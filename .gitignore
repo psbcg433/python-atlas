@@ -1,0 +1,13 @@
+# Virtual environment and caches
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.ruff_cache/
+*.egg-info/
+
+# Local secrets and OS files
+.env
+.DS_Store
+
+# Scratch files written by notebook demos
+notebooks/_scratch/

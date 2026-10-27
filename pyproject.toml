@@ -1,0 +1,34 @@
+[project]
+name = "python-course"
+version = "0.1.0"
+description = "Notebook-based Python engineering course: language core, CPython internals, tooling, concurrency and FastAPI."
+requires-python = ">=3.15"
+dependencies = [
+    "ipykernel>=7.4.0",
+    "jupyterlab>=4.6.4",
+    "jupytext>=1.19.6",
+    "nbconvert>=7.17.2",
+    "nbformat>=5.11.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py315"
+extend-include = ["*.ipynb"]
+src = [".", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Unit modules hold notebook markdown (long table rows) inside strings.
+"scripts/phase*/unit_*.py" = ["E501"]
+"scripts/phase*/project.py" = ["E501"]
+# Notebooks keep sys.version_info guards (course convention 5) and each unit re-imports
+# what it needs so it can run on its own (convention 12).
+"notebooks/*.ipynb" = ["UP036", "F811"]
