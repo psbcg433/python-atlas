@@ -5,8 +5,10 @@ Run from the repository root:
     uv run python exercises/solutions/phase1_solutions.py
 """
 
-from collections.abc import Callable
+import unicodedata
+from collections.abc import Callable, Iterable
 from decimal import ROUND_HALF_UP, Decimal
+from typing import NamedTuple
 
 type TestCase = tuple[str, Callable[[], object], object]
 
@@ -163,5 +165,305 @@ def check_lab_1_3() -> None:
     print(f"\n{exact_total=}\n{float_total=}\n{float_total == float(exact_total)=}")
 
 
+# Lab 1.4 -------------------------------------------------------------------------------------
+
+USERNAME_EXTRA_CHARACTERS = frozenset("_.")
+
+
+def normalize_username(raw_username: str) -> str:
+    """Return the canonical form of a username: NFKC, casefolded, inner whitespace as "_".
+
+    Raises:
+        ValueError: if the result is empty or holds a character other than letters, digits,
+            "_" and ".".
+    """
+    folded_username = unicodedata.normalize("NFKC", raw_username).casefold()
+    username = "_".join(folded_username.split())
+    if not username:
+        raise ValueError("username is empty")
+    invalid_characters = sorted(
+        {
+            character
+            for character in username
+            if not (character.isalnum() or character in USERNAME_EXTRA_CHARACTERS)
+        }
+    )
+    if invalid_characters:
+        raise ValueError(f"invalid characters in username: {invalid_characters}")
+    return username
+
+
+RECEIPT_NAME_WIDTH = 20
+
+
+def format_receipt_line(item_name: str, quantity: int, unit_price: Decimal) -> str:
+    """Return a 49-character receipt line: name (20), quantity (4), " x ", price (10), total (12).
+
+    Names longer than the column are cut to 19 characters plus "…".
+    """
+    if len(item_name) > RECEIPT_NAME_WIDTH:
+        item_name = item_name[: RECEIPT_NAME_WIDTH - 1] + "…"
+    name_column = f"{item_name:<{RECEIPT_NAME_WIDTH}}"
+    line_total = unit_price * quantity
+    return f"{name_column}{quantity:>4} x {unit_price:>10,.2f}{line_total:>12,.2f}"
+
+
+def normalize_search_query(raw_query: str) -> str:
+    """Return a casefolded, accent-free query with punctuation removed and single spaces."""
+    decomposed_query = unicodedata.normalize("NFKD", raw_query)
+    unaccented_query = "".join(
+        character for character in decomposed_query if not unicodedata.combining(character)
+    )
+    folded_query = unaccented_query.casefold()
+    spaced_query = "".join(character if character.isalnum() else " " for character in folded_query)
+    return " ".join(spaced_query.split())
+
+
+def check_lab_1_4() -> None:
+    """Run the same checks as the Lab 1.4 check cells in the notebook."""
+    print("Exercise 1 — normalize_username")
+    run_checks(
+        [
+            ("strip and casefold", lambda: normalize_username("  Asha.Kumar "), "asha.kumar"),
+            (
+                "inner spaces become _",
+                lambda: normalize_username("Ravi   Shankar"),
+                "ravi_shankar",
+            ),
+            ("full-width letters", lambda: normalize_username("ＡＳＨＡ２６"), "asha26"),
+            ("ß casefolds to ss", lambda: normalize_username("STRAßE"), "strasse"),
+            (
+                "combining accent equals precomposed",
+                lambda: normalize_username("José") == normalize_username("JOSÉ"),
+                True,
+            ),
+            (
+                "blank raises",
+                lambda: raised_error_name(lambda: normalize_username("   ")),
+                "ValueError",
+            ),
+            (
+                "@ raises",
+                lambda: raised_error_name(lambda: normalize_username("asha@home")),
+                "ValueError",
+            ),
+        ]
+    )
+    print("\nExercise 2 — format_receipt_line")
+    run_checks(
+        [
+            (
+                "basic line",
+                lambda: format_receipt_line("Masala Dosa", 2, Decimal("120")),
+                "Masala Dosa            2 x     120.00      240.00",
+            ),
+            (
+                "long name is truncated with …",
+                lambda: format_receipt_line("Paneer Butter Masala Special", 1, Decimal("320.5")),
+                "Paneer Butter Masal…   1 x     320.50      320.50",
+            ),
+            (
+                "thousands separators",
+                lambda: format_receipt_line("Wedding Catering", 3, Decimal("125000")),
+                "Wedding Catering       3 x 125,000.00  375,000.00",
+            ),
+            (
+                "always 49 characters",
+                lambda: {
+                    len(format_receipt_line(name, count, Decimal(price)))
+                    for name, count, price in [("Tea", 1, "10"), ("A" * 40, 99, "9999.99")]
+                },
+                {49},
+            ),
+        ]
+    )
+    print("\nExercise 3 — normalize_search_query")
+    run_checks(
+        [
+            (
+                "accents and case",
+                lambda: normalize_search_query("  Café   CRÈME! "),
+                "cafe creme",
+            ),
+            (
+                "punctuation becomes spaces",
+                lambda: normalize_search_query("Masala-Dosa,  Bengaluru"),
+                "masala dosa bengaluru",
+            ),
+            ("full-width text", lambda: normalize_search_query("ＤＯＳＡ ２０２６"), "dosa 2026"),
+            (
+                "ß and SS match",
+                lambda: normalize_search_query("Straße") == normalize_search_query("STRASSE"),
+                True,
+            ),
+            ("empty query", lambda: normalize_search_query(""), ""),
+            ("only punctuation", lambda: normalize_search_query("!!! ???"), ""),
+        ]
+    )
+
+
+# Lab 1.5 -------------------------------------------------------------------------------------
+
+
+class Employee(NamedTuple):
+    """An employee record for the sorting exercise."""
+
+    name: str
+    department: str
+    salary: int
+
+
+SAMPLE_EMPLOYEES = [
+    Employee("Asha", "Engineering", 120_000),
+    Employee("Ravi", "Sales", 80_000),
+    Employee("Meena", "Engineering", 150_000),
+    Employee("John", "Sales", 80_000),
+    Employee("Fatima", "Design", 95_000),
+    Employee("Arjun", "Engineering", 120_000),
+]
+
+
+def sort_employees_multipass(employees: list[Employee]) -> list[Employee]:
+    """Sort by department, salary (high first), name using stable multi-pass sorting.
+
+    Passes run from the least important key to the most important one; stability keeps the
+    earlier order among ties.
+    """
+    by_name = sorted(employees, key=lambda employee: employee.name)
+    by_salary_descending = sorted(by_name, key=lambda employee: employee.salary, reverse=True)
+    return sorted(by_salary_descending, key=lambda employee: employee.department)
+
+
+def sort_employees_tuple_key(employees: list[Employee]) -> list[Employee]:
+    """Sort by department, salary (high first), name using one tuple key."""
+    return sorted(
+        employees,
+        key=lambda employee: (employee.department, -employee.salary, employee.name),
+    )
+
+
+def transpose[T](matrix: list[list[T]]) -> list[list[T]]:
+    """Return the transpose of a rectangular matrix given as a list of rows.
+
+    Raises:
+        ValueError: if the rows have different lengths.
+    """
+    return [list(column) for column in zip(*matrix, strict=True)]
+
+
+def dedupe_preserving_order[T](items: Iterable[T]) -> list[T]:
+    """Return the items without duplicates, keeping first occurrences in order."""
+    seen_items: set[T] = set()
+    unique_items: list[T] = []
+    for item in items:
+        if item not in seen_items:
+            seen_items.add(item)
+            unique_items.append(item)
+    return unique_items
+
+
+def employee_names(employees: list[Employee]) -> list[str]:
+    """Return just the names, in order."""
+    return [employee.name for employee in employees]
+
+
+def returns_new_list(sort_function: Callable[[list[Employee]], list[Employee]]) -> bool:
+    """Return True if sort_function returns a new list and leaves its argument alone."""
+    employees_argument = list(SAMPLE_EMPLOYEES)
+    sorted_employees = sort_function(employees_argument)
+    return sorted_employees is not employees_argument and employees_argument == SAMPLE_EMPLOYEES
+
+
+def check_lab_1_5() -> None:
+    """Run the same checks as the Lab 1.5 check cells in the notebook."""
+    print("Exercise 1 — sort employee records")
+    expected_employee_order = ["Fatima", "Meena", "Arjun", "Asha", "John", "Ravi"]
+    run_checks(
+        [
+            (
+                "multi-pass order",
+                lambda: employee_names(sort_employees_multipass(SAMPLE_EMPLOYEES)),
+                expected_employee_order,
+            ),
+            (
+                "tuple-key order",
+                lambda: employee_names(sort_employees_tuple_key(SAMPLE_EMPLOYEES)),
+                expected_employee_order,
+            ),
+            (
+                "both versions agree",
+                lambda: (
+                    sort_employees_multipass(SAMPLE_EMPLOYEES)
+                    == sort_employees_tuple_key(SAMPLE_EMPLOYEES)
+                ),
+                True,
+            ),
+            (
+                "multi-pass returns a new list",
+                lambda: returns_new_list(sort_employees_multipass),
+                True,
+            ),
+            (
+                "tuple-key returns a new list",
+                lambda: returns_new_list(sort_employees_tuple_key),
+                True,
+            ),
+            ("empty list", lambda: sort_employees_tuple_key([]), []),
+        ]
+    )
+    print("\nExercise 2 — transpose")
+    run_checks(
+        [
+            (
+                "2x3 becomes 3x2",
+                lambda: transpose([[1, 2, 3], [4, 5, 6]]),
+                [[1, 4], [2, 5], [3, 6]],
+            ),
+            ("square", lambda: transpose([[1, 2], [3, 4]]), [[1, 3], [2, 4]]),
+            ("single row", lambda: transpose([["a", "b"]]), [["a"], ["b"]]),
+            ("empty matrix", lambda: transpose([]), []),
+            ("rows are lists", lambda: type(transpose([[1, 2]])[0]).__name__, "list"),
+            (
+                "ragged rows raise",
+                lambda: raised_error_name(lambda: transpose([[1, 2], [3]])),
+                "ValueError",
+            ),
+        ]
+    )
+    print("\nExercise 3 — dedupe_preserving_order")
+    run_checks(
+        [
+            ("ints", lambda: dedupe_preserving_order([3, 1, 3, 2, 1]), [3, 1, 2]),
+            (
+                "strings",
+                lambda: dedupe_preserving_order(["b", "a", "b", "c", "a"]),
+                ["b", "a", "c"],
+            ),
+            ("empty", lambda: dedupe_preserving_order([]), []),
+            (
+                "one-shot iterator",
+                lambda: dedupe_preserving_order(iter("mississippi")),
+                ["m", "i", "s", "p"],
+            ),
+            (
+                "1, 1.0 and True are equal",
+                lambda: dedupe_preserving_order([1, 1.0, True, 2]),
+                [1, 2],
+            ),
+            (
+                "tuples",
+                lambda: dedupe_preserving_order([(1, 2), (1, 2), (2, 1)]),
+                [(1, 2), (2, 1)],
+            ),
+        ]
+    )
+
+
 if __name__ == "__main__":
-    check_lab_1_3()
+    for lab_title, check_lab in [
+        ("Lab 1.3", check_lab_1_3),
+        ("Lab 1.4", check_lab_1_4),
+        ("Lab 1.5", check_lab_1_5),
+    ]:
+        print(f"\n=== {lab_title} ===")
+        check_lab()
