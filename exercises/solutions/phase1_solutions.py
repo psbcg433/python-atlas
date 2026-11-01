@@ -5,8 +5,10 @@ Run from the repository root:
     uv run python exercises/solutions/phase1_solutions.py
 """
 
+import re
 import unicodedata
-from collections.abc import Callable, Iterable
+from collections import ChainMap, Counter, OrderedDict, defaultdict, deque
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from decimal import ROUND_HALF_UP, Decimal
 from typing import NamedTuple
 
@@ -459,11 +461,326 @@ def check_lab_1_5() -> None:
     )
 
 
+# Lab 1.6 -------------------------------------------------------------------------------------
+
+
+class Order(NamedTuple):
+    """One order line for the Lab 1.6 exercises."""
+
+    order_id: int
+    customer: str
+    sku: str
+    quantity: int
+
+
+SAMPLE_ORDERS = [
+    Order(1001, "asha", "TEA-500G", 2),
+    Order(1002, "ravi", "RICE-5KG", 1),
+    Order(1003, "asha", "GHEE-1L", 1),
+    Order(1004, "meena", "TEA-500G", 3),
+    Order(1005, "ravi", "TEA-500G", 1),
+    Order(1006, "john", "SOAP-3PK", 4),
+    Order(1007, "meena", "RICE-5KG", 2),
+    Order(1008, "asha", "DAL-1KG", 2),
+]
+PRODUCT_CATALOG: Mapping[str, Decimal] = frozendict(
+    {
+        "TEA-500G": Decimal("249.00"),
+        "RICE-5KG": Decimal("525.50"),
+        "GHEE-1L": Decimal("640.00"),
+        "DAL-1KG": Decimal("162.25"),
+    }
+)
+WORD_PATTERN = re.compile(r"[^\W_]+")
+
+
+def group_orders_by_customer(orders: Iterable[Order]) -> dict[str, list[Order]]:
+    """Return {customer: [their orders in input order]} as a plain dict."""
+    orders_by_customer: defaultdict[str, list[Order]] = defaultdict(list)
+    for order in orders:
+        orders_by_customer[order.customer].append(order)
+    return dict(orders_by_customer)
+
+
+def top_k_words(text: str, k: int) -> list[tuple[str, int]]:
+    """Return the k most frequent words, ties broken alphabetically."""
+    if k <= 0:
+        return []
+    word_counts = Counter(WORD_PATTERN.findall(text.casefold()))
+    ranked_words = sorted(word_counts.items(), key=lambda pair: (-pair[1], pair[0]))
+    return ranked_words[:k]
+
+
+def merge_configs(
+    defaults: Mapping[str, object], env: Mapping[str, object], cli: Mapping[str, object]
+) -> ChainMap[str, object]:
+    """Layer cli > env > defaults; None in cli means "not given"."""
+    given_cli_values = {key: value for key, value in cli.items() if value is not None}
+    return ChainMap({}, given_cli_values, env, defaults)
+
+
+class LRUCache:
+    """A fixed-capacity least-recently-used cache built on OrderedDict."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError(f"capacity must be at least 1, got {capacity}")
+        self.capacity = capacity
+        self._entries: OrderedDict[Hashable, object] = OrderedDict()
+
+    def get(self, key: Hashable, default: object = None) -> object:
+        """Return the cached value (marking it recent) or default."""
+        if key not in self._entries:
+            return default
+        self._entries.move_to_end(key)
+        return self._entries[key]
+
+    def put(self, key: Hashable, value: object) -> None:
+        """Store value, evicting the least recently used key if over capacity."""
+        self._entries[key] = value
+        self._entries.move_to_end(key)
+        if len(self._entries) > self.capacity:
+            self._entries.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._entries
+
+
+def analyze_orders(orders: Iterable[Order], catalog: Mapping[str, Decimal]) -> dict[str, object]:
+    """Summarise orders: revenue, top SKUs, customers, recent IDs, unknown SKUs."""
+    revenue_by_customer: defaultdict[str, Decimal] = defaultdict(Decimal)
+    units_by_sku: Counter[str] = Counter()
+    customers: set[str] = set()
+    recent_order_ids: deque[int] = deque(maxlen=5)
+    unknown_skus: set[str] = set()
+    for order in orders:
+        customers.add(order.customer)
+        recent_order_ids.append(order.order_id)
+        if order.sku not in catalog:
+            unknown_skus.add(order.sku)
+            continue
+        revenue_by_customer[order.customer] += catalog[order.sku] * order.quantity
+        units_by_sku[order.sku] += order.quantity
+    return {
+        "revenue_by_customer": dict(revenue_by_customer),
+        "top_skus": units_by_sku.most_common(3),
+        "unique_customer_count": len(customers),
+        "recent_order_ids": list(recent_order_ids),
+        "unknown_skus": sorted(unknown_skus),
+    }
+
+
+DEFAULT_CONFIG = {"host": "localhost", "port": 8000, "debug": False, "log_level": "INFO"}
+ENV_CONFIG = {"port": 9000, "log_level": "WARNING"}
+CLI_CONFIG = {"debug": True, "port": None}
+
+
+def writes_leave_inputs_alone() -> bool:
+    """Write through merge_configs' result and check that no input dict changed."""
+    inputs_before = (dict(DEFAULT_CONFIG), dict(ENV_CONFIG), dict(CLI_CONFIG))
+    merged_config = merge_configs(DEFAULT_CONFIG, ENV_CONFIG, CLI_CONFIG)
+    merged_config["host"] = "example.in"
+    merged_config["timeout"] = 30
+    return (DEFAULT_CONFIG, ENV_CONFIG, CLI_CONFIG) == inputs_before
+
+
+def lru_basic_trace() -> list[object]:
+    """get refreshes 'a', so putting 'c' evicts 'b'."""
+    cache = LRUCache(2)
+    cache.put("a", 1)
+    cache.put("b", 2)
+    first_get = cache.get("a")
+    cache.put("c", 3)
+    return [first_get, cache.get("b"), cache.get("c"), len(cache), "a" in cache]
+
+
+def lru_update_trace() -> list[object]:
+    """Updating 'a' refreshes it, so putting 'c' evicts 'b'."""
+    cache = LRUCache(2)
+    cache.put("a", 1)
+    cache.put("b", 2)
+    cache.put("a", 10)
+    cache.put("c", 3)
+    return [cache.get("a"), "b" in cache, len(cache)]
+
+
+def lru_contains_trace() -> bool:
+    """Membership does not refresh 'a', so putting 'c' evicts it."""
+    cache = LRUCache(2)
+    cache.put("a", 1)
+    cache.put("b", 2)
+    _ = "a" in cache
+    cache.put("c", 3)
+    return "a" in cache
+
+
+def check_lab_1_6() -> None:
+    """Run the same checks as the Lab 1.6 check cells in the notebook."""
+    print("Exercise 1 — group_orders_by_customer")
+    run_checks(
+        [
+            (
+                "order ids per customer",
+                lambda: {
+                    customer: [order.order_id for order in customer_orders]
+                    for customer, customer_orders in group_orders_by_customer(SAMPLE_ORDERS).items()
+                },
+                {
+                    "asha": [1001, 1003, 1008],
+                    "ravi": [1002, 1005],
+                    "meena": [1004, 1007],
+                    "john": [1006],
+                },
+            ),
+            (
+                "customers in first-seen order",
+                lambda: list(group_orders_by_customer(SAMPLE_ORDERS)),
+                ["asha", "ravi", "meena", "john"],
+            ),
+            (
+                "returns a plain dict",
+                lambda: type(group_orders_by_customer(SAMPLE_ORDERS)).__name__,
+                "dict",
+            ),
+            (
+                "missing customer raises",
+                lambda: raised_error_name(lambda: group_orders_by_customer(SAMPLE_ORDERS)["zoe"]),
+                "KeyError",
+            ),
+            (
+                "accepts an iterator",
+                lambda: list(group_orders_by_customer(iter(SAMPLE_ORDERS[:2]))),
+                ["asha", "ravi"],
+            ),
+            ("no orders", lambda: group_orders_by_customer([]), {}),
+        ]
+    )
+    print("\nExercise 2 — top_k_words")
+    nursery_text = "The cat and the hat. THE CAT sat; a bat sat!"
+    run_checks(
+        [
+            (
+                "top 3",
+                lambda: top_k_words(nursery_text, 3),
+                [("the", 3), ("cat", 2), ("sat", 2)],
+            ),
+            (
+                "ties alphabetical",
+                lambda: top_k_words(nursery_text, 5),
+                [("the", 3), ("cat", 2), ("sat", 2), ("a", 1), ("and", 1)],
+            ),
+            ("k larger than vocabulary", lambda: len(top_k_words(nursery_text, 50)), 7),
+            ("k = 0", lambda: top_k_words(nursery_text, 0), []),
+            ("empty text", lambda: top_k_words("", 3), []),
+            (
+                "caseless and unicode",
+                lambda: top_k_words("Café café CAFÉ, tea", 1),
+                [("café", 3)],
+            ),
+            (
+                "underscore splits words",
+                lambda: top_k_words("snake_case snake", 1),
+                [("snake", 2)],
+            ),
+        ]
+    )
+    print("\nExercise 3 — merge_configs")
+    run_checks(
+        [
+            (
+                "returns a ChainMap",
+                lambda: type(merge_configs(DEFAULT_CONFIG, ENV_CONFIG, CLI_CONFIG)).__name__,
+                "ChainMap",
+            ),
+            (
+                "precedence cli > env > defaults",
+                lambda: dict(merge_configs(DEFAULT_CONFIG, ENV_CONFIG, CLI_CONFIG)),
+                {"host": "localhost", "port": 9000, "debug": True, "log_level": "WARNING"},
+            ),
+            (
+                "None in cli is ignored",
+                lambda: merge_configs(DEFAULT_CONFIG, ENV_CONFIG, CLI_CONFIG)["port"],
+                9000,
+            ),
+            ("writes leave inputs alone", writes_leave_inputs_alone, True),
+            ("empty layers", lambda: dict(merge_configs({"a": 1}, {}, {})), {"a": 1}),
+        ]
+    )
+    print("\nExercise 4 — LRUCache")
+    run_checks(
+        [
+            ("get refreshes recency", lru_basic_trace, [1, None, 3, 2, True]),
+            ("put updates and refreshes", lru_update_trace, [10, False, 2]),
+            ("in does not refresh", lru_contains_trace, False),
+            ("get default on miss", lambda: LRUCache(1).get("x", "fallback"), "fallback"),
+            ("capacity 0 raises", lambda: raised_error_name(lambda: LRUCache(0)), "ValueError"),
+        ]
+    )
+    print("\nExercise 5 — analyze_orders")
+    run_checks(
+        [
+            (
+                "revenue by customer",
+                lambda: analyze_orders(SAMPLE_ORDERS, PRODUCT_CATALOG)["revenue_by_customer"],
+                {
+                    "asha": Decimal("1462.50"),
+                    "ravi": Decimal("774.50"),
+                    "meena": Decimal("1798.00"),
+                },
+            ),
+            (
+                "top 3 SKUs by units",
+                lambda: analyze_orders(SAMPLE_ORDERS, PRODUCT_CATALOG)["top_skus"],
+                [("TEA-500G", 6), ("RICE-5KG", 3), ("DAL-1KG", 2)],
+            ),
+            (
+                "unique customers",
+                lambda: analyze_orders(SAMPLE_ORDERS, PRODUCT_CATALOG)["unique_customer_count"],
+                4,
+            ),
+            (
+                "last 5 order ids",
+                lambda: analyze_orders(SAMPLE_ORDERS, PRODUCT_CATALOG)["recent_order_ids"],
+                [1004, 1005, 1006, 1007, 1008],
+            ),
+            (
+                "unknown SKUs",
+                lambda: analyze_orders(SAMPLE_ORDERS, PRODUCT_CATALOG)["unknown_skus"],
+                ["SOAP-3PK"],
+            ),
+            (
+                "revenue is a plain dict",
+                lambda: (
+                    type(
+                        analyze_orders(SAMPLE_ORDERS, PRODUCT_CATALOG)["revenue_by_customer"]
+                    ).__name__
+                ),
+                "dict",
+            ),
+            (
+                "no orders",
+                lambda: analyze_orders([], PRODUCT_CATALOG),
+                {
+                    "revenue_by_customer": {},
+                    "top_skus": [],
+                    "unique_customer_count": 0,
+                    "recent_order_ids": [],
+                    "unknown_skus": [],
+                },
+            ),
+        ]
+    )
+
+
 if __name__ == "__main__":
     for lab_title, check_lab in [
         ("Lab 1.3", check_lab_1_3),
         ("Lab 1.4", check_lab_1_4),
         ("Lab 1.5", check_lab_1_5),
+        ("Lab 1.6", check_lab_1_6),
     ]:
         print(f"\n=== {lab_title} ===")
         check_lab()
