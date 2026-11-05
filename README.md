@@ -9,6 +9,8 @@ an "under the hood" look at how CPython implements it.
 - **Prerequisites:** working knowledge of JavaScript/TypeScript (variables, functions, objects,
   async code, HTTP basics).
 - **Full outline:** see [SYLLABUS.md](SYLLABUS.md) for every phase, unit and section.
+- **Study notes:** [Phase 1 study notes](notes/phase1/README.md), a textbook-style
+  Markdown version of the Phase 1 notebook, written for reading on a phone.
 
 ## Course structure
 
@@ -31,6 +33,7 @@ an "under the hood" look at how CPython implements it.
 ├── .python-version       # pins Python 3.15
 ├── uv.lock               # exact dependency versions and hashes
 ├── notebooks/            # one .ipynb per phase
+├── notes/                # textbook-style study notes: notes/phaseN/
 ├── projects/             # code that outgrows a notebook (CLI package, FastAPI apps)
 ├── exercises/solutions/  # lab reference solutions: phaseN_solutions.py
 └── scripts/              # notebook build scripts: nb_builder.py, phaseN/build.py, phaseN/unit_N_M.py
