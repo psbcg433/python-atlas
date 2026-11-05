@@ -5,16 +5,23 @@ Run from the repository root:
     uv run python exercises/solutions/phase1_solutions.py
 """
 
+import contextlib
 import copy
 import datetime as dt
+import functools
 import inspect
 import io
+import itertools
 import operator
 import re
+import tempfile
+import time
+import tracemalloc
 import unicodedata
 from collections import ChainMap, Counter, OrderedDict, defaultdict, deque
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Generator, Hashable, Iterable, Iterator, Mapping
 from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
 from typing import IO, Any, NamedTuple
 from urllib.parse import urlencode
 
@@ -1485,6 +1492,1200 @@ def check_lab_1_10() -> None:
     )
 
 
+# Lab 1.11 ------------------------------------------------------------------------------------
+
+
+def make_rate_counter(
+    window_seconds: float,
+) -> tuple[Callable[[float], None], Callable[[float], int]]:
+    """Return (record_hit, hits_in_window) closures sharing one deque of timestamps."""
+    if window_seconds <= 0:
+        raise ValueError("window_seconds must be positive")
+    hit_times: deque[float] = deque()
+
+    def record_hit(timestamp: float) -> None:
+        """Remember one hit (timestamps arrive in increasing order)."""
+        hit_times.append(timestamp)
+
+    def hits_in_window(now: float) -> int:
+        """Count hits with now - window_seconds < timestamp <= now."""
+        return sum(1 for hit_time in hit_times if now - window_seconds < hit_time <= now)
+
+    return record_hit, hits_in_window
+
+
+def add_tag(tag: str, tags: list[str] | None = None) -> list[str]:
+    """Return a new list holding the given tags followed by tag."""
+    return [*(tags or []), tag]
+
+
+def make_accumulator() -> Callable[[float], float]:
+    """Return add(amount), which returns the running total."""
+    total = 0.0
+
+    def add(amount: float) -> float:
+        nonlocal total
+        total += amount
+        return total
+
+    return add
+
+
+def make_price_formatters(currency_codes: list[str]) -> list[Callable[[float], str]]:
+    """Return one formatter per currency code, e.g. 'INR 250.00'."""
+    return [lambda amount, code=code: f"{code} {amount:.2f}" for code in currency_codes]
+
+
+type Validator = Callable[[str], str | None]
+
+
+def min_length(length: int) -> Validator:
+    """Return a validator that rejects values shorter than length."""
+
+    def validate(value: str) -> str | None:
+        return None if len(value) >= length else f"must be at least {length} characters"
+
+    return validate
+
+
+def matches_pattern(pattern: str, description: str) -> Validator:
+    """Return a validator that rejects values that do not fully match pattern."""
+    compiled_pattern = re.compile(pattern)
+
+    def validate(value: str) -> str | None:
+        return None if compiled_pattern.fullmatch(value) else f"must be {description}"
+
+    return validate
+
+
+def one_of(allowed_values: set[str]) -> Validator:
+    """Return a validator that rejects values outside allowed_values."""
+    allowed = frozenset(allowed_values)
+    message = "must be one of: " + ", ".join(sorted(allowed))
+
+    def validate(value: str) -> str | None:
+        return None if value in allowed else message
+
+    return validate
+
+
+def validate_record(
+    record: dict[str, str], rules: dict[str, list[Validator]]
+) -> dict[str, list[str]]:
+    """Return {field: [error messages]} for every field that has errors."""
+    errors_by_field: dict[str, list[str]] = {}
+    for field_name, validators in rules.items():
+        value = record.get(field_name, "")
+        messages = [message for validator in validators if (message := validator(value))]
+        if messages:
+            errors_by_field[field_name] = messages
+    return errors_by_field
+
+
+def rate_counter_trace() -> list[int]:
+    """Counts at t=30, 59.9, 60, 65 and 85 after hits at 0, 10, 20, 30 and 65."""
+    record_hit, hits_in_window = make_rate_counter(60)
+    for timestamp in (0, 10, 20, 30):
+        record_hit(timestamp)
+    counts = [hits_in_window(30), hits_in_window(59.9), hits_in_window(60)]
+    record_hit(65)
+    counts += [hits_in_window(65), hits_in_window(85)]
+    return counts
+
+
+def rate_counters_independent() -> tuple[int, int]:
+    """Hits recorded on one counter are not seen by another."""
+    record_first, count_first = make_rate_counter(10)
+    _, count_second = make_rate_counter(10)
+    record_first(1.0)
+    return count_first(1.0), count_second(1.0)
+
+
+def accumulator_trace() -> list[float]:
+    """Running totals from one accumulator."""
+    add = make_accumulator()
+    return [add(100), add(49.5), add(-20)]
+
+
+def caller_list_untouched() -> tuple[list[str], list[str]]:
+    """The caller's list is not modified."""
+    existing_tags = ["new"]
+    return add_tag("sale", existing_tags), existing_tags
+
+
+def signup_rules() -> dict[str, list[Validator]]:
+    """Rules for a sign-up form, built from the three factories."""
+    return {
+        "password": [min_length(8), matches_pattern(r".*\d.*", "a value containing a digit")],
+        "username": [min_length(3), matches_pattern(r"[a-z_]+", "lowercase letters or _")],
+        "plan": [one_of({"free", "pro", "team"})],
+    }
+
+
+def check_lab_1_11() -> None:
+    """Run the same checks as the Lab 1.11 check cells in the notebook."""
+    print("Exercise 1 — make_rate_counter")
+    run_checks(
+        [
+            ("window counts", rate_counter_trace, [4, 4, 3, 4, 2]),
+            ("independent counters", rate_counters_independent, (1, 0)),
+            (
+                "both are closures",
+                lambda: all(f.__closure__ for f in make_rate_counter(5)),
+                True,
+            ),
+            (
+                "window 0",
+                lambda: raised_error_name(lambda: make_rate_counter(0)),
+                "ValueError",
+            ),
+        ]
+    )
+    print("Exercise 2 — fix three buggy functions")
+    run_checks(
+        [
+            (
+                "add_tag fresh default",
+                lambda: (add_tag("new"), add_tag("sale")),
+                (["new"], ["sale"]),
+            ),
+            ("add_tag keeps caller list", caller_list_untouched, (["new", "sale"], ["new"])),
+            ("accumulator", accumulator_trace, [100, 149.5, 129.5]),
+            (
+                "accumulators independent",
+                lambda: (make_accumulator()(1), make_accumulator()(2)),
+                (1, 2),
+            ),
+            (
+                "formatters",
+                lambda: [f(250) for f in make_price_formatters(["INR", "USD", "EUR"])],
+                ["INR 250.00", "USD 250.00", "EUR 250.00"],
+            ),
+            (
+                "formatter per currency",
+                lambda: [f(9.5) for f in make_price_formatters(["INR", "USD"])][0],
+                "INR 9.50",
+            ),
+        ]
+    )
+    print("Exercise 3 — closure-based field validation")
+    run_checks(
+        [
+            ("min_length ok", lambda: min_length(3)("abc"), None),
+            (
+                "min_length short",
+                lambda: min_length(8)("abc"),
+                "must be at least 8 characters",
+            ),
+            (
+                "pattern ok",
+                lambda: matches_pattern(r"\d{6}", "a 6-digit PIN code")("560001"),
+                None,
+            ),
+            (
+                "pattern is a full match",
+                lambda: matches_pattern(r"\d{6}", "a 6-digit PIN code")("5600012"),
+                "must be a 6-digit PIN code",
+            ),
+            ("one_of ok", lambda: one_of({"free", "pro"})("pro"), None),
+            (
+                "one_of message",
+                lambda: one_of({"pro", "free"})("gold"),
+                "must be one of: free, pro",
+            ),
+            (
+                "valid record",
+                lambda: validate_record(
+                    {"password": "chai2024!", "username": "asha", "plan": "pro"}, signup_rules()
+                ),
+                {},
+            ),
+            (
+                "invalid record",
+                lambda: validate_record({"password": "chai", "username": "Asha K"}, signup_rules()),
+                {
+                    "password": [
+                        "must be at least 8 characters",
+                        "must be a value containing a digit",
+                    ],
+                    "username": ["must be lowercase letters or _"],
+                    "plan": ["must be one of: free, pro, team"],
+                },
+            ),
+            ("validators are closures", lambda: min_length(8).__closure__ is not None, True),
+        ]
+    )
+
+
+# Lab 1.12 ------------------------------------------------------------------------------------
+
+TIMER_UNITS = {"s": 1.0, "ms": 1_000.0, "us": 1_000_000.0}
+
+
+def timer(
+    func: Callable[..., Any] | None = None,
+    /,
+    *,
+    unit: str = "ms",
+    clock: Callable[[], float] = time.perf_counter,
+    report: Callable[[str], object] = print,
+) -> Callable[..., Any]:
+    """Report each call's duration. Use as @timer or @timer(unit=..., clock=..., report=...)."""
+    if unit not in TIMER_UNITS:
+        raise ValueError(f"unit must be one of {sorted(TIMER_UNITS)}, got {unit!r}")
+
+    def decorator(target: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(target)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            started = clock()
+            result = target(*args, **kwargs)
+            elapsed = (clock() - started) * TIMER_UNITS[unit]
+            report(f"{target.__name__} took {elapsed:.2f} {unit}")
+            return result
+
+        return wrapper
+
+    return decorator if func is None else decorator(func)
+
+
+def retry(
+    times: int = 3,
+    exceptions: tuple[type[BaseException], ...] = (Exception,),
+    backoff_factor: float = 0.0,
+    *,
+    sleep: Callable[[float], object] = time.sleep,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Retry on exceptions, sleeping backoff_factor * 2 ** (attempt - 1) between attempts."""
+    if times < 1:
+        raise ValueError("times must be at least 1")
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            for attempt in range(1, times + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions:
+                    if attempt == times:
+                        raise
+                    sleep(backoff_factor * 2 ** (attempt - 1))
+            raise AssertionError("unreachable")
+
+        return wrapper
+
+    return decorator
+
+
+def count_calls(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Count every call in wrapper.call_count."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        wrapper.call_count += 1
+        return func(*args, **kwargs)
+
+    wrapper.call_count = 0
+    return wrapper
+
+
+def validate_arguments(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Check annotated argument types on every call."""
+    signature = inspect.signature(func)
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        for name, value in bound.arguments.items():
+            annotation = signature.parameters[name].annotation
+            if annotation is inspect.Parameter.empty or not isinstance(annotation, type):
+                continue  # Parameter.empty is itself a class, so test for it first
+            if not isinstance(value, annotation):
+                raise TypeError(f"{name} must be {annotation.__name__}, got {type(value).__name__}")
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+@functools.singledispatch
+def serialize(value: object) -> Any:
+    """Convert value into JSON-compatible data."""
+    raise TypeError(f"cannot serialize {type(value).__name__}")
+
+
+@serialize.register(str)
+@serialize.register(int)
+@serialize.register(float)
+@serialize.register(type(None))
+def _(value: object) -> object:
+    return value  # bool is a subclass of int, so it lands here too
+
+
+@serialize.register
+def _(value: Decimal) -> str:
+    return str(value)
+
+
+@serialize.register
+def _(value: dt.date) -> str:
+    return value.isoformat()  # covers dt.datetime, a subclass of dt.date
+
+
+@serialize.register(list)
+@serialize.register(tuple)
+def _(value: list[Any] | tuple[Any, ...]) -> list[Any]:
+    return [serialize(item) for item in value]
+
+
+@serialize.register(set)
+@serialize.register(frozenset)
+def _(value: set[Any] | frozenset[Any]) -> list[Any]:
+    return sorted(serialize(item) for item in value)
+
+
+@serialize.register
+def _(value: dict) -> dict[str, Any]:
+    return {str(key): serialize(item) for key, item in value.items()}
+
+
+TRUE_WORDS = frozenset({"true", "1", "yes"})
+FALSE_WORDS = frozenset({"false", "0", "no"})
+
+
+def convert_param(text: str, annotation: object) -> object:
+    """Convert a query-string value by annotation (int, float, bool; otherwise unchanged)."""
+    if annotation is bool:
+        lowered = text.lower()
+        if lowered in TRUE_WORDS:
+            return True
+        if lowered in FALSE_WORDS:
+            return False
+        raise ValueError(f"not a boolean: {text!r}")
+    if annotation in (int, float):
+        return annotation(text)
+    return text
+
+
+def call_with_params(func: Callable[..., Any], params: dict[str, str]) -> Any:
+    """Call func with string params converted by its annotations."""
+    arguments: dict[str, Any] = {}
+    for name, parameter in inspect.signature(func).parameters.items():
+        if name in params:
+            arguments[name] = convert_param(params[name], parameter.annotation)
+        elif parameter.default is inspect.Parameter.empty:
+            raise TypeError(f"missing required parameter: {name}")
+    return func(**arguments)
+
+
+PATH_CONVERTERS: dict[object, Callable[[str], object]] = {int: int, float: float, str: str}
+
+
+class Router:
+    """Register handlers with @router.get / @router.post and dispatch paths to them."""
+
+    def __init__(self) -> None:
+        self.routes: list[tuple[str, list[str], Callable[..., Any]]] = []
+
+    def route(
+        self, method: str, path_template: str
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Return a decorator that registers a handler for method and path_template."""
+
+        def decorator(handler: Callable[..., Any]) -> Callable[..., Any]:
+            self.routes.append((method, path_template.strip("/").split("/"), handler))
+            return handler
+
+        return decorator
+
+    def get(self, path_template: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.route("GET", path_template)
+
+    def post(self, path_template: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self.route("POST", path_template)
+
+    @staticmethod
+    def match(
+        template_segments: list[str], path_segments: list[str], handler: Callable[..., Any]
+    ) -> dict[str, object] | None:
+        """Return the converted path parameters, or None if the path does not match."""
+        if len(template_segments) != len(path_segments):
+            return None
+        parameters = inspect.signature(handler).parameters
+        captured: dict[str, object] = {}
+        for template_segment, path_segment in zip(template_segments, path_segments, strict=True):
+            if template_segment.startswith("{") and template_segment.endswith("}"):
+                name = template_segment[1:-1]
+                converter = PATH_CONVERTERS.get(parameters[name].annotation, str)
+                try:
+                    captured[name] = converter(path_segment)
+                except ValueError:
+                    return None
+            elif template_segment != path_segment:
+                return None
+        return captured
+
+    def dispatch(self, method: str, path: str) -> Any:
+        """Call the first matching handler with typed path parameters."""
+        path_segments = path.strip("/").split("/")
+        for route_method, template_segments, handler in self.routes:
+            if route_method != method:
+                continue
+            captured = self.match(template_segments, path_segments, handler)
+            if captured is not None:
+                return handler(**captured)
+        raise LookupError(f"no route for {method} {path}")
+
+
+def fake_clock(*readings: float) -> Callable[[], float]:
+    """Return a clock that returns readings one by one."""
+    reading_iterator = iter(readings)
+    return lambda: next(reading_iterator)
+
+
+def captured_stdout(thunk: Callable[[], object]) -> tuple[object, str]:
+    """Run thunk and return (its result, what it printed)."""
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        result = thunk()
+    return result, buffer.getvalue()
+
+
+def timer_with_options() -> tuple[int, list[str]]:
+    """@timer(...) with a fake clock: 10.0 s → 10.25 s."""
+    messages: list[str] = []
+
+    @timer(unit="ms", clock=fake_clock(10.0, 10.25), report=messages.append)
+    def brew_chai(cups: int) -> int:
+        return cups * 150
+
+    return brew_chai(2), messages
+
+
+def timer_bare() -> tuple[object, bool, str]:
+    """Bare @timer: real clock, printed message."""
+
+    def pack_order() -> str:
+        """Pack it."""
+        return "packed"
+
+    result, printed = captured_stdout(lambda: timer(pack_order)())
+    message_ok = bool(re.fullmatch(r"pack_order took \d+\.\d{2} ms\n", printed))
+    return result, message_ok, timer(pack_order).__name__
+
+
+def flaky(failures: int, error: Exception) -> Callable[[], str]:
+    """Return a function that fails failures times, then returns "ok"."""
+    calls: list[int] = []
+
+    def unreliable() -> str:
+        calls.append(len(calls) + 1)
+        if len(calls) <= failures:
+            raise error
+        return "ok"
+
+    unreliable.calls = calls
+    return unreliable
+
+
+def retry_trace(failures: int, times: int, error: Exception) -> tuple[str, int, list[float]]:
+    """Return (result or exception name, number of calls, recorded delays)."""
+    delays: list[float] = []
+    target = flaky(failures, error)
+    decorated = retry(times, (ConnectionError,), 0.5, sleep=delays.append)(target)
+    outcome = raised_error_name(decorated)
+    return ("ok" if outcome == "no error" else outcome), len(target.calls), delays
+
+
+def count_calls_trace() -> tuple[int, int, int, str]:
+    """Count calls on two functions, one of which raises."""
+
+    @count_calls
+    def ping() -> str:
+        return "pong"
+
+    @count_calls
+    def fail() -> None:
+        raise RuntimeError("boom")
+
+    start = ping.call_count
+    ping()
+    ping()
+    raised_error_name(fail)
+    return start, ping.call_count, fail.call_count, ping.__name__
+
+
+def make_add_item() -> Callable[..., Any]:
+    """A decorated function with checked and unchecked parameters."""
+
+    @validate_arguments
+    def add_item(
+        sku: str,
+        quantity: int = 1,
+        *,
+        note: str = "",
+        tags: list[str] | None = None,
+        extra=None,
+    ) -> str:
+        return f"{quantity} x {sku}"
+
+    return add_item
+
+
+def type_error_message(thunk: Callable[[], object]) -> str:
+    """Return the TypeError message thunk raises, or 'no error'."""
+    try:
+        thunk()
+    except TypeError as error:
+        return str(error)
+    return "no error"
+
+
+SAMPLE_ORDER_FOR_SERIALIZE = {
+    "order_id": 1042,
+    "placed_on": dt.date(2026, 11, 5),
+    "total": Decimal("889.50"),
+    "items": ("TEA-500G", "RICE-5KG"),
+    "tags": {"gift", "express"},
+    "paid": True,
+    "coupon": None,
+}
+
+
+def search_products(
+    query: str, page: int = 1, max_price: float = 1e9, in_stock: bool = False
+) -> tuple[Any, ...]:
+    """A handler with typed query parameters."""
+    return query, page, max_price, in_stock
+
+
+def missing_message() -> str:
+    """Return the TypeError message for a missing required parameter."""
+    try:
+        call_with_params(search_products, {"page": "2"})
+    except TypeError as error:
+        return str(error)
+    return "no error"
+
+
+def make_shop_router() -> Router:
+    """A router with literal, typed and multi-parameter routes."""
+    router = Router()
+
+    @router.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @router.get("/users/{user_id}")
+    def get_user(user_id: int) -> dict[str, Any]:
+        return {"user_id": user_id, "type": type(user_id).__name__}
+
+    @router.get("/users/{user_id}/orders/{order_code}")
+    def get_order(user_id: int, order_code: str) -> tuple[int, str]:
+        return user_id, order_code
+
+    @router.post("/users/{user_id}")
+    def update_user(user_id: int) -> str:
+        return f"updated {user_id}"
+
+    return router
+
+
+def decorator_returns_handler() -> bool:
+    """router.get(...) must return the original function."""
+
+    def handler() -> None:
+        return None
+
+    return Router().get("/x")(handler) is handler
+
+
+def check_lab_1_12() -> None:
+    """Run the same checks as the Lab 1.12 check cells in the notebook."""
+    print("Exercise 1 — @timer with optional arguments")
+    run_checks(
+        [
+            (
+                "@timer(...) result and message",
+                timer_with_options,
+                (300, ["brew_chai took 250.00 ms"]),
+            ),
+            ("bare @timer", timer_bare, ("packed", True, "pack_order")),
+            (
+                "seconds",
+                lambda: captured_stdout(
+                    lambda: timer(unit="s", clock=fake_clock(1.0, 3.5))(len)("ab")
+                )[1],
+                "len took 2.50 s\n",
+            ),
+            ("bad unit", lambda: raised_error_name(lambda: timer(unit="hours")), "ValueError"),
+            ("__wrapped__", lambda: timer(len).__wrapped__ is len, True),
+        ]
+    )
+    print("Exercise 2 — @retry(times, exceptions, backoff_factor)")
+    run_checks(
+        [
+            (
+                "succeeds on third attempt",
+                lambda: retry_trace(2, 3, ConnectionError()),
+                ("ok", 3, [0.5, 1.0]),
+            ),
+            (
+                "gives up and re-raises",
+                lambda: retry_trace(5, 3, ConnectionError()),
+                ("ConnectionError", 3, [0.5, 1.0]),
+            ),
+            (
+                "other exceptions not retried",
+                lambda: retry_trace(5, 3, KeyError("x")),
+                ("KeyError", 1, []),
+            ),
+            ("first try ok", lambda: retry_trace(0, 3, ConnectionError()), ("ok", 1, [])),
+            ("times 0", lambda: raised_error_name(lambda: retry(0)), "ValueError"),
+            ("wraps", lambda: retry(2)(flaky(0, ValueError())).__name__, "unreliable"),
+        ]
+    )
+    print("Exercise 3 — @count_calls")
+    run_checks(
+        [
+            ("counts, raising calls included", count_calls_trace, (0, 2, 1, "ping")),
+            ("returns the result", lambda: count_calls(max)(3, 9), 9),
+        ]
+    )
+    print("Exercise 4 — @validate_arguments")
+    run_checks(
+        [
+            ("valid call", lambda: make_add_item()("TEA", 2), "2 x TEA"),
+            ("defaults pass", lambda: make_add_item()("TEA"), "1 x TEA"),
+            (
+                "bad positional",
+                lambda: type_error_message(lambda: make_add_item()("TEA", "2")),
+                "quantity must be int, got str",
+            ),
+            (
+                "bad keyword-only",
+                lambda: type_error_message(lambda: make_add_item()("TEA", note=5)),
+                "note must be str, got int",
+            ),
+            (
+                "unchecked annotations",
+                lambda: make_add_item()("TEA", tags="x", extra=object()),
+                "1 x TEA",
+            ),
+            (
+                "missing argument",
+                lambda: raised_error_name(lambda: make_add_item()()),
+                "TypeError",
+            ),
+            ("keeps name", lambda: make_add_item().__name__, "add_item"),
+        ]
+    )
+    print("Exercise 5 — serialize() with singledispatch")
+    run_checks(
+        [
+            ("Decimal", lambda: serialize(Decimal("249.50")), "249.50"),
+            (
+                "datetime",
+                lambda: serialize(dt.datetime(2026, 11, 5, 9, 30)),
+                "2026-11-05T09:30:00",
+            ),
+            ("set sorted", lambda: serialize({3, 1, 2}), [1, 2, 3]),
+            ("dict keys become str", lambda: serialize({1: Decimal("1.5")}), {"1": "1.5"}),
+            (
+                "nested order",
+                lambda: serialize(SAMPLE_ORDER_FOR_SERIALIZE),
+                {
+                    "order_id": 1042,
+                    "placed_on": "2026-11-05",
+                    "total": "889.50",
+                    "items": ["TEA-500G", "RICE-5KG"],
+                    "tags": ["express", "gift"],
+                    "paid": True,
+                    "coupon": None,
+                },
+            ),
+            (
+                "unsupported type",
+                lambda: raised_error_name(lambda: serialize(object())),
+                "TypeError",
+            ),
+            ("uses singledispatch", lambda: Decimal in serialize.registry, True),
+        ]
+    )
+    print("Exercise 6 — call_with_params")
+    run_checks(
+        [
+            (
+                "converts",
+                lambda: call_with_params(
+                    search_products,
+                    {"query": "tea", "page": "2", "max_price": "499.5", "in_stock": "Yes"},
+                ),
+                ("tea", 2, 499.5, True),
+            ),
+            (
+                "defaults",
+                lambda: call_with_params(search_products, {"query": "rice"}),
+                ("rice", 1, 1e9, False),
+            ),
+            (
+                "extra keys ignored",
+                lambda: call_with_params(search_products, {"query": "x", "utm_source": "ad"}),
+                ("x", 1, 1e9, False),
+            ),
+            (
+                "bool false",
+                lambda: call_with_params(search_products, {"query": "x", "in_stock": "0"})[3],
+                False,
+            ),
+            ("missing required", missing_message, "missing required parameter: query"),
+            (
+                "bad int",
+                lambda: raised_error_name(
+                    lambda: call_with_params(search_products, {"query": "x", "page": "two"})
+                ),
+                "ValueError",
+            ),
+            (
+                "bad bool",
+                lambda: raised_error_name(
+                    lambda: call_with_params(search_products, {"query": "x", "in_stock": "maybe"})
+                ),
+                "ValueError",
+            ),
+        ]
+    )
+    print("Exercise 7 — mini router")
+    run_checks(
+        [
+            (
+                "literal route",
+                lambda: make_shop_router().dispatch("GET", "/health"),
+                {"status": "ok"},
+            ),
+            (
+                "typed param",
+                lambda: make_shop_router().dispatch("GET", "/users/42"),
+                {"user_id": 42, "type": "int"},
+            ),
+            (
+                "two params",
+                lambda: make_shop_router().dispatch("GET", "/users/7/orders/A-19"),
+                (7, "A-19"),
+            ),
+            (
+                "method matters",
+                lambda: make_shop_router().dispatch("POST", "/users/7"),
+                "updated 7",
+            ),
+            (
+                "conversion failure is 404",
+                lambda: raised_error_name(lambda: make_shop_router().dispatch("GET", "/users/abc")),
+                "LookupError",
+            ),
+            (
+                "unknown path",
+                lambda: raised_error_name(lambda: make_shop_router().dispatch("GET", "/admin")),
+                "LookupError",
+            ),
+            (
+                "segment count matters",
+                lambda: raised_error_name(lambda: make_shop_router().dispatch("GET", "/users/7/x")),
+                "LookupError",
+            ),
+            ("decorator returns handler", decorator_returns_handler, True),
+        ]
+    )
+
+
+# Lab 1.13 ------------------------------------------------------------------------------------
+
+
+class Countdown:
+    """Re-iterable countdown from start to 1."""
+
+    def __init__(self, start: int) -> None:
+        if start < 0:
+            raise ValueError("start must not be negative")
+        self.start = start
+
+    def __iter__(self) -> Iterator[int]:
+        """A generator method: every loop gets a fresh generator."""
+        current = self.start
+        while current > 0:
+            yield current
+            current -= 1
+
+
+def read_log_records(path: Path) -> Iterator[dict[str, str]]:
+    """Yield {"date", "time", "level", "message"} for each record line of the file."""
+    with path.open(encoding="utf-8") as log_file:
+        for raw_line in log_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split(maxsplit=3)
+            if len(fields) < 4:
+                continue
+            date, time_of_day, level, message = fields
+            yield {"date": date, "time": time_of_day, "level": level, "message": message}
+
+
+def flatten(nested: Iterable[Any]) -> Iterator[Any]:
+    """Yield the leaves of nested lists and tuples."""
+    for item in nested:
+        if isinstance(item, (list, tuple)):
+            yield from flatten(item)
+        else:
+            yield item
+
+
+def running_average() -> Generator[float | None, float]:
+    """Receive numbers with send(); yield the running average."""
+    total = 0.0
+    count = 0
+    average: float | None = None
+    while True:
+        number = yield average
+        total += number
+        count += 1
+        average = total / count
+
+
+def paginate(fetch_page: Callable[[int], list[Any]]) -> Iterator[Any]:
+    """Yield items from pages 1, 2, … until fetch_page returns an empty list."""
+    for page_number in itertools.count(1):
+        page = fetch_page(page_number)
+        if not page:
+            return
+        yield from page
+
+
+def sliding_windows(iterable: Iterable[Any], size: int) -> Iterator[tuple[Any, ...]]:
+    """Yield overlapping windows of size consecutive items."""
+    if size < 1:
+        raise ValueError("size must be at least 1")
+    window: deque[Any] = deque(maxlen=size)
+    for item in iterable:
+        window.append(item)
+        if len(window) == size:
+            yield tuple(window)
+
+
+def summarize_log(records: Iterable[dict[str, str]]) -> dict[str, Any]:
+    """Return {"total", "by_level", "first_error"} in a single pass over records."""
+    level_counts: Counter[str] = Counter()
+    first_error: str | None = None
+    for record in records:
+        level_counts[record["level"]] += 1
+        if first_error is None and record["level"] == "ERROR":
+            first_error = record["message"]
+    return {
+        "total": level_counts.total(),
+        "by_level": dict(sorted(level_counts.items())),
+        "first_error": first_error,
+    }
+
+
+def analyze_log_file(path: Path) -> dict[str, Any]:
+    """Stream the file through read_log_records into summarize_log."""
+    return summarize_log(read_log_records(path))
+
+
+LEVEL_PATTERN = (
+    "INFO",
+    "INFO",
+    "DEBUG",
+    "INFO",
+    "WARNING",
+    "INFO",
+    "DEBUG",
+    "INFO",
+    "INFO",
+    "ERROR",
+)
+
+
+def write_big_log(path: Path, line_count: int) -> None:
+    """Write a comment, a blank line and line_count deterministic records."""
+    with path.open("w", encoding="utf-8") as log_file:
+        log_file.write("# synthetic service log\n\n")
+        log_file.writelines(
+            f"2026-11-05 {index // 3600 % 24:02d}:{index // 60 % 60:02d}:{index % 60:02d} "
+            f"{LEVEL_PATTERN[index % 10]} request {index} handled\n"
+            for index in range(line_count)
+        )
+
+
+def analyze_log_file_eager(path: Path) -> dict[str, Any]:
+    """Reference summary that reads the whole file into memory first."""
+    all_lines = path.read_text(encoding="utf-8").splitlines()
+    level_counts: Counter[str] = Counter()
+    first_error = None
+    for line in all_lines:
+        fields = line.strip().split(maxsplit=3)
+        if len(fields) < 4 or fields[0].startswith("#"):
+            continue
+        level_counts[fields[2]] += 1
+        if fields[2] == "ERROR" and first_error is None:
+            first_error = fields[3]
+    return {
+        "total": level_counts.total(),
+        "by_level": dict(sorted(level_counts.items())),
+        "first_error": first_error,
+    }
+
+
+def peak_memory(function: Callable[..., Any], *args: Any) -> tuple[Any, int]:
+    """Return (function(*args), peak traced bytes during the call)."""
+    tracemalloc.start()
+    try:
+        result = function(*args)
+        return result, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+SAMPLE_LOG_TEXT = (
+    "# service log\n"
+    "2026-11-05 09:30:01 INFO user asha logged in\n"
+    "\n"
+    "2026-11-05 09:30:05 ERROR payment failed: card declined\n"
+    "garbage line\n"
+    "2026-11-05 09:31:00 WARNING disk 91% full\n"
+)
+
+
+def averages_for(numbers: list[float]) -> tuple[float | None, list[float | None]]:
+    """Prime a running_average and send numbers; return (priming value, averages)."""
+    averager = running_average()
+    priming_value = next(averager)
+    return priming_value, [averager.send(number) for number in numbers]
+
+
+def make_fake_api(items: list[Any], page_size: int) -> Callable[[int], list[Any]]:
+    """Return fetch_page(page_number) serving items in pages; records requested pages."""
+    requested_pages: list[int] = []
+
+    def fetch_page(page_number: int) -> list[Any]:
+        requested_pages.append(page_number)
+        start = (page_number - 1) * page_size
+        return items[start : start + page_size]
+
+    fetch_page.requested_pages = requested_pages
+    return fetch_page
+
+
+def lazy_fetch_trace() -> tuple[list[str], list[int]]:
+    """Take 3 items with page size 2: only pages 1 and 2 may be fetched."""
+    fetch_page = make_fake_api(["A-1", "A-2", "A-3", "A-4", "A-5"], page_size=2)
+    first_three = list(itertools.islice(paginate(fetch_page), 3))
+    return first_three, fetch_page.requested_pages
+
+
+def streaming_vs_eager(work_dir: Path) -> tuple[Any, ...]:
+    """Analyze a 1M-line log both ways; return the comparison."""
+    big_log_path = work_dir / "unit_1_13_big.log"
+    try:
+        write_big_log(big_log_path, 1_000_000)
+        streamed, streaming_peak = peak_memory(analyze_log_file, big_log_path)
+        eager, eager_peak = peak_memory(analyze_log_file_eager, big_log_path)
+        print(f"  peak memory: streaming {streaming_peak / 1e3:,.0f} kB", end=", ")
+        print(f"eager {eager_peak / 1e6:,.0f} MB")
+        return (
+            streamed == eager,
+            streamed["total"],
+            streamed["by_level"],
+            streamed["first_error"],
+            streaming_peak * 20 < eager_peak,
+        )
+    finally:
+        big_log_path.unlink(missing_ok=True)
+
+
+SMALL_LOG_RECORDS = [
+    {"date": "d", "time": "t", "level": "WARNING", "message": "slow"},
+    {"date": "d", "time": "t", "level": "ERROR", "message": "first failure"},
+    {"date": "d", "time": "t", "level": "ERROR", "message": "second failure"},
+]
+
+
+def check_lab_1_13() -> None:
+    """Run the same checks as the Lab 1.13 check cells in the notebook."""
+    print("Exercise 1 — re-iterable Countdown")
+    run_checks(
+        [
+            ("counts down", lambda: list(Countdown(3)), [3, 2, 1]),
+            (
+                "re-iterable",
+                lambda: (lambda launch: (list(launch), list(launch)))(Countdown(2)),
+                ([2, 1], [2, 1]),
+            ),
+            (
+                "nested loops",
+                lambda: len([(a, b) for launch in [Countdown(3)] for a in launch for b in launch]),
+                9,
+            ),
+            ("zero", lambda: list(Countdown(0)), []),
+            ("negative", lambda: raised_error_name(lambda: Countdown(-1)), "ValueError"),
+            ("__iter__ is a generator", lambda: inspect.isgenerator(iter(Countdown(3))), True),
+        ]
+    )
+    with tempfile.TemporaryDirectory() as temporary_folder:
+        work_dir = Path(temporary_folder)
+        sample_log_path = work_dir / "unit_1_13_sample.log"
+        sample_log_path.write_text(SAMPLE_LOG_TEXT, encoding="utf-8")
+        missing_log_path = work_dir / "unit_1_13_missing.log"
+        print("Exercise 2 — read_log_records")
+        run_checks(
+            [
+                ("record count", lambda: len(list(read_log_records(sample_log_path))), 3),
+                (
+                    "first record",
+                    lambda: next(read_log_records(sample_log_path)),
+                    {
+                        "date": "2026-11-05",
+                        "time": "09:30:01",
+                        "level": "INFO",
+                        "message": "user asha logged in",
+                    },
+                ),
+                (
+                    "levels",
+                    lambda: [r["level"] for r in read_log_records(sample_log_path)],
+                    ["INFO", "ERROR", "WARNING"],
+                ),
+                (
+                    "is a generator",
+                    lambda: inspect.isgenerator(read_log_records(sample_log_path)),
+                    True,
+                ),
+                (
+                    "lazy open",
+                    lambda: raised_error_name(lambda: read_log_records(missing_log_path)),
+                    "no error",
+                ),
+                (
+                    "error on first next",
+                    lambda: raised_error_name(lambda: next(read_log_records(missing_log_path))),
+                    "FileNotFoundError",
+                ),
+            ]
+        )
+        print("Exercise 3 — flatten")
+        run_checks(
+            [
+                (
+                    "deep",
+                    lambda: list(flatten([1, [2, [3, [4, (5, 6)]]], 7])),
+                    [1, 2, 3, 4, 5, 6, 7],
+                ),
+                (
+                    "strings are leaves",
+                    lambda: list(flatten(["tea", ["rice", ("soap",)]])),
+                    ["tea", "rice", "soap"],
+                ),
+                ("dicts are leaves", lambda: list(flatten([{"a": 1}, [[]]])), [{"a": 1}]),
+                ("empty", lambda: list(flatten([[], [[]]])), []),
+                ("tuple at the top", lambda: list(flatten((1, (2, [3])))), [1, 2, 3]),
+                ("is a generator", lambda: inspect.isgenerator(flatten([])), True),
+            ]
+        )
+        print("Exercise 4 — running_average")
+        run_checks(
+            [
+                ("averages", lambda: averages_for([10, 20, 60]), (None, [10.0, 15.0, 30.0])),
+                ("floats", lambda: averages_for([1, 2])[1], [1.0, 1.5]),
+                (
+                    "independent",
+                    lambda: (averages_for([100])[1], averages_for([2])[1]),
+                    ([100.0], [2.0]),
+                ),
+                ("is a generator", lambda: inspect.isgenerator(running_average()), True),
+            ]
+        )
+        print("Exercise 5 — paginate")
+        run_checks(
+            [
+                (
+                    "all items",
+                    lambda: list(paginate(make_fake_api(list(range(7)), 3))),
+                    [0, 1, 2, 3, 4, 5, 6],
+                ),
+                ("fetches lazily", lazy_fetch_trace, (["A-1", "A-2", "A-3"], [1, 2])),
+                ("no items", lambda: list(paginate(make_fake_api([], 3))), []),
+                (
+                    "nothing fetched before iteration",
+                    lambda: (lambda api: (paginate(api), api.requested_pages)[1])(
+                        make_fake_api([1], 1)
+                    ),
+                    [],
+                ),
+            ]
+        )
+        print("Exercise 6 — sliding_windows")
+        run_checks(
+            [
+                (
+                    "windows of 3",
+                    lambda: list(sliding_windows("ABCD", 3)),
+                    [("A", "B", "C"), ("B", "C", "D")],
+                ),
+                ("size 1", lambda: list(sliding_windows([7, 8], 1)), [(7,), (8,)]),
+                ("too few items", lambda: list(sliding_windows([1, 2], 3)), []),
+                (
+                    "infinite input",
+                    lambda: list(itertools.islice(sliding_windows(itertools.count(), 2), 3)),
+                    [(0, 1), (1, 2), (2, 3)],
+                ),
+                (
+                    "moving average",
+                    lambda: [sum(w) / 2 for w in sliding_windows([10, 20, 40], 2)],
+                    [15.0, 30.0],
+                ),
+                (
+                    "size 0",
+                    lambda: raised_error_name(lambda: list(sliding_windows([1], 0))),
+                    "ValueError",
+                ),
+            ]
+        )
+        print("Exercise 7 — streaming analysis of a 1M-line log")
+        run_checks(
+            [
+                (
+                    "small input",
+                    lambda: summarize_log(SMALL_LOG_RECORDS),
+                    {
+                        "total": 3,
+                        "by_level": {"ERROR": 2, "WARNING": 1},
+                        "first_error": "first failure",
+                    },
+                ),
+                (
+                    "accepts an iterator",
+                    lambda: summarize_log(iter(SMALL_LOG_RECORDS))["total"],
+                    3,
+                ),
+                (
+                    "no records",
+                    lambda: summarize_log([]),
+                    {"total": 0, "by_level": {}, "first_error": None},
+                ),
+                (
+                    "1M lines: same result, 20x less memory",
+                    lambda: streaming_vs_eager(work_dir),
+                    (
+                        True,
+                        1_000_000,
+                        {"DEBUG": 200_000, "ERROR": 100_000, "INFO": 600_000, "WARNING": 100_000},
+                        "request 9 handled",
+                        True,
+                    ),
+                ),
+            ]
+        )
+
+
 if __name__ == "__main__":
     for lab_title, check_lab in [
         ("Lab 1.3", check_lab_1_3),
@@ -1495,6 +2696,9 @@ if __name__ == "__main__":
         ("Lab 1.8", check_lab_1_8),
         ("Lab 1.9", check_lab_1_9),
         ("Lab 1.10", check_lab_1_10),
+        ("Lab 1.11", check_lab_1_11),
+        ("Lab 1.12", check_lab_1_12),
+        ("Lab 1.13", check_lab_1_13),
     ]:
         print(f"\n=== {lab_title} ===")
         check_lab()
