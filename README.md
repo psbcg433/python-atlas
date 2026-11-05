@@ -86,7 +86,7 @@ uv run python exercises/solutions/phase0_solutions.py
 | Phase | Notebook | Status |
 | --- | --- | --- |
 | 0 | `phase0_environment_setup.ipynb` | Done |
-| 1 | `phase1_language_fundamentals.ipynb` | Not started |
+| 1 | `phase1_language_fundamentals.ipynb` | Done |
 | 2 | `phase2_oop_data_model.ipynb` | Not started |
 | 3 | `phase3_python_internals.ipynb` | Not started |
 | 4 | `phase4_professional_python.ipynb` | Not started |

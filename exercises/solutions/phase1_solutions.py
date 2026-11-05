@@ -12,7 +12,9 @@ import functools
 import inspect
 import io
 import itertools
+import json
 import operator
+import os
 import re
 import tempfile
 import time
@@ -2686,6 +2688,512 @@ def check_lab_1_13() -> None:
         )
 
 
+# Lab 1.14 ------------------------------------------------------------------------------------
+
+AGE_NOT_A_NUMBER_NOTE = "age must be a whole number, e.g. 42"
+AGE_RANGE_NOTE = "age must be between 0 and 150"
+
+
+def parse_age(text: str) -> int:
+    """Parse an age in years, with helpful notes on failure."""
+    try:
+        age = int(text.strip())
+    except ValueError as error:
+        invalid = ValueError(f"invalid age: {text!r}")
+        invalid.add_note(AGE_NOT_A_NUMBER_NOTE)
+        raise invalid from error
+    if not 0 <= age <= 150:
+        out_of_range = ValueError(f"age out of range: {age}")
+        out_of_range.add_note(AGE_RANGE_NOTE)
+        raise out_of_range
+    return age
+
+
+class ConfigError(Exception):
+    """Raised when a configuration file cannot be loaded."""
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    """Load a JSON object from path, raising ConfigError on any failure."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise ConfigError(f"config file not found: {path.name}") from error
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"invalid JSON in {path.name} at line {error.lineno}") from error
+    if not isinstance(data, dict):
+        raise ConfigError(f"config must be a JSON object, got {type(data).__name__}")
+    return data
+
+
+class StopwatchTimer:
+    """Context-manager stopwatch with laps and an injectable clock."""
+
+    def __init__(self, clock: Callable[[], float] = time.perf_counter) -> None:
+        self.clock = clock
+        self.running = False
+        self.laps: list[float] = []
+        self._started: float | None = None
+        self._stopped: float | None = None
+        self._last_lap: float = 0.0
+
+    def __enter__(self) -> StopwatchTimer:
+        if self.running:
+            raise RuntimeError("stopwatch is already running")
+        self._started = self._last_lap = self.clock()
+        self._stopped = None
+        self.laps = []
+        self.running = True
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._stopped = self.clock()
+        self.running = False
+
+    @property
+    def elapsed(self) -> float:
+        """Seconds since the start: live while running, frozen after the block."""
+        if self._started is None:
+            return 0.0
+        end = self.clock() if self.running else self._stopped
+        assert end is not None
+        return end - self._started
+
+    def lap(self) -> float:
+        """Record and return the seconds since the previous lap (or the start)."""
+        if not self.running:
+            raise RuntimeError("stopwatch is not running")
+        now = self.clock()
+        lap_seconds = now - self._last_lap
+        self._last_lap = now
+        self.laps.append(lap_seconds)
+        return lap_seconds
+
+
+@contextlib.contextmanager
+def temporary_env(**variables: str | None) -> Iterator[None]:
+    """Temporarily set (or unset, with None) environment variables."""
+    previous = {name: os.environ.get(name) for name in variables}
+    try:
+        for name, value in variables.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, old_value in previous.items():
+            if old_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old_value
+
+
+def open_utf8(path: Path) -> IO[str]:
+    """Default opener for open_many."""
+    return open(path, encoding="utf-8")  # closed by the caller's ExitStack
+
+
+@contextlib.contextmanager
+def open_many(
+    paths: Iterable[Path],
+    opener: Callable[[Path], IO[str]] | None = None,
+) -> Iterator[list[IO[str]]]:
+    """Open all paths; close all of them on exit."""
+    open_one = opener or open_utf8
+    with contextlib.ExitStack() as stack:
+        yield [stack.enter_context(open_one(path)) for path in paths]
+
+
+REQUIRED_SIGNUP_FIELDS = ("name", "age", "email")
+
+
+def record_errors(record: dict[str, Any]) -> list[Exception]:
+    """Every problem with one record, in field order."""
+    errors: list[Exception] = []
+    for field_name in REQUIRED_SIGNUP_FIELDS:
+        if field_name not in record:
+            errors.append(KeyError(field_name))
+            continue
+        value = record[field_name]
+        if field_name == "name" and not (isinstance(value, str) and value.strip()):
+            errors.append(ValueError("name must be a non-empty string"))
+        elif field_name == "age" and not (
+            isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 150
+        ):
+            errors.append(ValueError("age must be an integer between 0 and 150"))
+        elif field_name == "email" and not (isinstance(value, str) and "@" in value):
+            errors.append(ValueError("email must contain '@'"))
+    return errors
+
+
+def validate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return records unchanged, or raise an ExceptionGroup of every problem."""
+    all_errors: list[Exception] = []
+    for index, record in enumerate(records):
+        for error in record_errors(record):
+            error.add_note(f"record {index}")
+            all_errors.append(error)
+    if all_errors:
+        raise ExceptionGroup("invalid records", all_errors)
+    return records
+
+
+def summarize_validation(records: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Handle the ExceptionGroup with except* and summarize it."""
+    summary: dict[str, list[str]] = {"missing": [], "invalid": []}
+    try:
+        validate_records(records)
+    except* KeyError as missing_group:
+        summary["missing"] = [f"{e.__notes__[0]}: {e.args[0]}" for e in missing_group.exceptions]
+    except* ValueError as invalid_group:
+        summary["invalid"] = [f"{e.__notes__[0]}: {e}" for e in invalid_group.exceptions]
+    return summary
+
+
+def caught_error(thunk: Callable[[], object]) -> BaseException | None:
+    """Return the exception thunk raises, or None."""
+    try:
+        thunk()
+    except BaseException as error:
+        return error
+    return None
+
+
+def error_report(thunk: Callable[[], object]) -> tuple[str, str, list[str], str]:
+    """(type, message, notes, cause type) of the raised exception."""
+    error = caught_error(thunk)
+    return (
+        type(error).__name__,
+        str(error),
+        getattr(error, "__notes__", []),
+        type(error.__cause__).__name__ if error is not None else "",
+    )
+
+
+def stopwatch_laps() -> tuple[list[float], float]:
+    """Readings: enter 0, lap 1, lap 3, exit 6."""
+    with StopwatchTimer(clock=fake_clock(0.0, 1.0, 3.0, 6.0)) as stopwatch:
+        stopwatch.lap()
+        stopwatch.lap()
+    return stopwatch.laps, stopwatch.elapsed
+
+
+def stopwatch_while_running() -> tuple[bool, float, bool, float]:
+    """Readings: enter 10, elapsed read 14, exit 15."""
+    stopwatch = StopwatchTimer(clock=fake_clock(10.0, 14.0, 15.0))
+    with stopwatch:
+        during = (stopwatch.running, stopwatch.elapsed)
+    return (*during, stopwatch.running, stopwatch.elapsed)
+
+
+def stopwatch_on_error() -> tuple[str, float]:
+    """The body raises; the time is still recorded and the error propagates."""
+    stopwatch = StopwatchTimer(clock=fake_clock(0.0, 2.5))
+
+    def failing_block() -> None:
+        with stopwatch:
+            raise ValueError("body failed")
+
+    return raised_error_name(failing_block), stopwatch.elapsed
+
+
+def stopwatch_nested() -> str:
+    """Entering a running stopwatch must fail."""
+    stopwatch = StopwatchTimer(clock=fake_clock(0.0, 1.0, 2.0, 3.0))
+    with stopwatch:
+        return raised_error_name(lambda: stopwatch.__enter__())
+
+
+def stopwatch_real_clock() -> bool:
+    """The default clock measures real time."""
+    with StopwatchTimer() as stopwatch:
+        time.sleep(0.01)
+    return stopwatch.elapsed >= 0.01
+
+
+def env_inside_and_after() -> tuple[str | None, str | None]:
+    """Value inside the block, then after it."""
+    with temporary_env(LAB_1_14_MODE="test"):
+        inside = os.environ.get("LAB_1_14_MODE")
+    return inside, os.environ.get("LAB_1_14_MODE")
+
+
+def env_restores_existing() -> tuple[str | None, str | None, str | None]:
+    """An existing variable: overridden, unset, then restored."""
+    os.environ["LAB_1_14_REGION"] = "ap-south-1"
+    try:
+        with temporary_env(LAB_1_14_REGION="eu-west-1"):
+            overridden = os.environ.get("LAB_1_14_REGION")
+        with temporary_env(LAB_1_14_REGION=None):
+            unset = os.environ.get("LAB_1_14_REGION")
+        return overridden, unset, os.environ.get("LAB_1_14_REGION")
+    finally:
+        os.environ.pop("LAB_1_14_REGION", None)
+
+
+def env_after_error() -> tuple[str, str | None]:
+    """The block raises; the variable must still be removed."""
+
+    def failing_block() -> None:
+        with temporary_env(LAB_1_14_MODE="broken"):
+            raise RuntimeError("body failed")
+
+    return raised_error_name(failing_block), os.environ.get("LAB_1_14_MODE")
+
+
+def make_recording_opener() -> tuple[Callable[[Path], IO[str]], list[IO[str]]]:
+    """An opener that remembers every file it opened."""
+    opened: list[IO[str]] = []
+
+    def recording_opener(path: Path) -> IO[str]:
+        stream = open(path, encoding="utf-8")  # closed by open_many
+        opened.append(stream)
+        return stream
+
+    return recording_opener, opened
+
+
+def read_all_parts(part_paths: list[Path]) -> tuple[list[str], bool]:
+    """Read every part; afterwards all files must be closed."""
+    opener, opened = make_recording_opener()
+    with open_many(part_paths, opener) as streams:
+        contents = [stream.read().strip() for stream in streams]
+    return contents, all(stream.closed for stream in opened)
+
+
+def partial_failure(part_paths: list[Path], missing_path: Path) -> tuple[str, int, bool]:
+    """The third path is missing: the two opened files must be closed."""
+    opener, opened = make_recording_opener()
+
+    def open_them() -> None:
+        with open_many([*part_paths[:2], missing_path], opener):
+            pass
+
+    return raised_error_name(open_them), len(opened), all(s.closed for s in opened)
+
+
+def closed_after_body_error(part_paths: list[Path]) -> tuple[str, bool]:
+    """The body raises: files are closed and the error propagates."""
+    opener, opened = make_recording_opener()
+
+    def failing_block() -> None:
+        with open_many(part_paths, opener):
+            raise KeyError("body failed")
+
+    return raised_error_name(failing_block), all(s.closed for s in opened)
+
+
+def no_paths() -> list[IO[str]]:
+    """An empty iterable yields an empty list."""
+    with open_many([]) as streams:
+        return streams
+
+
+def default_opener(part_paths: list[Path]) -> list[str]:
+    """Without an opener, files are opened as UTF-8 text."""
+    with open_many(part_paths[:1]) as streams:
+        return [stream.read().strip() for stream in streams]
+
+
+SAMPLE_SIGNUPS: list[dict[str, Any]] = [
+    {"name": "Asha", "age": 31, "email": "asha@example.com"},
+    {"name": "  ", "age": 200, "email": "ravi@example.com"},
+    {"name": "Meena", "email": "meena.example.com"},
+    {"name": "John", "age": True, "email": "john@example.com"},
+]
+VALID_SIGNUPS = SAMPLE_SIGNUPS[:1]
+
+
+def group_shape(thunk: Callable[[], object]) -> tuple[str, str, int, list[str], int]:
+    """(type, message, leaf count, first leaf's notes, KeyError count)."""
+    error = caught_error(thunk)
+    if not isinstance(error, ExceptionGroup):
+        return (type(error).__name__, str(error), 0, [], 0)
+    missing_group = error.subgroup(KeyError)
+    return (
+        type(error).__name__,
+        error.message,
+        len(error.exceptions),
+        error.exceptions[0].__notes__,
+        len(missing_group.exceptions) if missing_group else 0,
+    )
+
+
+def check_lab_1_14() -> None:
+    """Run the same checks as the Lab 1.14 check cells in the notebook."""
+    print("Exercise 1 — parse_age")
+    run_checks(
+        [
+            ("plain", lambda: parse_age("42"), 42),
+            ("whitespace", lambda: parse_age(" 7 "), 7),
+            ("bounds", lambda: (parse_age("0"), parse_age("150")), (0, 150)),
+            (
+                "not a number",
+                lambda: error_report(lambda: parse_age("abc")),
+                ("ValueError", "invalid age: 'abc'", [AGE_NOT_A_NUMBER_NOTE], "ValueError"),
+            ),
+            ("decimal", lambda: error_report(lambda: parse_age("4.5"))[1], "invalid age: '4.5'"),
+            (
+                "too large",
+                lambda: error_report(lambda: parse_age("200")),
+                ("ValueError", "age out of range: 200", [AGE_RANGE_NOTE], "NoneType"),
+            ),
+            ("negative", lambda: error_report(lambda: parse_age("-1"))[1], "age out of range: -1"),
+        ]
+    )
+    with tempfile.TemporaryDirectory() as work_folder:
+        work_dir = Path(work_folder)
+        print("Exercise 2 — load_config")
+        good_config = work_dir / "lab_1_14_good.json"
+        good_config.write_text('{"debug": true, "port": 8000}', encoding="utf-8")
+        broken_config = work_dir / "lab_1_14_broken.json"
+        broken_config.write_text('{"debug": true,\n "port": }', encoding="utf-8")
+        list_config = work_dir / "lab_1_14_list.json"
+        list_config.write_text("[1, 2]", encoding="utf-8")
+        missing_config = work_dir / "lab_1_14_missing.json"
+        run_checks(
+            [
+                ("loads", lambda: load_config(good_config), {"debug": True, "port": 8000}),
+                (
+                    "missing",
+                    lambda: error_report(lambda: load_config(missing_config)),
+                    (
+                        "ConfigError",
+                        "config file not found: lab_1_14_missing.json",
+                        [],
+                        "FileNotFoundError",
+                    ),
+                ),
+                (
+                    "invalid JSON",
+                    lambda: error_report(lambda: load_config(broken_config)),
+                    (
+                        "ConfigError",
+                        "invalid JSON in lab_1_14_broken.json at line 2",
+                        [],
+                        "JSONDecodeError",
+                    ),
+                ),
+                (
+                    "not an object",
+                    lambda: error_report(lambda: load_config(list_config)),
+                    ("ConfigError", "config must be a JSON object, got list", [], "NoneType"),
+                ),
+            ]
+        )
+        print("Exercise 3 — StopwatchTimer")
+        run_checks(
+            [
+                (
+                    "returns self",
+                    lambda: (lambda s: s.__enter__() is s)(StopwatchTimer(fake_clock(0.0))),
+                    True,
+                ),
+                (
+                    "before start",
+                    lambda: (lambda s: (s.elapsed, s.running, s.laps))(StopwatchTimer()),
+                    (0.0, False, []),
+                ),
+                ("laps and total", stopwatch_laps, ([1.0, 2.0], 6.0)),
+                (
+                    "elapsed while running, frozen after",
+                    stopwatch_while_running,
+                    (True, 4.0, False, 5.0),
+                ),
+                ("error propagates, time recorded", stopwatch_on_error, ("ValueError", 2.5)),
+                (
+                    "lap when stopped",
+                    lambda: raised_error_name(lambda: StopwatchTimer().lap()),
+                    "RuntimeError",
+                ),
+                ("nested enter", stopwatch_nested, "RuntimeError"),
+                ("real clock", stopwatch_real_clock, True),
+            ]
+        )
+        print("Exercise 4 — temporary_env")
+        for variable_name in ("LAB_1_14_MODE", "LAB_1_14_REGION"):
+            os.environ.pop(variable_name, None)
+        run_checks(
+            [
+                ("set inside, removed after", env_inside_and_after, ("test", None)),
+                ("existing restored", env_restores_existing, ("eu-west-1", None, "ap-south-1")),
+                ("restored after an error", env_after_error, ("RuntimeError", None)),
+                (
+                    "built with @contextmanager",
+                    lambda: inspect.isgeneratorfunction(
+                        getattr(temporary_env, "__wrapped__", None)
+                    ),
+                    True,
+                ),
+            ]
+        )
+        print("Exercise 5 — open_many")
+        part_paths = []
+        for part_number in (1, 2, 3):
+            part_path = work_dir / f"lab_1_14_part_{part_number}.txt"
+            part_path.write_text(f"part {part_number}\n", encoding="utf-8")
+            part_paths.append(part_path)
+        missing_part = work_dir / "lab_1_14_missing_part.txt"
+        run_checks(
+            [
+                (
+                    "reads and closes",
+                    lambda: read_all_parts(part_paths),
+                    (["part 1", "part 2", "part 3"], True),
+                ),
+                (
+                    "failed open closes the others",
+                    lambda: partial_failure(part_paths, missing_part),
+                    ("FileNotFoundError", 2, True),
+                ),
+                (
+                    "closed after a body error",
+                    lambda: closed_after_body_error(part_paths),
+                    ("KeyError", True),
+                ),
+                ("default opener", lambda: default_opener(part_paths), ["part 1"]),
+                ("no paths", no_paths, []),
+            ]
+        )
+    print("Exercise 6 — validate_records / summarize_validation")
+    run_checks(
+        [
+            (
+                "valid returns the same list",
+                lambda: validate_records(VALID_SIGNUPS) is VALID_SIGNUPS,
+                True,
+            ),
+            (
+                "group of every problem",
+                lambda: group_shape(lambda: validate_records(SAMPLE_SIGNUPS)),
+                ("ExceptionGroup", "invalid records", 5, ["record 1"], 1),
+            ),
+            (
+                "summary",
+                lambda: summarize_validation(SAMPLE_SIGNUPS),
+                {
+                    "missing": ["record 2: age"],
+                    "invalid": [
+                        "record 1: name must be a non-empty string",
+                        "record 1: age must be an integer between 0 and 150",
+                        "record 2: email must contain '@'",
+                        "record 3: age must be an integer between 0 and 150",
+                    ],
+                },
+            ),
+            (
+                "summary of valid records",
+                lambda: summarize_validation(VALID_SIGNUPS),
+                {"missing": [], "invalid": []},
+            ),
+            ("empty input", lambda: validate_records([]), []),
+        ]
+    )
+
+
 if __name__ == "__main__":
     for lab_title, check_lab in [
         ("Lab 1.3", check_lab_1_3),
@@ -2699,6 +3207,7 @@ if __name__ == "__main__":
         ("Lab 1.11", check_lab_1_11),
         ("Lab 1.12", check_lab_1_12),
         ("Lab 1.13", check_lab_1_13),
+        ("Lab 1.14", check_lab_1_14),
     ]:
         print(f"\n=== {lab_title} ===")
         check_lab()
