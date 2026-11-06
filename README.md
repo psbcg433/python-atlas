@@ -25,6 +25,21 @@ an "under the hood" look at how CPython implements it.
 | 6 | Web Development with FastAPI | `phase6_web_fastapi.ipynb` | 6.1–6.8 |
 | — | Capstone Project | `capstone_task_tracker.ipynb` | — |
 
+## Study notes
+
+Each finished phase also has a textbook-style Markdown version of its notebook in `notes/phaseN/`,
+written for reading on a phone through GitHub. The notes explain each topic in prose first, then
+show the code with the real output it printed on CPython 3.15. Each unit file has a
+JavaScript → Python bridge table, predict-the-output questions and lab solutions in collapsible
+blocks, and a recap table.
+
+| Phase | Notes | Contents |
+| --- | --- | --- |
+| 1 | [notes/phase1/](notes/phase1/README.md) | 14 unit chapters, the log analyzer case study with 30 review questions, and a [cheat sheet](notes/phase1/cheatsheet.md) |
+
+Start with the [Phase 1 index](notes/phase1/README.md), which gives the reading order and links
+every chapter.
+
 ## Repository layout
 
 ```text
@@ -86,13 +101,13 @@ uv run python exercises/solutions/phase0_solutions.py
 
 ## Progress
 
-| Phase | Notebook | Status |
-| --- | --- | --- |
-| 0 | `phase0_environment_setup.ipynb` | Done |
-| 1 | `phase1_language_fundamentals.ipynb` | Done |
-| 2 | `phase2_oop_data_model.ipynb` | Not started |
-| 3 | `phase3_python_internals.ipynb` | Not started |
-| 4 | `phase4_professional_python.ipynb` | Not started |
-| 5 | `phase5_concurrency_performance.ipynb` | Not started |
-| 6 | `phase6_web_fastapi.ipynb` | Not started |
-| — | `capstone_task_tracker.ipynb` | Not started |
+| Phase | Notebook | Status | Study notes |
+| --- | --- | --- | --- |
+| 0 | `phase0_environment_setup.ipynb` | Done | — |
+| 1 | `phase1_language_fundamentals.ipynb` | Done | [Done](notes/phase1/README.md) |
+| 2 | `phase2_oop_data_model.ipynb` | Not started | — |
+| 3 | `phase3_python_internals.ipynb` | Not started | — |
+| 4 | `phase4_professional_python.ipynb` | Not started | — |
+| 5 | `phase5_concurrency_performance.ipynb` | Not started | — |
+| 6 | `phase6_web_fastapi.ipynb` | Not started | — |
+| — | `capstone_task_tracker.ipynb` | Not started | — |
