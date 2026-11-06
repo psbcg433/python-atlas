@@ -300,7 +300,8 @@ print(f"{rows_from_tuple=}  (outer type converted, inner tuples shared)")
 
 ```text
 rows_copy is price_rows=False, rows_copy[0] is price_rows[0]=True
-rows_from_tuple=[(60, 40), (30, 45)]  (outer type converted, inner tuples shared)
+rows_from_tuple=[(60, 40), (30, 45)]
+  (outer type converted, inner tuples shared)
 ```
 
 ### `dict.copy()` and `dict(config)`
@@ -1276,7 +1277,8 @@ print(
 ```
 
 ```text
-line_snapshot=('TEA-500G', 'RICE-5KG')  (later appends do not reach the snapshot)
+line_snapshot=('TEA-500G', 'RICE-5KG')
+  (later appends do not reach the snapshot)
 copy.copy(line_snapshot) is line_snapshot=True
 copy.deepcopy(line_snapshot) is line_snapshot=True  (all elements immutable)
 item assignment: AttributeError

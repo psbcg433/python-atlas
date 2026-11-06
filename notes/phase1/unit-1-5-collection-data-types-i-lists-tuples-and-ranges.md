@@ -764,7 +764,8 @@ print(
 
 ```text
 sorted(['pen', 'Notebook', 'eraser'])=['Notebook', 'eraser', 'pen']
-sorted(['pen', 'Notebook', 'eraser'], key=str.lower)=['eraser', 'Notebook', 'pen']
+sorted(['pen', 'Notebook', 'eraser'], key=str.lower)=['eraser', 'Notebook',
+  'pen']
 ['eraser', 'pen', 'Notebook', 'Bag']
 [Product(name='eraser', price=5, rating=4.2), Product(name='pen', price=20,
   rating=4.2)]
@@ -800,7 +801,8 @@ print(f"{sorted([3, '2', 1], key=str)=}  (an explicit key makes it work)")
 
 ```text
 sorted([10, 9, 1, 100])=[1, 9, 10, 100]
-sorted(['10', '9', '1', '100'])=['1', '10', '100', '9']  (what JS does to numbers)
+sorted(['10', '9', '1', '100'])=['1', '10', '100', '9']  (what JS does to
+  numbers)
 TypeError: '<' not supported between instances of 'str' and 'int'
 sorted([3, '2', 1], key=str)=[1, '2', 3]  (an explicit key makes it work)
 ```
@@ -1748,3 +1750,680 @@ mixed types: TypeError
 | No holes | Assigning past the end raises |
 | `in` | Identity first, then `==` |
 | Comparison | Lexicographic, by contents |
+
+## 1.5.10 Method reference — `tuple`, `namedtuple` and `range`
+
+The immutable sequences have much smaller APIs, because everything that
+would change them is missing. The tables are grouped by type. Tuple examples
+start from `t = (3, 1, 2, 1)`; named-tuple examples use
+`P = namedtuple("P", ["x", "y"], defaults=[0])` and `p = P._make([1, 2])`;
+range examples use `r = range(0, 10, 2)`.
+
+### `tuple`
+
+| Method / operation | What it does | Example | Result |
+| --- | --- | --- | --- |
+| `count(x)`, `index(x[, s[, e]])` | the only two methods | `t.count(1), t.index(1)` | `(2, 1)` |
+| index, slice, `in`, `+`, `*`, `len` | like lists; new tuples | `t + (4,)` | `(3, 1, 2, 1, 4)` |
+| `hash(t)` | works if every item is hashable | `hash((1, 'a'))` | an `int` |
+| `a, b = t`, `first, *rest = t` | unpacking | `a, *rest = t` | `3`, `[1, 2, 1]` |
+
+### `namedtuple`
+
+| Method | What it does | Example | Result |
+| --- | --- | --- | --- |
+| `_make(iterable)` | construct from an iterable | `P._make([1, 2])` | `P(x=1, y=2)` |
+| `_asdict()` | convert to a `dict` | `p._asdict()` | `{'x': 1, 'y': 2}` |
+| `_replace(**changes)` | modified copy | `p._replace(y=5)` | `P(x=1, y=5)` |
+| `_fields` | field names | `P._fields` | `('x', 'y')` |
+| `_field_defaults` | defaults by field | `P._field_defaults` | `{'y': 0}` |
+
+### `range`
+
+| Method | What it does | Example | Result |
+| --- | --- | --- | --- |
+| `start`, `stop`, `step` | the three attributes | `r.start, r.stop, r.step` | `(0, 10, 2)` |
+| `count(x)` | 0 or 1, computed | `r.count(4)` | `1` |
+| `index(x)` | position, computed in O(1) | `r.index(6)` | `3` |
+
+### `tuple`: `count(x)`, `index(x[, start[, end]])`
+
+These are the only two public methods, as `dir(tuple)` confirms.
+
+```python
+weekday_codes = ("Mon", "Tue", "Wed", "Tue", "Fri")
+tuple_method_names = [
+    name for name in dir(tuple) if not name.startswith("_")
+]
+print(f"{tuple_method_names=}")
+print(f"{weekday_codes.count('Tue')=}, {weekday_codes.index('Tue', 2)=}")
+print(f"missing: {raised_error_name(lambda: weekday_codes.index('Sun'))}")
+```
+
+```text
+tuple_method_names=['count', 'index']
+weekday_codes.count('Tue')=2, weekday_codes.index('Tue', 2)=3
+missing: ValueError
+```
+
+### `tuple`: indexing, slicing, `in`, `+`, `*`, `len`, comparison
+
+Same semantics as lists, but every result is a new tuple. Note the last
+result: a tuple never equals a list, even with the same items, because
+`==` between sequences requires the same type.
+
+```python
+rgb_colour = (255, 153, 51)
+print(
+    f"{rgb_colour[0]=}, {rgb_colour[-2:]=}, "
+    f"{153 in rgb_colour=}, {len(rgb_colour)=}"
+)
+print(f"{rgb_colour + (128,)=}, {(0,) * 3=}")
+print(f"{(1, 2, 3) < (1, 3)=}, {(1, 2) == (1, 2)=}, {(1, 2) == [1, 2]=}")
+```
+
+```text
+rgb_colour[0]=255, rgb_colour[-2:]=(153, 51), 153 in rgb_colour=True,
+  len(rgb_colour)=3
+rgb_colour + (128,)=(255, 153, 51, 128), (0,) * 3=(0, 0, 0)
+(1, 2, 3) < (1, 3)=True, (1, 2) == (1, 2)=True, (1, 2) == [1, 2]=False
+```
+
+### `tuple`: `hash(t)`
+
+Works only when every item is hashable, which is what lets tuples key a dict
+or live in a set. Grid coordinates in a set are a common example; the
+duplicate `(0, 0)` collapses into one entry.
+
+```python
+route_distances = {("Delhi", "Agra"): 233, ("Mumbai", "Pune"): 148}
+print(f"{route_distances[('Delhi', 'Agra')]=}")
+visited_cells = {(0, 0), (0, 1), (0, 0)}
+print(f"{visited_cells=}")
+print(
+    "tuple holding a list: "
+    f"{raised_error_name(lambda: hash(('Delhi', ['Agra'])))}"
+)
+```
+
+```text
+route_distances[('Delhi', 'Agra')]=233
+visited_cells={(0, 1), (0, 0)}
+tuple holding a list: TypeError
+```
+
+> **Note:** set display order is not guaranteed; it depends on the hash
+> values, so `visited_cells` may print in a different order elsewhere.
+
+### `tuple`: unpacking `a, b = t`, `first, *rest = t`
+
+The most common way to read a tuple. Without a star, the number of names
+must match the number of items exactly.
+
+```python
+delivery_record = ("A-17", "Asha", "Pune", 450)
+order_id, customer_name, delivery_city, amount_due = delivery_record
+first_field, *remaining_fields = delivery_record
+print(f"{order_id=}, {amount_due=}, {first_field=}, {remaining_fields=}")
+try:
+    order_id, customer_name = delivery_record
+except ValueError as error:
+    print(f"{type(error).__name__}: {error}")
+```
+
+```text
+order_id='A-17', amount_due=450, first_field='A-17',
+  remaining_fields=['Asha', 'Pune', 450]
+ValueError: too many values to unpack (expected 2, got 4)
+```
+
+### `namedtuple`: `_make`, `_asdict`, `_replace`, `_fields`, `_field_defaults`
+
+Construction, conversion, modified copy and introspection in one example.
+The `defaults=` argument applies to the **rightmost** fields: with three
+fields and two defaults, `quantity` and `unit_price` get defaults and `item`
+stays required.
+
+```python
+OrderLine = namedtuple(
+    "OrderLine", ["item", "quantity", "unit_price"], defaults=[1, 0]
+)
+csv_line = OrderLine._make(["dosa", 2, 60])
+print(f"{csv_line=}")
+print(f"{csv_line._asdict()=}")
+print(f"{csv_line._replace(quantity=3)=}")
+print(f"{OrderLine._fields=}, {OrderLine._field_defaults=}")
+print(f"{OrderLine('tea')=}  (defaults filled in)")
+```
+
+```text
+csv_line=OrderLine(item='dosa', quantity=2, unit_price=60)
+csv_line._asdict()={'item': 'dosa', 'quantity': 2, 'unit_price': 60}
+csv_line._replace(quantity=3)=OrderLine(item='dosa', quantity=3, unit_price=60)
+OrderLine._fields=('item', 'quantity', 'unit_price'),
+  OrderLine._field_defaults={'quantity': 1, 'unit_price': 0}
+OrderLine('tea')=OrderLine(item='tea', quantity=1, unit_price=0)  (defaults
+  filled in)
+```
+
+### `range`: `start`, `stop`, `step`, `count(x)`, `index(x)`
+
+The three attributes, plus lookups computed arithmetically. Finding the
+index of 10¹⁷ in a range of 10¹⁸ numbers is instant, because no item is
+generated.
+
+```python
+even_hours = range(0, 24, 2)
+print(f"{even_hours.start=}, {even_hours.stop=}, {even_hours.step=}")
+print(
+    f"{even_hours.count(14)=}, {even_hours.count(15)=}, "
+    f"{even_hours.index(14)=}"
+)
+print(f"{range(10**18).index(10**17)=:,}  (instant: no scan)")
+print(f"not in range: {raised_error_name(lambda: even_hours.index(15))}")
+```
+
+```text
+even_hours.start=0, even_hours.stop=24, even_hours.step=2
+even_hours.count(14)=1, even_hours.count(15)=0, even_hours.index(14)=7
+range(10**18).index(10**17)=100,000,000,000,000,000  (instant: no scan)
+not in range: ValueError
+```
+
+### Key points
+
+| Idea | Takeaway |
+| --- | --- |
+| `tuple` API | Only `count` and `index` |
+| Tuple vs list | Never equal, even with same items |
+| Unpacking | Counts must match unless starred |
+| `defaults=` | Applies to the rightmost fields |
+| `range` lookups | `count`, `index` are O(1) |
+
+## 1.5.11 Real-world use cases
+
+Choosing the right sequence type is mostly about two questions: *will the
+collection change?* and *do the positions mean something?* This section
+shows each type in the kind of job it is good at.
+
+### `list`: ordered, changing collections
+
+Use a list for an ordered collection that grows and shrinks: shopping-cart
+items, a page of API results, rows read from a CSV file, or a **stack**
+(`append` to push, `pop` to pop, both O(1)). Ordered processing queues of
+moderate size also fit, as long as you take items from the end; for a true
+FIFO queue use `collections.deque`.
+
+```python
+undo_stack: list[str] = []
+for editor_action in ["type 'a'", "type 'b'", "bold"]:
+    undo_stack.append(editor_action)
+print(f"undo {undo_stack.pop()!r}; remaining stack: {undo_stack}")
+api_page = [{"id": 1, "item": "idli"}, {"id": 2, "item": "dosa"}]
+print(f"{[result['item'] for result in api_page]=}")
+csv_text = "id,item,price\n1,idli,40\n2,dosa,60\n"
+header_row, *data_rows = csv.reader(io.StringIO(csv_text))
+print(f"{header_row=}, {data_rows=}")
+```
+
+```text
+undo 'bold'; remaining stack: ["type 'a'", "type 'b'"]
+[result['item'] for result in api_page]=['idli', 'dosa']
+header_row=['id', 'item', 'price'], data_rows=[['1', 'idli', '40'], ['2',
+  'dosa', '60']]
+```
+
+Starred unpacking splits the CSV header from the data rows in one line, and
+it works directly on the `csv.reader` iterator.
+
+### `tuple`: fixed records and composite keys
+
+Use a tuple for a fixed record whose positions mean something: database rows
+(the `sqlite3` module returns each row as a tuple), `(latitude, longitude)`
+pairs, several return values from one function, composite dict keys like
+`(country, product)`, and constants that must not change. Returning
+`min(prices), max(prices)` packs a tuple; the caller unpacks it.
+
+```python
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def lowest_and_highest(prices: list[int]) -> tuple[int, int]:
+    """Return the lowest and highest price as one tuple."""
+    return min(prices), max(prices)
+
+
+cheapest_price, dearest_price = lowest_and_highest([40, 60, 35, 120])
+print(f"{cheapest_price=}, {dearest_price=}, {WEEKDAY_NAMES[4]=}")
+connection = sqlite3.connect(":memory:")
+connection.execute(
+    "CREATE TABLE stores (city TEXT, latitude REAL, longitude REAL)"
+)
+connection.execute("INSERT INTO stores VALUES ('Pune', 18.52, 73.86)")
+store_row = connection.execute("SELECT * FROM stores").fetchone()
+connection.close()
+print(f"{store_row=}, {type(store_row).__name__=}")
+units_sold = {("IN", "dosa"): 1200, ("IN", "idli"): 800, ("US", "dosa"): 150}
+india_units = sum(
+    count for (country, _), count in units_sold.items() if country == "IN"
+)
+print(f"{india_units=}")
+```
+
+```text
+cheapest_price=35, dearest_price=120, WEEKDAY_NAMES[4]='Fri'
+store_row=('Pune', 18.52, 73.86), type(store_row).__name__='tuple'
+india_units=2000
+```
+
+> **Note:** the last line was shortened from the notebook, which printed the
+> whole `sum(...)` expression with a self-documenting f-string; the value,
+> 2000, is the same. Notice the nested unpacking `(country, _), count` in the
+> generator: each dict item is a `((country, product), count)` pair.
+
+### `namedtuple` / `NamedTuple`: read-only records with names
+
+Use a named tuple for a lightweight read-only record with field names, such
+as a parsed log line or a CSV row. This reuses `LogEntry` from 1.5.6.
+
+```python
+raw_log_lines = [
+    "INFO|order placed|201",
+    "ERROR|payment failed|502",
+    "WARNING|slow response|200",
+]
+parsed_entries = []
+for raw_log_line in raw_log_lines:
+    level, message, status_text = raw_log_line.split("|")
+    parsed_entries.append(LogEntry(level, message, int(status_text)))
+print([entry.message for entry in parsed_entries if entry.is_error()])
+print(f"{parsed_entries[0]._asdict()=}")
+```
+
+```text
+['payment failed']
+parsed_entries[0]._asdict()={'level': 'INFO', 'message': 'order placed',
+  'status_code': 201}
+```
+
+### `range`: index loops, pagination and numeric intervals
+
+Use a range for index loops, pagination offsets (`range(0, total,
+page_size)`) and membership checks on numeric intervals. `range(18, 61)`
+means 18 to 60 inclusive, and `17.5 in working_age` is `False` because only
+integers are members.
+
+```python
+total_results, page_size = 95, 20
+page_offsets = range(0, total_results, page_size)
+for page_number, page_offset in enumerate(page_offsets, start=1):
+    page_end = min(page_offset + page_size, total_results)
+    print(f"page {page_number}: results {page_offset + 1}-{page_end}")
+working_age = range(18, 61)
+print(f"{25 in working_age=}, {61 in working_age=}, {17.5 in working_age=}")
+```
+
+```text
+page 1: results 1-20
+page 2: results 21-40
+page 3: results 41-60
+page 4: results 61-80
+page 5: results 81-95
+25 in working_age=True, 61 in working_age=False, 17.5 in working_age=False
+```
+
+### `array.array`: large numeric series
+
+Use an array for large numeric series where memory matters, such as sensor
+readings. The type code `"f"` stores 4-byte C floats, and `tobytes()` returns
+the raw block, ready to write to a file or send over a socket.
+
+```python
+temperature_readings = array.array("f")
+for minute in range(60 * 24):
+    temperature_readings.append(20 + (minute % 120) / 10)
+average_temperature = sum(temperature_readings) / len(temperature_readings)
+print(f"{len(temperature_readings)=}, {average_temperature=:.2f}")
+print(
+    f"{len(temperature_readings.tobytes())=:,} bytes "
+    "for a day of readings"
+)
+```
+
+```text
+len(temperature_readings)=1440, average_temperature=25.95
+len(temperature_readings.tobytes())=5,760 bytes for a day of readings
+```
+
+### Key points
+
+| Type | Choose it for |
+| --- | --- |
+| `list` | Changing ordered data, stacks |
+| `tuple` | Fixed records, keys, multiple returns |
+| Named tuple | Read-only records with field names |
+| `range` | Index loops, offsets, integer intervals |
+| `array.array` | Big numeric series, raw bytes |
+
+## Lab 1.5
+
+The lab has three coding exercises and a set of predict-the-output questions
+on aliasing. In the course notebook each exercise is a stub that raises
+`NotImplementedError` followed by a check cell that prints `PASS` or `FAIL`
+per test case; here you get the task, the test cases and hints, with the
+reference solution hidden.
+
+### Exercise 1 — sort employee records by several keys
+
+Order employees by **department ascending**, then **salary descending**,
+then **name ascending**. Write it twice:
+
+1. `sort_employees_multipass(employees)`: several stable `sorted()` passes,
+   with no tuple keys.
+2. `sort_employees_tuple_key(employees)`: one `sorted()` call with a tuple
+   key.
+
+Both must return a **new** list and leave the input unchanged. The data:
+
+```python
+class Employee(NamedTuple):
+    """An employee record for the sorting exercise."""
+
+    name: str
+    department: str
+    salary: int
+
+
+SAMPLE_EMPLOYEES = [
+    Employee("Asha", "Engineering", 120_000),
+    Employee("Ravi", "Sales", 80_000),
+    Employee("Meena", "Engineering", 150_000),
+    Employee("John", "Sales", 80_000),
+    Employee("Fatima", "Design", 95_000),
+    Employee("Arjun", "Engineering", 120_000),
+]
+```
+
+The checks:
+
+| Check | Expected |
+| --- | --- |
+| multi-pass order (names) | Fatima, Meena, Arjun, Asha, John, Ravi |
+| tuple-key order (names) | the same |
+| both versions agree | `True` |
+| multi-pass returns a new list | `True`, input unchanged |
+| tuple-key returns a new list | `True`, input unchanged |
+| empty list | `[]` |
+
+**Hints.** For multi-pass, sort by the least important key (name) first and
+the most important (department) last; use `reverse=True` on the salary pass.
+For the tuple key, negate the salary. `sorted()` always returns a new list.
+
+<details><summary>Solution</summary>
+
+```python
+def sort_employees_multipass(employees: list[Employee]) -> list[Employee]:
+    """Sort by department, salary (high first), name; multi-pass.
+
+    Passes run from the least important key to the most important one;
+    stability keeps the earlier order among ties.
+    """
+    by_name = sorted(employees, key=lambda employee: employee.name)
+    by_salary_descending = sorted(
+        by_name, key=lambda employee: employee.salary, reverse=True
+    )
+    return sorted(
+        by_salary_descending, key=lambda employee: employee.department
+    )
+
+
+def sort_employees_tuple_key(employees: list[Employee]) -> list[Employee]:
+    """Sort by department, salary (high first), name using one tuple key."""
+    return sorted(
+        employees,
+        key=lambda employee: (
+            employee.department,
+            -employee.salary,
+            employee.name,
+        ),
+    )
+```
+
+Within Engineering, Meena (150 000) comes first; Arjun and Asha tie on
+120 000, so the name decides. In Sales, John and Ravi tie on salary and are
+ordered by name.
+
+</details>
+
+### Exercise 2 — `transpose(matrix)`
+
+Write `transpose(matrix: list[list[T]]) -> list[list[T]]` using
+`zip(*matrix)`: rows become columns. Return a list of **lists** (not
+tuples). `[]` transposes to `[]`. If the rows have different lengths, raise
+`ValueError`.
+
+| Check | Input | Expected |
+| --- | --- | --- |
+| 2x3 becomes 3x2 | `[[1, 2, 3], [4, 5, 6]]` | `[[1, 4], [2, 5], [3, 6]]` |
+| square | `[[1, 2], [3, 4]]` | `[[1, 3], [2, 4]]` |
+| single row | `[["a", "b"]]` | `[["a"], ["b"]]` |
+| empty matrix | `[]` | `[]` |
+| rows are lists | `[[1, 2]]` | rows of type `list` |
+| ragged rows raise | `[[1, 2], [3]]` | `ValueError` |
+
+**Hints.** `zip(*matrix)` passes each row as a separate argument, and `zip`
+yields tuples of the first items, the second items, and so on. Convert each
+tuple with `list()`. `zip(..., strict=True)` raises `ValueError` when the
+iterables have different lengths. The signature uses the PEP 695 syntax
+`def transpose[T](...)` for a generic type parameter.
+
+<details><summary>Solution</summary>
+
+```python
+def transpose[T](matrix: list[list[T]]) -> list[list[T]]:
+    """Return the transpose of a rectangular matrix given as a list of rows.
+
+    Raises:
+        ValueError: if the rows have different lengths.
+    """
+    return [list(column) for column in zip(*matrix, strict=True)]
+```
+
+With an empty matrix, `zip()` receives no arguments and yields nothing, so
+the result is `[]`.
+
+</details>
+
+### Exercise 3 — `dedupe_preserving_order(items)`
+
+Write `dedupe_preserving_order(items: Iterable[T]) -> list[T]` for hashable
+items: keep the **first** occurrence of each item, in the original order. It
+must accept any iterable, including a one-shot iterator. Note that `1`, `1.0`
+and `True` are equal and hash the same, so they count as duplicates.
+
+| Check | Input | Expected |
+| --- | --- | --- |
+| ints | `[3, 1, 3, 2, 1]` | `[3, 1, 2]` |
+| strings | `["b", "a", "b", "c", "a"]` | `["b", "a", "c"]` |
+| empty | `[]` | `[]` |
+| one-shot iterator | `iter("mississippi")` | `["m", "i", "s", "p"]` |
+| equal numbers | `[1, 1.0, True, 2]` | `[1, 2]` |
+| tuples | `[(1, 2), (1, 2), (2, 1)]` | `[(1, 2), (2, 1)]` |
+
+**Hints.** Checking `item not in result_list` works but is O(n) per item,
+O(n²) overall. Keep a `set` of items already seen for O(1) membership, and
+loop over the input exactly once so iterators work.
+
+<details><summary>Solution</summary>
+
+```python
+def dedupe_preserving_order[T](items: Iterable[T]) -> list[T]:
+    """Return the items without duplicates, keeping first occurrences."""
+    seen_items: set[T] = set()
+    unique_items: list[T] = []
+    for item in items:
+        if item not in seen_items:
+            seen_items.add(item)
+            unique_items.append(item)
+    return unique_items
+```
+
+A one-line alternative is `list(dict.fromkeys(items))`: dict keys are unique
+and keep insertion order (Unit 1.6).
+
+</details>
+
+When all three solutions are in place, every check passes:
+
+```text
+Exercise 1 — sort employee records
+PASS  multi-pass order
+PASS  tuple-key order
+PASS  both versions agree
+PASS  multi-pass returns a new list
+PASS  tuple-key returns a new list
+PASS  empty list
+6/6 checks passed
+
+Exercise 2 — transpose
+PASS  2x3 becomes 3x2
+PASS  square
+PASS  single row
+PASS  empty matrix
+PASS  rows are lists
+PASS  ragged rows raise
+6/6 checks passed
+
+Exercise 3 — dedupe_preserving_order
+PASS  ints
+PASS  strings
+PASS  empty
+PASS  one-shot iterator
+PASS  1, 1.0 and True are equal
+PASS  tuples
+6/6 checks passed
+```
+
+### Exercise 4 — predict the output (aliasing)
+
+Each snippet below tests whether you can tell when two names, or two slots,
+refer to the **same** list object.
+
+**Question 1.**
+
+```python
+seating_grid = [[0] * 3] * 3
+seating_grid[0][0] = 1
+print(seating_grid)
+```
+
+<details><summary>Answer</summary>
+
+```text
+[[1, 0, 0], [1, 0, 0], [1, 0, 0]]
+```
+
+`[0] * 3` builds one inner list, and `* 3` on the outer list copies the
+**reference** to it three times. All three rows are the same object
+(`seating_grid[0] is seating_grid[1]` is `True`), so changing one changes
+them all. `[0] * 3` itself is fine: ints are immutable, so sharing them is
+harmless. JavaScript's `Array(3).fill([])` has exactly the same bug.
+
+</details>
+
+**Question 2.**
+
+```python
+seating_grid = [[0] * 3 for _ in range(3)]
+seating_grid[0][0] = 1
+print(seating_grid)
+```
+
+<details><summary>Answer</summary>
+
+```text
+[[1, 0, 0], [0, 0, 0], [0, 0, 0]]
+```
+
+The comprehension evaluates `[0] * 3` once per row, so each row is a
+separate list (`seating_grid[0] is seating_grid[1]` is `False`). This is the
+correct way to build a grid.
+
+</details>
+
+**Question 3.**
+
+```python
+pending_orders = processed_orders = []
+pending_orders.append("A-17")
+print(processed_orders, pending_orders is processed_orders)
+```
+
+<details><summary>Answer</summary>
+
+```text
+['A-17'] True
+```
+
+Chained assignment binds both names to **one** list object. Write
+`pending_orders, processed_orders = [], []` for two lists.
+
+</details>
+
+**Question 4.**
+
+```python
+shelf_rows = [[]] * 2
+shelf_rows[0] += ["jam"]
+shelf_rows[1] = shelf_rows[1] + ["tea"]
+print(shelf_rows)
+```
+
+<details><summary>Answer</summary>
+
+```text
+[['jam'], ['jam', 'tea']]
+```
+
+Both slots start as the same empty list. `+=` extends that shared list in
+place, so both rows show `'jam'`. `shelf_rows[1] + ["tea"]` builds a **new**
+list and rebinds only slot 1.
+
+</details>
+
+## Recap
+
+| Concept | Takeaway | JavaScript equivalent |
+| --- | --- | --- |
+| Sequence operations | Shared by all; `range` lacks `+`/`*` | Array methods |
+| `list` internals | Pointer array with spare slots | `Array` |
+| `append` | O(1) amortized, returns `None` | `push` (returns length) |
+| Front operations | `pop(0)`, `insert(0, x)` are O(n) | `shift`, `unshift` |
+| Mutating methods | Return `None` | `sort` returns the array |
+| `+=` vs `+` | In place vs new list | `push(...xs)` vs `concat` |
+| Slice assignment | Replaces a slice, may resize | `splice` |
+| Copies | `copy()`, `[:]`, `list()` are shallow | `[...arr]`, `slice()` |
+| Sorting | Stable Timsort with `key=` | `sort((a, b) => …)` |
+| Mixed directions | Negate numbers or multi-pass | Comparator logic |
+| `tuple` | The comma makes it; hashable if items are | `Object.freeze([])` |
+| `t[0] += [x]` | Mutates *and* raises `TypeError` | — |
+| Named tuples | Fields, defaults, `_replace` | Frozen object literal |
+| `range` | Lazy, O(1) `len`/`in`/index | — |
+| `array.array` | Typed, compact numbers | `Float64Array` |
+| `[[0] * 3] * 3` | Repeats references | `Array(3).fill([])` |
+
+## Further reading
+
+- [Sequence types — list, tuple, range](https://docs.python.org/3/library/stdtypes.html#sequence-types-list-tuple-range)
+- [Tutorial: more on lists](https://docs.python.org/3/tutorial/datastructures.html#more-on-lists)
+- [Tutorial: tuples and sequences](https://docs.python.org/3/tutorial/datastructures.html#tuples-and-sequences)
+- [Sorting techniques](https://docs.python.org/3/howto/sorting.html)
+- [operator.itemgetter and attrgetter](https://docs.python.org/3/library/operator.html#operator.itemgetter)
+- [collections.namedtuple](https://docs.python.org/3/library/collections.html#collections.namedtuple)
+- [typing.NamedTuple](https://docs.python.org/3/library/typing.html#typing.NamedTuple)
+- [array — efficient arrays of numeric values](https://docs.python.org/3/library/array.html)
+- [PEP 3132 — Extended iterable unpacking](https://peps.python.org/pep-3132/)
+- [PEP 448 — Additional unpacking generalizations](https://peps.python.org/pep-0448/)
+- [PEP 695 — Type parameter syntax](https://peps.python.org/pep-0695/)
+
+[← Previous](unit-1-4-text-and-binary-data-types.md) · [Index](README.md) · [Next →](unit-1-6-collection-data-types-ii-dictionaries-sets-and-the-collections-module.md)
