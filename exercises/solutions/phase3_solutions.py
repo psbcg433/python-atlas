@@ -6,14 +6,26 @@ Run from the repository root:
 """
 
 import ast
+import csv
 import dis
 import functools
 import gc
+import importlib
+import importlib.abc
+import importlib.machinery
+import importlib.resources
+import importlib.resources.abc
+import importlib.util
 import inspect
+import io
 import itertools
+import json
 import linecache
 import operator
+import os
+import pkgutil
 import platform
+import subprocess
 import sys
 import sysconfig
 import tempfile
@@ -21,8 +33,11 @@ import textwrap
 import tracemalloc
 import types
 import weakref
+import zipfile
 from collections import Counter, deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 
 type TestCase = tuple[str, Callable[[], object], object]
@@ -1126,10 +1141,658 @@ def check_lab_3_2() -> None:
     )
 
 
+# ---------------------------------------------------------------------------------------------
+# Lab 3.3 — Modules, packages and the import system
+# ---------------------------------------------------------------------------------------------
+
+CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0"}
+
+
+def _comes_from(module: object, folder: str) -> bool:
+    """Was this module loaded from somewhere under folder?"""
+    spec = getattr(module, "__spec__", None)
+    locations = [
+        getattr(spec, "origin", None) or "",
+        *(getattr(spec, "submodule_search_locations", None) or []),
+    ]
+    return any(str(location).startswith(folder) for location in locations)
+
+
+@contextmanager
+def temporary_modules(files: dict[str, str], *, zipped: bool = False) -> Iterator[Path]:
+    """Write files to a temporary folder (or zip), put it first on sys.path, undo on exit."""
+    with tempfile.TemporaryDirectory(prefix="unit33_") as folder:
+        root = Path(folder) / "src"
+        root.mkdir()
+        for relative_path, text in files.items():
+            target = root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(textwrap.dedent(text))
+        entry = root
+        if zipped:
+            entry = Path(folder) / "bundle.zip"
+            with zipfile.ZipFile(entry, "w") as archive:
+                for path in sorted(root.rglob("*")):
+                    if path.is_file():
+                        archive.write(path, path.relative_to(root).as_posix())
+        sys.path.insert(0, str(entry))
+        importlib.invalidate_caches()
+        try:
+            yield root
+        finally:
+            sys.path.remove(str(entry))
+            sys.path_importer_cache.pop(str(entry), None)
+            for name, module in list(sys.modules.items()):
+                if _comes_from(module, folder):
+                    del sys.modules[name]
+            importlib.invalidate_caches()
+
+
+def run_python(*arguments: str, cwd: Path | None = None) -> str:
+    """Run this interpreter in a child process; return stdout and stderr, stripped."""
+    completed = subprocess.run(
+        [sys.executable, *arguments],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+        env=CHILD_ENV,
+        timeout=120,
+    )
+    return (completed.stdout + completed.stderr).strip()
+
+
+# Exercise 1 — the shop package
+
+
+def shop_package_files() -> dict[str, str]:
+    """Relative path -> source for the shop package."""
+    return {
+        "shop/__init__.py": """
+            from .cart import Cart
+            from .models import Product
+
+            __all__ = ["Cart", "Product"]
+            __version__ = "1.0"
+            """,
+        "shop/models.py": """
+            from dataclasses import dataclass
+            from decimal import Decimal
+
+
+            @dataclass(frozen=True)
+            class Product:
+                name: str
+                price: Decimal
+            """,
+        "shop/cart.py": """
+            from decimal import Decimal
+
+            from .models import Product
+
+
+            class Cart:
+                def __init__(self):
+                    self._lines: list[tuple[Product, int]] = []
+
+                def add(self, product: Product, quantity: int = 1) -> None:
+                    self._lines.append((product, quantity))
+
+                def total(self) -> Decimal:
+                    line_totals = (product.price * quantity for product, quantity in self._lines)
+                    return sum(line_totals, Decimal("0"))
+            """,
+        "shop/payments/__init__.py": """
+            from decimal import Decimal
+
+
+            def charge(amount: Decimal) -> str:
+                return f"charged INR {amount:.2f}"
+            """,
+        "shop/__main__.py": """
+            from . import __version__
+
+            print(f"shop {__version__}")
+            """,
+    }
+
+
+# Exercise 2 — circular imports fixed three ways
+
+_ORDER_CLASS = """
+    class Order:
+        def __init__(self, order_id, customer):
+            if not isinstance(customer, {customer_class}):
+                raise TypeError("customer must be a Customer")
+            self.order_id = order_id
+            self.customer = customer
+
+        def describe(self):
+            return f"order {{self.order_id}} for {{self.customer.name}}"
+    """
+_CUSTOMER_CLASS = """
+    class Customer:
+        def __init__(self, name):
+            self.name = name
+            self.orders = []
+
+        def place_order(self, order_id):{local_import}
+            order = {order_class}(order_id, self)
+            self.orders.append(order)
+            return order
+    """
+
+
+def fix_with_module_imports() -> dict[str, str]:
+    """Fix 1: import modules, not names; look classes up at call time."""
+    return {
+        "orders.py": "import customers\n"
+        + textwrap.dedent(_ORDER_CLASS.format(customer_class="customers.Customer")),
+        "customers.py": "import orders\n"
+        + textwrap.dedent(_CUSTOMER_CLASS.format(local_import="", order_class="orders.Order")),
+    }
+
+
+def fix_with_local_import() -> dict[str, str]:
+    """Fix 2: orders keeps its top-level import; customers imports Order inside the method."""
+    return {
+        "orders.py": "from customers import Customer\n"
+        + textwrap.dedent(_ORDER_CLASS.format(customer_class="Customer")),
+        "customers.py": textwrap.dedent(
+            _CUSTOMER_CLASS.format(
+                local_import="\n            from orders import Order\n", order_class="Order"
+            )
+        ),
+    }
+
+
+def fix_with_third_module() -> dict[str, str]:
+    """Fix 3: both classes live in models.py; orders and customers re-export them."""
+    return {
+        "models.py": textwrap.dedent(_ORDER_CLASS.format(customer_class="Customer"))
+        + textwrap.dedent(_CUSTOMER_CLASS.format(local_import="", order_class="Order")),
+        "orders.py": "from models import Order\n\n__all__ = ['Order']\n",
+        "customers.py": "from models import Customer\n\n__all__ = ['Customer']\n",
+    }
+
+
+# Exercise 3 — plugin loader
+
+
+def load_plugins(package_name: str) -> dict[str, Callable[..., object]]:
+    """Discover plugin modules (PLUGIN_NAME + run) in a package."""
+    package = importlib.import_module(package_name)
+    plugins: dict[str, Callable[..., object]] = {}
+    for module_info in pkgutil.iter_modules(package.__path__):
+        if module_info.ispkg or module_info.name.startswith("_"):
+            continue
+        module = importlib.import_module(f"{package_name}.{module_info.name}")
+        plugin_name = getattr(module, "PLUGIN_NAME", None)
+        run = getattr(module, "run", None)
+        if not isinstance(plugin_name, str) or not callable(run):
+            continue
+        if plugin_name in plugins:
+            raise ValueError(f"duplicate plugin name: {plugin_name}")
+        plugins[plugin_name] = run
+    return dict(sorted(plugins.items()))
+
+
+# Exercise 4 — DictImporter
+
+
+class DictImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Serve modules from a dict of dotted name -> source code."""
+
+    def __init__(self, sources: dict[str, str]) -> None:
+        self.sources = dict(sources)
+
+    def find_spec(
+        self, fullname: str, path: object = None, target: object = None
+    ) -> importlib.machinery.ModuleSpec | None:
+        if fullname not in self.sources:
+            return None
+        is_package = any(name.startswith(fullname + ".") for name in self.sources)
+        return importlib.util.spec_from_loader(
+            fullname, self, origin="<dict>", is_package=is_package
+        )
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
+        return None
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        name = module.__spec__.name
+        exec(compile(self.sources[name], f"<dict:{name}>", "exec"), module.__dict__)
+
+
+# Exercise 5 — importlib.resources
+
+
+def _data_folder(package: str) -> importlib.resources.abc.Traversable:
+    return importlib.resources.files(package).joinpath("data")
+
+
+def load_tax_rates(package: str) -> dict[str, float]:
+    """data/tax_rates.json from the package."""
+    return json.loads(_data_folder(package).joinpath("tax_rates.json").read_text(encoding="utf-8"))
+
+
+def product_names(package: str) -> list[str]:
+    """The name column of data/products.csv, in file order."""
+    text = _data_folder(package).joinpath("products.csv").read_text(encoding="utf-8")
+    return [row["name"] for row in csv.DictReader(io.StringIO(text))]
+
+
+def data_file_names(package: str) -> list[str]:
+    """Sorted file names in data/."""
+    return sorted(item.name for item in _data_folder(package).iterdir() if item.is_file())
+
+
+# Exercise 6 — lazy imports for a CLI
+
+
+def parse_importtime(stderr_text: str) -> dict[str, int]:
+    """{module: cumulative microseconds} from `python -X importtime` output."""
+    timings: dict[str, int] = {}
+    for line in stderr_text.splitlines():
+        if not line.startswith("import time:"):
+            continue
+        fields = line.removeprefix("import time:").split("|")
+        if len(fields) != 3 or not fields[1].strip().isdigit():
+            continue  # the header line
+        timings[fields[2].strip()] = int(fields[1])
+    return timings
+
+
+def make_lazy(source: str) -> str:
+    """Turn module-level imports into lazy imports (not __future__ or star imports)."""
+    lines = source.splitlines(keepends=True)
+    for node in ast.parse(source).body:
+        eligible = isinstance(node, ast.Import) or (
+            isinstance(node, ast.ImportFrom)
+            and node.module != "__future__"
+            and not any(alias.name == "*" for alias in node.names)
+        )
+        if eligible:
+            lines[node.lineno - 1] = "lazy " + lines[node.lineno - 1]
+    return "".join(lines)
+
+
+def check_lab_3_3() -> None:
+    """Run the same checks as the Lab 3.3 check cells in the notebook."""
+    print("Exercise 1 — the shop package")
+
+    def with_shop(action: Callable[[Path], object]) -> object:
+        with temporary_modules(shop_package_files()) as root:
+            return action(root)
+
+    def shop_total(root: Path) -> Decimal:
+        shop = importlib.import_module("shop")
+        cart = shop.Cart()
+        cart.add(shop.Product("tea", Decimal("120.50")), quantity=2)
+        cart.add(shop.Product("rice", Decimal("80")))
+        return cart.total()
+
+    def shop_star_names(root: Path) -> list[str]:
+        namespace: dict[str, object] = {}
+        exec("from shop import *", namespace)
+        return sorted(name for name in namespace if not name.startswith("__"))
+
+    def same_class(root: Path) -> bool:
+        shop = importlib.import_module("shop")
+        return shop.Cart is importlib.import_module("shop.cart").Cart
+
+    def charge(root: Path) -> str:
+        return importlib.import_module("shop.payments").charge(Decimal("321"))
+
+    run_checks(
+        [
+            (
+                "__all__",
+                lambda: with_shop(lambda root: sorted(importlib.import_module("shop").__all__)),
+                ["Cart", "Product"],
+            ),
+            (
+                "__version__",
+                lambda: with_shop(lambda root: importlib.import_module("shop").__version__),
+                "1.0",
+            ),
+            ("star import", lambda: with_shop(shop_star_names), ["Cart", "Product"]),
+            ("re-export is the same class", lambda: with_shop(same_class), True),
+            ("cart total", lambda: with_shop(shop_total), Decimal("321.00")),
+            ("subpackage", lambda: with_shop(charge), "charged INR 321.00"),
+            (
+                "relative import in cart.py",
+                lambda: "from .models import" in shop_package_files()["shop/cart.py"],
+                True,
+            ),
+            (
+                "python -m shop",
+                lambda: with_shop(lambda root: run_python("-m", "shop", cwd=root)),
+                "shop 1.0",
+            ),
+        ]
+    )
+
+    print("Exercise 2 — circular imports fixed three ways")
+
+    def orders_scenario(files: dict[str, str]) -> list[str]:
+        outcomes = []
+        for first_import in ("customers", "orders"):
+            with temporary_modules(files):
+                importlib.import_module(first_import)
+                customers = importlib.import_module("customers")
+                orders = importlib.import_module("orders")
+                outcomes.append(customers.Customer("Asha").place_order(7).describe())
+                outcomes.append(raised_error_name(lambda: orders.Order(1, "nobody")))  # noqa: B023
+        return outcomes
+
+    def top_level_imports(source: str) -> list[str]:
+        tree = ast.parse(textwrap.dedent(source))
+        return [
+            alias.name for node in tree.body if isinstance(node, ast.Import) for alias in node.names
+        ]
+
+    def has_function_level_import(files: dict[str, str]) -> bool:
+        for source in files.values():
+            for node in ast.walk(ast.parse(textwrap.dedent(source))):
+                if isinstance(node, ast.FunctionDef) and any(
+                    isinstance(inner, ast.Import | ast.ImportFrom) for inner in ast.walk(node)
+                ):
+                    return True
+        return False
+
+    def uses_module_imports() -> tuple[bool, bool]:
+        files = fix_with_module_imports()
+        return (
+            "customers" in top_level_imports(files["orders.py"]),
+            "orders" in top_level_imports(files["customers.py"]),
+        )
+
+    expected_scenario = ["order 7 for Asha", "TypeError", "order 7 for Asha", "TypeError"]
+    run_checks(
+        [
+            (
+                "module imports: scenario",
+                lambda: orders_scenario(fix_with_module_imports()),
+                expected_scenario,
+            ),
+            ("module imports: uses `import`", uses_module_imports, (True, True)),
+            (
+                "local import: scenario",
+                lambda: orders_scenario(fix_with_local_import()),
+                expected_scenario,
+            ),
+            (
+                "local import: inside a function",
+                lambda: has_function_level_import(fix_with_local_import()),
+                True,
+            ),
+            (
+                "third module: scenario",
+                lambda: orders_scenario(fix_with_third_module()),
+                expected_scenario,
+            ),
+            ("third module: three files", lambda: len(fix_with_third_module()) >= 3, True),
+        ]
+    )
+
+    print("Exercise 3 — plugin loader")
+    exporter_files = {
+        "exporters/__init__.py": "",
+        "exporters/csv_exporter.py": """
+            PLUGIN_NAME = "csv"
+
+            def run(rows):
+                return "\\n".join(",".join(str(value) for value in row.values()) for row in rows)
+            """,
+        "exporters/json_exporter.py": """
+            import json
+
+            PLUGIN_NAME = "json"
+
+            def run(rows):
+                return json.dumps(rows)
+            """,
+        "exporters/_shared.py": "PLUGIN_NAME = 'shared'\n\ndef run(rows):\n    return ''\n",
+        "exporters/draft_exporter.py": "PLUGIN_NAME = 'draft'  # no run() yet\n",
+        "exporters/legacy/__init__.py": "PLUGIN_NAME = 'legacy'\n\ndef run(rows):\n    return ''\n",
+    }
+    sample_rows = [{"sku": "TEA-01", "qty": 2}, {"sku": "RICE-5", "qty": 1}]
+
+    def plugins_from(files: dict[str, str]) -> Callable[[], object]:
+        def load() -> object:
+            with temporary_modules(files):
+                plugins = load_plugins("exporters")
+                return list(plugins), plugins["csv"](sample_rows), plugins["json"](sample_rows[:1])
+
+        return load
+
+    duplicate_files = {
+        **exporter_files,
+        "exporters/csv_again.py": "PLUGIN_NAME = 'csv'\n\ndef run(rows):\n    return ''\n",
+    }
+    run_checks(
+        [
+            (
+                "plugins, sorted, run",
+                plugins_from(exporter_files),
+                (["csv", "json"], "TEA-01,2\nRICE-5,1", '[{"sku": "TEA-01", "qty": 2}]'),
+            ),
+            (
+                "duplicate name",
+                lambda: raised_message(plugins_from(duplicate_files)),
+                "ValueError: duplicate plugin name: csv",
+            ),
+        ]
+    )
+
+    print("Exercise 4 — DictImporter")
+    in_memory_sources = {
+        "greetings": "def hello(name):\n    return f'Namaste, {name}'\n",
+        "toolbox": "from .strings import shout\n",
+        "toolbox.strings": "def shout(text):\n    return text.upper() + '!'\n",
+        "run_counter": "import builtins\n"
+        "builtins.__dict__.setdefault('_run_counter_hits', []).append(1)",
+    }
+
+    @contextmanager
+    def installed(importer: object) -> Iterator[object]:
+        sys.meta_path.insert(0, importer)
+        try:
+            yield importer
+        finally:
+            sys.meta_path.remove(importer)
+            for name in [
+                name
+                for name, module in sys.modules.items()
+                if getattr(module, "__loader__", None) is importer
+            ]:
+                del sys.modules[name]
+
+    def with_importer(action: Callable[[object], object]) -> Callable[[], object]:
+        def run() -> object:
+            with installed(DictImporter(in_memory_sources)) as importer:
+                return action(importer)
+
+        return run
+
+    def imports_once(importer: object) -> int:
+        import builtins
+
+        builtins.__dict__.pop("_run_counter_hits", None)
+        importlib.import_module("run_counter")
+        importlib.import_module("run_counter")
+        return len(builtins.__dict__.pop("_run_counter_hits", []))
+
+    def spec_facts(importer: object) -> tuple[str, bool]:
+        module = importlib.import_module("greetings")
+        return module.__spec__.origin, module.__loader__ is importer
+
+    run_checks(
+        [
+            (
+                "plain module",
+                with_importer(lambda imp: importlib.import_module("greetings").hello("Asha")),
+                "Namaste, Asha",
+            ),
+            ("spec origin and loader", with_importer(spec_facts), ("<dict>", True)),
+            (
+                "package + relative import",
+                with_importer(lambda imp: importlib.import_module("toolbox").shout("hi")),
+                "HI!",
+            ),
+            (
+                "package has __path__",
+                with_importer(lambda imp: hasattr(importlib.import_module("toolbox"), "__path__")),
+                True,
+            ),
+            ("unknown name -> None", with_importer(lambda imp: imp.find_spec("json", None)), None),
+            (
+                "missing module",
+                with_importer(
+                    lambda imp: raised_error_name(
+                        lambda: importlib.import_module("not_in_the_dict")
+                    )
+                ),
+                "ModuleNotFoundError",
+            ),
+            ("runs once", with_importer(imports_once), 1),
+        ]
+    )
+
+    print("Exercise 5 — importlib.resources")
+    catalog_files = {
+        "catalog/__init__.py": "",
+        "catalog/data/products.csv": "name,price\nGreen tea,120.50\nBasmati rice,80\nTurmeric,45\n",
+        "catalog/data/tax_rates.json": '{"food": 0.05, "electronics": 0.18}',
+    }
+
+    def read_catalog(zipped: bool) -> Callable[[], object]:
+        def read() -> object:
+            with temporary_modules(catalog_files, zipped=zipped):
+                return (
+                    load_tax_rates("catalog"),
+                    product_names("catalog"),
+                    data_file_names("catalog"),
+                )
+
+        return read
+
+    expected_catalog = (
+        {"food": 0.05, "electronics": 0.18},
+        ["Green tea", "Basmati rice", "Turmeric"],
+        ["products.csv", "tax_rates.json"],
+    )
+    run_checks(
+        [
+            ("from a folder", read_catalog(zipped=False), expected_catalog),
+            ("from a zip", read_catalog(zipped=True), expected_catalog),
+        ]
+    )
+
+    print("Exercise 6 — lazy imports for a CLI")
+    report_cli = textwrap.dedent(
+        """
+        import asyncio
+        import email.parser
+        import http.client
+        import json
+        import xml.etree.ElementTree as ElementTree
+        from decimal import Decimal
+        import sys
+
+
+        def main(argv):
+            if argv[:1] == ["--version"]:
+                print("report 2.0")
+            elif argv[:1] == ["total"]:
+                print(sum(Decimal(value) for value in argv[1:]))
+            else:
+                print("usage: report [--version | total VALUE...]")
+
+
+        if __name__ == "__main__":
+            main(sys.argv[1:])
+        """
+    )
+    sample_importtime = textwrap.dedent(
+        """
+        import time: self [us] | cumulative | imported package
+        import time:       120 |        120 |   _json
+        import time:       850 |       1300 | json
+        import time:        90 |         90 |     _decimal
+        import time:       400 |        490 |   decimal
+        garbage line
+        """
+    ).strip()
+
+    def run_cli(source: str, *arguments: str) -> tuple[str, set[str]]:
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "report.py"
+            script.write_text(source)
+            completed = subprocess.run(
+                [sys.executable, "-X", "importtime", str(script), *arguments],
+                capture_output=True,
+                text=True,
+                env=CHILD_ENV,
+                timeout=60,
+            )
+        return completed.stdout.strip(), set(parse_importtime(completed.stderr))
+
+    def startup_comparison() -> tuple[bool, bool, bool, bool]:
+        eager_output, eager_modules = run_cli(report_cli, "--version")
+        lazy_output, lazy_modules = run_cli(make_lazy(report_cli), "--version")
+        counts = f"eager {len(eager_modules)}, lazy {len(lazy_modules)}"
+        print(f"    modules loaded for --version: {counts}")
+        return (
+            eager_output == lazy_output == "report 2.0",
+            "asyncio" in eager_modules,
+            "asyncio" in lazy_modules,
+            len(lazy_modules) * 2 < len(eager_modules),
+        )
+
+    keep_sample = (
+        "from __future__ import annotations\nimport os\n\n"
+        "def f():\n    import json\n\n"
+        "try:\n    import tomllib\nexcept ImportError:\n    pass\n"
+    )
+    run_checks(
+        [
+            (
+                "parse sample",
+                lambda: parse_importtime(sample_importtime),
+                {"_json": 120, "json": 1300, "_decimal": 90, "decimal": 490},
+            ),
+            (
+                "make_lazy rewrites top-level imports",
+                lambda: [line for line in make_lazy(report_cli).splitlines() if "import" in line][
+                    :2
+                ],
+                ["lazy import asyncio", "lazy import email.parser"],
+            ),
+            (
+                "make_lazy leaves the rest",
+                lambda: make_lazy(keep_sample),
+                keep_sample.replace("\nimport os", "\nlazy import os"),
+            ),
+            (
+                "--version: same output, asyncio skipped, half the modules",
+                startup_comparison,
+                (True, True, False, True),
+            ),
+            (
+                "total still works lazily",
+                lambda: run_cli(make_lazy(report_cli), "total", "1.10", "2.20")[0],
+                "3.30",
+            ),
+        ]
+    )
+
+
 if __name__ == "__main__":
     for lab_title, check_lab in [
         ("Lab 3.1", check_lab_3_1),
         ("Lab 3.2", check_lab_3_2),
+        ("Lab 3.3", check_lab_3_3),
     ]:
         print(f"===== {lab_title} =====")
         check_lab()
