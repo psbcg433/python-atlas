@@ -26,9 +26,10 @@ src = [".", "scripts"]
 select = ["E", "W", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-# Unit modules hold notebook markdown (long table rows) inside strings.
+# Unit, project and build modules hold notebook markdown (long table rows) inside strings.
 "scripts/phase*/unit_*.py" = ["E501"]
 "scripts/phase*/project.py" = ["E501"]
+"scripts/phase*/build.py" = ["E501"]
 # Notebooks keep sys.version_info guards (course convention 5) and each unit re-imports
 # what it needs so it can run on its own (convention 12).
 "notebooks/*.ipynb" = ["UP036", "F811"]
