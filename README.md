@@ -49,7 +49,7 @@ every chapter.
 ├── uv.lock               # exact dependency versions and hashes
 ├── notebooks/            # one .ipynb per phase
 ├── notes/                # textbook-style study notes: notes/phaseN/
-├── projects/             # code that outgrows a notebook (CLI package, FastAPI apps)
+├── projects/             # code that outgrows a notebook: pyinspect/ (Phase 3), FastAPI apps later
 ├── exercises/solutions/  # lab reference solutions: phaseN_solutions.py
 └── scripts/              # notebook build scripts: nb_builder.py, phaseN/build.py, phaseN/unit_N_M.py
 ```
@@ -106,7 +106,7 @@ uv run python exercises/solutions/phase0_solutions.py
 | 0 | `phase0_environment_setup.ipynb` | Done | — |
 | 1 | `phase1_language_fundamentals.ipynb` | Done | [Done](notes/phase1/README.md) |
 | 2 | `phase2_oop_data_model.ipynb` | Done | — |
-| 3 | `phase3_python_internals.ipynb` | Not started | — |
+| 3 | `phase3_python_internals.ipynb` | Done (project: [`projects/pyinspect/`](projects/pyinspect/)) | — |
 | 4 | `phase4_professional_python.ipynb` | Not started | — |
 | 5 | `phase5_concurrency_performance.ipynb` | Not started | — |
 | 6 | `phase6_web_fastapi.ipynb` | Not started | — |

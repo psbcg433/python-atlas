@@ -6,19 +6,17 @@ from nb_builder import code, md, predict_cells
 
 UNIT_SETUP_SOURCE = '''
 import ast
-import contextlib
 import importlib
 import importlib.abc
 import importlib.machinery
 import importlib.metadata
 import importlib.resources
 import importlib.util
-import io
 import json
 import os
 import pkgutil
 import platform
-import runpy
+import shutil
 import site
 import subprocess
 import sys
@@ -29,10 +27,12 @@ import types
 import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from decimal import Decimal
 from pathlib import Path
 
 CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0"}  # plain output from child interpreters
+scratch_dir = find_repo_root() / "notebooks" / "_scratch"  # git-ignored
+scratch_dir.mkdir(parents=True, exist_ok=True)
+KERNEL_PATH_AT_START = list(sys.path)  # compared again after the demos
 
 
 def raised_error_name(thunk: Callable[[], object]) -> str:
@@ -70,6 +70,64 @@ def interpreter_label() -> str:
     return f"{implementation} {platform.python_version()}, {build}, {platform.machine()}"
 
 
+def run_python(
+    *arguments: str, cwd: Path | None = None, extra_env: dict[str, str] | None = None
+) -> str:
+    """Run the kernel's interpreter in a child process; return its output, stripped.
+
+    The folder passed as cwd is shown as <project>, so no absolute path is printed.
+    """
+    completed = subprocess.run(
+        [sys.executable, *arguments],
+        capture_output=True, text=True, cwd=cwd, timeout=120,
+        env={**CHILD_ENV, **(extra_env or {})},
+    )  # fmt: skip
+    output = (completed.stdout + completed.stderr).strip()
+    return output.replace(str(cwd), "<project>") if cwd is not None else output
+
+
+@contextmanager
+def scratch_project(name: str, files: dict[str, str]) -> Iterator[Path]:
+    """Write files under notebooks/_scratch/<name>/ for a child process; delete them afterwards."""
+    root = scratch_dir / name
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    for relative_path, text in files.items():
+        target = root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(textwrap.dedent(text).lstrip("\\n"))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def run_script(
+    root: Path, script: str, *arguments: str, extra_env: dict[str, str] | None = None
+) -> str:
+    """Save script as root/main.py and run it in a child interpreter from root.
+
+    The child's sys.path[0] is root, so the project's modules are imported there, never in
+    the kernel.
+    """
+    (root / "main.py").write_text(textwrap.dedent(script).lstrip("\\n"))
+    return run_python("main.py", *arguments, cwd=root, extra_env=extra_env)
+
+
+def in_src(files: dict[str, str]) -> dict[str, str]:
+    """The same files moved into src/, a folder the script adds to sys.path itself."""
+    return {f"src/{relative_path}": text for relative_path, text in files.items()}
+
+
+def child_json(output: str) -> object:
+    """Parse the last line of a child's output as JSON; raise with the child's error if not."""
+    last_line = output.splitlines()[-1] if output else ""
+    try:
+        return json.loads(last_line)
+    except ValueError:
+        raise RuntimeError(f"child process failed: {last_line}") from None
+
+
 def _comes_from(module: object, folder: str) -> bool:
     """Was this module loaded from somewhere under folder?"""
     spec = getattr(module, "__spec__", None)
@@ -82,9 +140,10 @@ def _comes_from(module: object, folder: str) -> bool:
 
 @contextmanager
 def temporary_modules(files: dict[str, str], *, zipped: bool = False) -> Iterator[Path]:
-    """Write files (relative path -> source) to a temporary folder, or a zip of it, and put it
-    first on sys.path. On exit, remove it and forget every module imported from it."""
-    with tempfile.TemporaryDirectory(prefix="unit33_") as folder:
+    """For lab checks that must import into the kernel: write files under notebooks/_scratch
+    (or zip them), put the folder first on sys.path, and on exit remove it and forget every
+    module imported from it."""
+    with tempfile.TemporaryDirectory(prefix="unit33_lab_", dir=scratch_dir) as folder:
         root = Path(folder) / "src"
         root.mkdir()
         for relative_path, text in files.items():
@@ -109,18 +168,6 @@ def temporary_modules(files: dict[str, str], *, zipped: bool = False) -> Iterato
                 if _comes_from(module, folder):
                     del sys.modules[name]
             importlib.invalidate_caches()
-
-
-def run_python(
-    *arguments: str, cwd: Path | None = None, extra_env: dict[str, str] | None = None
-) -> str:
-    """Run the kernel's interpreter in a child process; return stdout and stderr, stripped."""
-    completed = subprocess.run(
-        [sys.executable, *arguments],
-        capture_output=True, text=True, cwd=cwd, timeout=120,
-        env={**CHILD_ENV, **(extra_env or {})},
-    )  # fmt: skip
-    return (completed.stdout + completed.stderr).strip()
 
 
 print(interpreter_label())
@@ -163,10 +210,14 @@ def _overview_cells() -> list[NotebookNode]:
             | `import()` (dynamic) | `importlib.import_module(name)` | Python's is synchronous |
             | Hoisted, static ESM imports | `import` is a statement executed in order | Imports can sit inside functions and `if` blocks |
 
-            The next cell is this unit's setup. `temporary_modules(files, zipped=False)` writes
-            small modules to a temporary folder (or zip), puts it on `sys.path`, and on exit
-            removes it and **forgets every module imported from it**, so demos never leak into
-            later cells. `run_python(*arguments, cwd=...)` runs a child interpreter.
+            **How the demos run.** Importing a throwaway module into this kernel would leave it
+            in `sys.modules` (and its folder in `sys.path`) for the rest of the notebook. So
+            every import demo writes its small project under `notebooks/_scratch/` with
+            `scratch_project(name, files)` and runs it in a **child interpreter** with
+            `run_script(root, script)`, which saves the script as `main.py` in that folder and
+            runs it from there. The folder is deleted afterwards, and absolute paths in the
+            child's output are shown as `<project>`. A check after 3.3.13 proves the kernel
+            stayed clean.
             """
         ),
         code(UNIT_SETUP_SOURCE),
@@ -221,7 +272,7 @@ def _module_object_cells() -> list[NotebookNode]:
             """
             import json.decoder
 
-            for module in (json, json.decoder, contextlib):
+            for module in (json, json.decoder, textwrap):
                 print(f"{module.__name__:<13} __package__={module.__package__!r}")
             """
         ),
@@ -298,44 +349,46 @@ def _import_steps_cells() -> list[NotebookNode]:
             </details>
 
             **Step 1, the cache.** A second import of the same name is a dict lookup. Whatever
-            object sits in `sys.modules` **is** the module, even a fake one.
+            object sits in `sys.modules` **is** the module, even a fake one. (The script runs in
+            a child interpreter, so the fake never reaches this kernel.)
             """
         ),
         code(
-            """
+            '''
+            CACHE_DEMO = """
+            import json
             import json as json_again
+            import sys
+            import types
 
-            print(f"{json_again is json is sys.modules['json']=}")
+            print("json_again is json is sys.modules['json']:", json_again is json is sys.modules["json"])
             sys.modules["fake_payments"] = types.SimpleNamespace(charge=lambda amount: f"faked {amount}")
-            try:
-                import fake_payments
+            import fake_payments
 
-                print(f"{fake_payments.charge(99)=}  (import returned whatever was cached)")
-            finally:
-                del sys.modules["fake_payments"]
+            print("fake_payments.charge(99) ->", fake_payments.charge(99), "(whatever was cached)")
             """
+            print(run_python("-c", textwrap.dedent(CACHE_DEMO)))
+            '''
         ),
         md(
             """
             **Step 2, the finders.** `sys.meta_path` lists finder objects, asked in order.
-            `importlib.util.find_spec(name)` runs the same search without executing anything.
+            `importlib.util.find_spec(name)` runs the same search **without executing**
+            anything, so it is safe to call in the kernel.
             """
         ),
         code(
             """
-            print(
-                [
-                    type(finder).__name__ if not isinstance(finder, type) else finder.__name__
-                    for finder in sys.meta_path
-                ]
-            )
+            finder_names = [getattr(finder, "__name__", type(finder).__name__) for finder in sys.meta_path]
+            print(f"{finder_names=}")
             for name in ("sys", "zipimport", "json", "_json", "no_such_module_here"):
                 spec = importlib.util.find_spec(name)
-                where = (
-                    "None (ModuleNotFoundError on import)"
-                    if spec is None
-                    else (spec.origin if spec.origin in {"built-in", "frozen"} else Path(spec.origin).name)
-                )
+                if spec is None:
+                    where = "None (ModuleNotFoundError on import)"
+                elif spec.origin in {"built-in", "frozen"}:
+                    where = spec.origin
+                else:
+                    where = Path(spec.origin).name
                 print(f"find_spec({name!r:<22}) -> {where}")
             """
         ),
@@ -343,24 +396,14 @@ def _import_steps_cells() -> list[NotebookNode]:
             """
             **Watching the steps.** A finder at the front of `sys.meta_path` that only records
             requests shows which imports reach the finders: `checkout_rules` and its helper do,
-            the already-cached `json` does not. Inside the module, `__name__ in sys.modules` is
-            already `True` while its code runs (step 4 before step 5).
+            the already-cached `json` and `sys` do not. Inside the module,
+            `__name__ in sys.modules` is already `True` while its code runs (step 4 before
+            step 5).
             """
         ),
         code(
             '''
-            class TracingFinder:
-                """A meta path finder that records requests and lets the next finder answer."""
-
-                def __init__(self) -> None:
-                    self.requests: list[str] = []
-
-                def find_spec(self, fullname: str, path: object, target: object = None) -> None:
-                    self.requests.append(fullname)
-                    return None
-
-
-            checkout_files = {
+            TRACING_FILES = {
                 "checkout_rules.py": """
                     import json
                     import sys
@@ -371,16 +414,31 @@ def _import_steps_cells() -> list[NotebookNode]:
                     """,
                 "checkout_helpers.py": "FREE_SHIPPING_ABOVE = 499\\n",
             }
+            TRACING_SCRIPT = """
+            import json  # loaded before the tracer is installed, so later imports hit the cache
+            import sys
+
+
+            class TracingFinder:
+                # A meta path finder that records requests and lets the next finder answer.
+                def __init__(self):
+                    self.requests = []
+
+                def find_spec(self, fullname, path, target=None):
+                    self.requests.append(fullname)
+                    return None
+
+
             tracer = TracingFinder()
-            with temporary_modules(checkout_files):
-                sys.meta_path.insert(0, tracer)
-                try:
-                    import checkout_rules
-                finally:
-                    sys.meta_path.remove(tracer)
-                print(f"{tracer.requests=}")
-                print(f"{checkout_rules.IN_SYS_MODULES_WHILE_RUNNING=}")
-            print(f"after the block: {'checkout_rules' in sys.modules=}")
+            sys.meta_path.insert(0, tracer)
+            import checkout_rules
+
+            sys.meta_path.remove(tracer)
+            print("requests that reached the finders:", tracer.requests)
+            print("in sys.modules while its code ran:", checkout_rules.IN_SYS_MODULES_WHILE_RUNNING)
+            """
+            with scratch_project("unit33_tracing", TRACING_FILES) as root:
+                print(run_script(root, TRACING_SCRIPT))
             '''
         ),
         md(
@@ -392,13 +450,18 @@ def _import_steps_cells() -> list[NotebookNode]:
         ),
         code(
             '''
-            def simple_import(module_name: str) -> types.ModuleType:
-                """The core of `import module_name` for a top-level module."""
+            SIMPLE_IMPORT_SCRIPT = """
+            import importlib.util
+            import sys
+
+
+            def simple_import(module_name):
+                # The core of `import module_name` for a top-level module.
                 if module_name in sys.modules:  # 1. cache
                     return sys.modules[module_name]
                 spec = importlib.util.find_spec(module_name)  # 2. finders
                 if spec is None:
-                    raise ModuleNotFoundError(f"No module named {module_name!r}", name=module_name)
+                    raise ModuleNotFoundError(f"No module named {module_name!r}")
                 module = importlib.util.module_from_spec(spec)  # 3. create
                 sys.modules[module_name] = module  # 4. insert before executing
                 try:
@@ -409,10 +472,17 @@ def _import_steps_cells() -> list[NotebookNode]:
                 return module  # 6. the caller binds the name
 
 
-            with temporary_modules({"discounts.py": "print('discounts executing')\\nFESTIVE = 0.1\\n"}):
-                discounts = simple_import("discounts")
-                print(f"{discounts.FESTIVE=}  {simple_import('discounts') is discounts=}")
-                print(raised_message(lambda: simple_import("no_such_discounts")))
+            discounts = simple_import("discounts")
+            print("FESTIVE =", discounts.FESTIVE)
+            print("cached on the second call:", simple_import("discounts") is discounts)
+            try:
+                simple_import("no_such_discounts")
+            except ModuleNotFoundError as error:
+                print("ModuleNotFoundError:", error)
+            """
+            discount_files = {"discounts.py": "print('discounts executing')\\nFESTIVE = 0.1\\n"}
+            with scratch_project("unit33_simple_import", discount_files) as root:
+                print(run_script(root, SIMPLE_IMPORT_SCRIPT))
             '''
         ),
     ]
@@ -434,12 +504,13 @@ def _import_forms_cells() -> list[NotebookNode]:
             | `from config import DEBUG as debug_flag` | `debug_flag` | Alias |
             | `from config import *` | every name in `config.__all__`, or every public name (no leading `_`) | Avoid outside the REPL and `__init__.py` re-exports |
 
-            The cell builds a `config` module and a small `shop` package and tries each form.
+            The cell builds a `config` module and a small `shop` package and tries each form in
+            a child interpreter.
             """
         ),
         code(
             '''
-            form_files = {
+            FORM_FILES = {
                 "config.py": """
                     __all__ = ["DEBUG", "region"]
                     DEBUG = False
@@ -452,22 +523,23 @@ def _import_forms_cells() -> list[NotebookNode]:
                 "shop/__init__.py": "",
                 "shop/cart.py": "class Cart:\\n    pass\\n",
             }
-            with temporary_modules(form_files):
-                import shop.cart
+            FORMS_SCRIPT = """
+            import shop.cart
 
-                print(
-                    f"import shop.cart binds {shop.__name__!r}; then {shop.cart.Cart.__name__!r} by attribute"
-                )
-                import shop.cart as cart_module
+            print("import shop.cart binds", repr(shop.__name__), "and reaches", shop.cart.Cart.__name__)
+            import shop.cart as cart_module
 
-                print(f"import shop.cart as cart_module -> {cart_module.__name__!r}")
-                from config import region as region_name
+            print("import shop.cart as cart_module ->", repr(cart_module.__name__))
+            from config import region as region_name
 
-                print(f"from config import region as region_name -> {region_name()!r}")
-                star_namespace: dict[str, object] = {}
-                exec("from config import *", star_namespace)
-                star_names = sorted(name for name in star_namespace if not name.startswith("__"))
-                print(f"from config import * -> {star_names}  (__all__ wins over TIMEOUT)")
+            print("from config import region as region_name ->", repr(region_name()))
+            star_namespace = {}
+            exec("from config import *", star_namespace)
+            star_names = sorted(name for name in star_namespace if not name.startswith("__"))
+            print("from config import * ->", star_names, "(__all__ wins over TIMEOUT)")
+            """
+            with scratch_project("unit33_forms", FORM_FILES) as root:
+                print(run_script(root, FORMS_SCRIPT))
             '''
         ),
         md(
@@ -480,17 +552,20 @@ def _import_forms_cells() -> list[NotebookNode]:
             """
         ),
         code(
+            '''
+            BINDING_SCRIPT = """
+            import settings
+            from settings import DEBUG, FEATURE_FLAGS
+
+            settings.DEBUG = True  # rebinding inside the module
+            settings.FEATURE_FLAGS["dark_mode"] = True  # mutating the shared dict
+            print("DEBUG =", DEBUG, "| settings.DEBUG =", settings.DEBUG, "(copied binding vs live attribute)")
+            print("FEATURE_FLAGS =", FEATURE_FLAGS, "(same dict object, so the mutation shows)")
             """
             binding_files = {"settings.py": "DEBUG = False\\nFEATURE_FLAGS = {'dark_mode': False}\\n"}
-            with temporary_modules(binding_files):
-                import settings
-                from settings import DEBUG, FEATURE_FLAGS
-
-                settings.DEBUG = True  # rebinding inside the module
-                settings.FEATURE_FLAGS["dark_mode"] = True  # mutating the shared dict
-                print(f"{DEBUG=}  {settings.DEBUG=}  (copied binding vs live attribute)")
-                print(f"{FEATURE_FLAGS=}  (same dict object, so the mutation shows)")
-            """
+            with scratch_project("unit33_bindings", binding_files) as root:
+                print(run_script(root, BINDING_SCRIPT))
+            '''
         ),
     ]
 
@@ -513,7 +588,7 @@ def _run_once_cells() -> list[NotebookNode]:
         ),
         code(
             '''
-            singleton_files = {
+            SINGLETON_FILES = {
                 "app_state.py": """
                     print("app_state: top-level code runs")
                     connection_pool = {"opened": 0}
@@ -525,12 +600,15 @@ def _run_once_cells() -> list[NotebookNode]:
                 "billing.py": "import app_state\\n\\ndef charge():\\n    return app_state.open_connection()\\n",
                 "shipping.py": "import app_state\\n\\ndef ship():\\n    return app_state.open_connection()\\n",
             }
-            with temporary_modules(singleton_files):
-                import billing
-                import shipping
+            SINGLETON_SCRIPT = """
+            import billing
+            import shipping
 
-                print(f"{billing.charge()=}  {shipping.ship()=}  (one shared pool)")
-                print(f"{billing.app_state is shipping.app_state=}")
+            print("billing.charge() =", billing.charge(), "| shipping.ship() =", shipping.ship(), "(one pool)")
+            print("billing.app_state is shipping.app_state:", billing.app_state is shipping.app_state)
+            """
+            with scratch_project("unit33_singleton", SINGLETON_FILES) as root:
+                print(run_script(root, SINGLETON_SCRIPT))
             '''
         ),
         md(
@@ -544,26 +622,35 @@ def _run_once_cells() -> list[NotebookNode]:
             - other modules that hold references to old functions.
 
             Use it in a REPL, not as a deployment mechanism; restart the process instead.
-            (The cell's new `rates.py` is a different size on purpose: a same-size rewrite
-            within the same second would leave the timestamp-based `.pyc` looking valid, 3.2.13,
-            and `reload` would run the old bytecode.)
+            (The script replaces `rates.py` with a file of a different size on purpose: a
+            same-size rewrite within the same second would leave the timestamp-based `.pyc`
+            looking valid, 3.2.13, and `reload` would run the old bytecode.)
             """
         ),
         code(
-            """
-            reload_files = {"rates.py": "class Rate:\\n    pass\\n\\nGST = 0.18\\n"}
-            with temporary_modules(reload_files) as root:
-                import rates
-                from rates import GST
+            '''
+            RELOAD_SCRIPT = """
+            import importlib
+            from pathlib import Path
 
-                old_rate = rates.Rate()
-                (root / "rates.py").write_text("class Rate:\\n    pass\\n\\nGST = 0.12  # festive rate\\n")
-                importlib.invalidate_caches()
-                reloaded = importlib.reload(rates)
-                print(f"{reloaded is rates=}  (same module object)")
-                print(f"{rates.GST=}  {GST=}  (the copied name is stale)")
-                print(f"{isinstance(old_rate, rates.Rate)=}  (old instance, new class)")
+            import rates
+            from rates import GST
+
+            old_rate = rates.Rate()
+            Path("rates.py").write_text(Path("rates_v2.txt").read_text())
+            importlib.invalidate_caches()
+            reloaded = importlib.reload(rates)
+            print("reloaded is rates:", reloaded is rates, "(same module object)")
+            print("rates.GST =", rates.GST, "| copied GST =", GST, "(the copied name is stale)")
+            print("old instance of new class:", isinstance(old_rate, rates.Rate), "(old object, new class)")
             """
+            reload_files = {
+                "rates.py": "class Rate:\\n    pass\\n\\nGST = 0.18\\n",
+                "rates_v2.txt": "class Rate:\\n    pass\\n\\nGST = 0.12  # festive rate\\n",
+            }
+            with scratch_project("unit33_reload", reload_files) as root:
+                print(run_script(root, RELOAD_SCRIPT))
+            '''
         ),
     ]
 
@@ -587,7 +674,8 @@ def _sys_path_cells() -> list[NotebookNode]:
             4. `site-packages`, added by the `site` module at start-up, plus anything listed in
                `.pth` files found there.
 
-            The cell labels this kernel's entries instead of printing full paths.
+            The cell labels this kernel's entries (reading `sys.path` changes nothing) instead
+            of printing full paths.
             """
         ),
         code(
@@ -616,26 +704,36 @@ def _sys_path_cells() -> list[NotebookNode]:
         md(
             """
             **`.pth` files.** When `site` processes a site directory, each `*.pth` file in it
-            adds one path per line, and lines starting with `import` are **executed**. Editable
-            installs (`uv pip install -e .`) work this way, and so does some malware; review
-            `.pth` files in your environment. `site.addsitedir(folder)` processes a folder the
-            same way; the cell undoes everything afterwards.
+            adds one path per line (relative paths are resolved against the site directory),
+            and lines starting with `import` are **executed**. Editable installs
+            (`uv pip install -e .`) work this way, and so does some malware; review `.pth`
+            files in your environment. `site.addsitedir(folder)` processes a folder the same
+            way. The child interpreter below does that with a scratch site folder.
             """
         ),
         code(
+            '''
+            PTH_FILES = {
+                "site_folder/course_extra.pth": """
+                    ../extra_folder
+                    import os; os.environ["UNIT33_PTH_RAN"] = "yes"
+                    """,
+                "extra_folder/README.txt": "a folder named in the .pth file\\n",
+            }
+            PTH_SCRIPT = """
+            import os
+            import site
+            import sys
+            from pathlib import Path
+
+            before = list(sys.path)
+            site.addsitedir(str(Path("site_folder").resolve()))
+            print("entries added:", [Path(entry).name for entry in sys.path if entry not in before])
+            print("import line executed:", os.environ.get("UNIT33_PTH_RAN"))
             """
-            with tempfile.TemporaryDirectory() as site_folder, tempfile.TemporaryDirectory() as extra_folder:
-                Path(site_folder, "course_extra.pth").write_text(
-                    f"{extra_folder}\\nimport os; os.environ['UNIT33_PTH_RAN'] = 'yes'\\n"
-                )
-                path_before = list(sys.path)
-                site.addsitedir(site_folder)
-                added = [describe_path_entry(entry) for entry in sys.path if entry not in path_before]
-                print(f"entries added: {len(added)} (the site folder and the folder named in the .pth)")
-                print(f"import line executed: {os.environ.get('UNIT33_PTH_RAN')=}")
-                sys.path[:] = path_before
-                os.environ.pop("UNIT33_PTH_RAN", None)
-            """
+            with scratch_project("unit33_pth", PTH_FILES) as root:
+                print(run_script(root, PTH_SCRIPT))
+            '''
         ),
         md(
             """
@@ -652,24 +750,28 @@ def _sys_path_cells() -> list[NotebookNode]:
         ),
         code(
             '''
-            where_source = """
-                import os, sys
-                first = sys.path[0]
-                script_folder = os.path.dirname(os.path.abspath(__file__))
-                if first == script_folder:
-                    print("sys.path[0] = the script's folder")
-                elif first in ("", os.getcwd()):
-                    print("sys.path[0] = the current directory")
-                else:
-                    print("sys.path[0] = " + os.path.basename(first) + " (no script folder or cwd)")
-                """
-            with temporary_modules({"tools/__init__.py": "", "tools/where.py": where_source}) as root:
-                for arguments in (
-                    ["tools/where.py"],
-                    ["-m", "tools.where"],
-                    ["-P", "tools/where.py"],
-                    ["-P", "-m", "tools.where"],
-                ):
+            WHERE_FILES = {
+                "tools/__init__.py": "",
+                "tools/where.py": """
+                    import os, sys
+                    first = sys.path[0]
+                    script_folder = os.path.dirname(os.path.abspath(__file__))
+                    if first == script_folder:
+                        print("sys.path[0] = the script's folder")
+                    elif first in ("", os.getcwd()):
+                        print("sys.path[0] = the current directory")
+                    else:
+                        print("sys.path[0] = " + os.path.basename(first) + " (no script folder or cwd)")
+                    """,
+            }
+            modes = [
+                ["tools/where.py"],
+                ["-m", "tools.where"],
+                ["-P", "tools/where.py"],
+                ["-P", "-m", "tools.where"],
+            ]
+            with scratch_project("unit33_sys_path", WHERE_FILES) as root:
+                for arguments in modes:
                     output = run_python(*arguments, cwd=root).splitlines()[-1].split("python: ")[-1]
                     print(f"python {' '.join(arguments):<22} {output}")
             '''
@@ -699,7 +801,7 @@ def _package_cells() -> list[NotebookNode]:
         ),
         code(
             '''
-            inventory_files = {
+            INVENTORY_FILES = {
                 "inventory/__init__.py": """
                     print("run inventory/__init__.py")
                     from .stock import StockLevel
@@ -713,35 +815,47 @@ def _package_cells() -> list[NotebookNode]:
                     from ..stock import StockLevel
                     """,
             }
-            with temporary_modules(inventory_files):
-                import inventory.reports.daily
-                from inventory import StockLevel
+            PACKAGE_SCRIPT = """
+            from pathlib import Path
 
-                print(f"re-export is the same class: {StockLevel is inventory.stock.StockLevel}")
-                print(f"{inventory.__all__=}  {[Path(p).name for p in inventory.__path__]=}")
+            import inventory.reports.daily
+            from inventory import StockLevel
+
+            print("re-export is the same class:", StockLevel is inventory.stock.StockLevel)
+            print("__all__ =", inventory.__all__, "| __path__ =", [Path(p).name for p in inventory.__path__])
+            """
+            with scratch_project("unit33_packages", INVENTORY_FILES) as root:
+                print(run_script(root, PACKAGE_SCRIPT))
             '''
         ),
         md(
             """
-            **Namespace packages.** Two separate folders each contain a `plugins/` folder
-            without `__init__.py`. Both are on `sys.path`, so `plugins` is one package whose
-            `__path__` lists both folders.
+            **Namespace packages.** Two separate folders, `first/` and `second/`, each contain a
+            `plugins/` folder without `__init__.py`. With both on `sys.path`, `plugins` is one
+            package whose `__path__` lists both folders.
             """
         ),
         code(
-            """
-            with (
-                temporary_modules({"plugins/csv_export.py": "FORMAT = 'csv'\\n"}),
-                temporary_modules({"plugins/pdf_export.py": "FORMAT = 'pdf'\\n"}),
-            ):
-                import plugins
-                import plugins.csv_export
-                import plugins.pdf_export
+            '''
+            NAMESPACE_FILES = {
+                "first/plugins/csv_export.py": "FORMAT = 'csv'\\n",
+                "second/plugins/pdf_export.py": "FORMAT = 'pdf'\\n",
+            }
+            NAMESPACE_SCRIPT = """
+            import sys
 
-                print(f"{type(plugins.__path__).__name__=}  {len(list(plugins.__path__))=}")
-                print(f"{getattr(plugins, '__file__', None)=}  {plugins.__spec__.origin=}")
-                print(f"{plugins.csv_export.FORMAT=}  {plugins.pdf_export.FORMAT=}")
+            sys.path[:0] = ["first", "second"]
+            import plugins
+            import plugins.csv_export
+            import plugins.pdf_export
+
+            print("__path__ type:", type(plugins.__path__).__name__, "| entries:", len(list(plugins.__path__)))
+            print("__file__:", getattr(plugins, "__file__", None), "| origin:", plugins.__spec__.origin)
+            print("formats:", plugins.csv_export.FORMAT, plugins.pdf_export.FORMAT)
             """
+            with scratch_project("unit33_namespace", NAMESPACE_FILES) as root:
+                print(run_script(root, NAMESPACE_SCRIPT))
+            '''
         ),
     ]
 
@@ -767,7 +881,7 @@ def _relative_import_cells() -> list[NotebookNode]:
         ),
         code(
             '''
-            relative_files = {
+            RELATIVE_FILES = {
                 "inventory/__init__.py": "",
                 "inventory/stock.py": "LEVEL = 7\\n",
                 "inventory/reports/__init__.py": "",
@@ -780,16 +894,15 @@ def _relative_import_cells() -> list[NotebookNode]:
                         print(f"__package__={__package__!r}:", formatting.bold(f"stock {LEVEL}"))
                     """,
             }
-            with temporary_modules(relative_files) as root:
+            with scratch_project("unit33_relative", RELATIVE_FILES) as root:
                 print(
                     "python -m inventory.reports.daily ->",
                     run_python("-m", "inventory.reports.daily", cwd=root),
                 )
                 script_output = run_python("inventory/reports/daily.py", cwd=root).splitlines()[-1]
                 print("python inventory/reports/daily.py ->", script_output)
-                import inventory.reports.daily
-
-                print(f"imported: {inventory.reports.daily.__package__=}")
+                imported = run_script(root, "import inventory.reports.daily as daily\\nprint(daily.__package__)")
+                print(f"imported from main.py: __package__ = {imported!r}")
             '''
         ),
     ]
@@ -811,11 +924,14 @@ def _entry_point_cells() -> list[NotebookNode]:
               testable.
             - Installed command-line tools come from `[project.scripts]` in `pyproject.toml`,
               which point at a `module:function` (Phase 4).
+
+            `runpy.run_module(name, run_name="__main__")` is what `python -m` uses; the last
+            child script calls it directly, then imports the same module normally.
             """
         ),
         code(
             '''
-            greeter_files = {
+            GREETER_FILES = {
                 "greeter/__init__.py": "",
                 "greeter/__main__.py": "from greeter.cli import main\\n\\nmain()\\n",
                 "greeter/cli.py": """
@@ -829,21 +945,21 @@ def _entry_point_cells() -> list[NotebookNode]:
                         main()
                     """,
             }
-            with temporary_modules(greeter_files) as root:
-                print("python -m greeter Ravi ->", run_python("-m", "greeter", "Ravi", cwd=root))
-                print("python -m greeter.cli ->", run_python("-m", "greeter.cli", cwd=root))
-                captured = io.StringIO()
-                with contextlib.redirect_stdout(captured):
-                    kernel_argv, sys.argv = sys.argv, ["greeter.cli", "Meena"]
-                    try:
-                        runpy.run_module("greeter.cli", run_name="__main__")
-                    finally:
-                        sys.argv = kernel_argv
-                print(f"runpy.run_module(..., run_name='__main__') -> {captured.getvalue().strip()}")
-                import greeter.cli
+            ENTRY_SCRIPT = """
+            import runpy
+            import sys
 
-                print("import greeter.cli: nothing printed, main() not called")
-                greeter.cli.main(["Asha"])
+            sys.argv = ["greeter.cli", "Meena"]
+            runpy.run_module("greeter.cli", run_name="__main__")  # what python -m does
+            import greeter.cli
+
+            print("import greeter.cli: main() was not called on import")
+            greeter.cli.main(["Asha"])
+            """
+            with scratch_project("unit33_entry_points", GREETER_FILES) as root:
+                print("python -m greeter Ravi ->", run_python("-m", "greeter", "Ravi", cwd=root))
+                print("python -m greeter.cli  ->", run_python("-m", "greeter.cli", cwd=root))
+                print(run_script(root, ENTRY_SCRIPT))
             '''
         ),
     ]
@@ -866,6 +982,12 @@ def _circular_cells() -> list[NotebookNode]:
                 tax: line 1: from invoices import Invoice
                      invoices is in sys.modules but has no Invoice yet  -> ImportError
             ```
+
+            The modules live in `src/`, which the script puts on `sys.path`. If they sat in
+            the script's own folder, 3.13+ would print a different hint, *consider renaming
+            '…/invoices.py' if it has the same name as a library you intended to import*: a
+            half-imported module from the script's folder is usually a file that shadows a
+            standard module (a `random.py` next to your script), so CPython suggests that first.
             """
         ),
         code(
@@ -890,14 +1012,15 @@ def _circular_cells() -> list[NotebookNode]:
                         return round(invoice.amount * RATE, 2)
                     """,
             }
-            with temporary_modules(BROKEN_INVOICES):
-                print(raised_message(lambda: importlib.import_module("invoices")).split(" (/")[0])
+            FROM_SRC = "import sys\\nsys.path.insert(0, 'src')\\n"
+            with scratch_project("unit33_circular", in_src(BROKEN_INVOICES)) as root:
+                print(run_script(root, FROM_SRC + "import invoices").splitlines()[-1])
             '''
         ),
         md(
             """
-            Four standard fixes, each checked with the same scenario
-            (`Invoice(1000).total()` should be `1180.0`):
+            Four standard fixes, each checked in child processes with the same scenario
+            (`Invoice(1000).total()` should be `1180.0`), importing each module first in turn:
 
             | Fix | Change | When to use |
             | --- | --- | --- |
@@ -909,17 +1032,29 @@ def _circular_cells() -> list[NotebookNode]:
         ),
         code(
             '''
+            ORDER_SCRIPT = """
+            import importlib
+            import sys
+
+            sys.path.insert(0, "src")
+            importlib.import_module(sys.argv[1])  # import this module first
+            import invoices
+
+            print(invoices.Invoice(1000).total())
+            """
+
+
             def check_invoice_fix(files: dict[str, str]) -> str:
-                """Import the fixed modules (in both orders) and run the scenario."""
-                results = []
+                """Run the scenario in child processes, importing each module first in turn."""
+                totals = []
                 for first_import in ("invoices", "tax"):
-                    with temporary_modules(files):
-                        importlib.import_module(first_import)
-                        results.append(importlib.import_module("invoices").Invoice(1000).total())
-                return f"total={results[0]} (both import orders work: {results[0] == results[1]})"
+                    with scratch_project("unit33_circular", in_src(files)) as root:
+                        totals.append(run_script(root, ORDER_SCRIPT, first_import).splitlines()[-1])
+                return f"total={totals[0]} (both import orders work: {totals[0] == totals[1] == '1180.0'})"
 
 
-            INVOICE_CLASS = """
+            INVOICE_CLASS = textwrap.dedent(
+                """
                 class Invoice:
                     def __init__(self, amount):
                         self.amount = amount
@@ -927,42 +1062,39 @@ def _circular_cells() -> list[NotebookNode]:
                     def total(self):
                         return self.amount + tax_for(self)
                 """
+            )
             BROKEN_TAX = textwrap.dedent(BROKEN_INVOICES["tax.py"])
-            fix_third_module = {
-                "rates.py": """
-                    RATE = 0.18
-
-                    def tax_for(invoice):
-                        return round(invoice.amount * RATE, 2)
-                    """,
-                "invoices.py": "from rates import tax_for\\n" + textwrap.dedent(INVOICE_CLASS),
-                "tax.py": "from invoices import Invoice\\nfrom rates import RATE, tax_for\\n",
-            }
-            fix_module_import = {
-                "invoices.py": "import tax\\n"
-                + textwrap.dedent(INVOICE_CLASS).replace("tax_for(self)", "tax.tax_for(self)"),
-                "tax.py": BROKEN_TAX.replace("from invoices import Invoice", "import invoices").replace(
-                    "invoice: Invoice", "invoice: invoices.Invoice"
-                ),
-            }
-            fix_local_import = {
-                "invoices.py": textwrap.dedent(INVOICE_CLASS).replace(
-                    "return self.amount", "from tax import tax_for\\n\\n        return self.amount"
-                ),
-                "tax.py": BROKEN_TAX,
-            }
-            fix_type_checking = {
-                "invoices.py": BROKEN_INVOICES["invoices.py"],
-                "tax.py": BROKEN_TAX.replace(
-                    "from invoices import Invoice",
-                    "from typing import TYPE_CHECKING\\n\\nif TYPE_CHECKING:\\n    from invoices import Invoice",
-                ),
-            }
             invoice_fixes = {
-                "1. third module": fix_third_module,
-                "2. module import": fix_module_import,
-                "3. local import": fix_local_import,
-                "4. TYPE_CHECKING": fix_type_checking,
+                "1. third module": {
+                    "rates.py": """
+                        RATE = 0.18
+
+                        def tax_for(invoice):
+                            return round(invoice.amount * RATE, 2)
+                        """,
+                    "invoices.py": "from rates import tax_for\\n" + INVOICE_CLASS,
+                    "tax.py": "from invoices import Invoice\\nfrom rates import RATE, tax_for\\n",
+                },
+                "2. module import": {
+                    "invoices.py": "import tax\\n" + INVOICE_CLASS.replace("tax_for(self)", "tax.tax_for(self)"),
+                    "tax.py": BROKEN_TAX.replace("from invoices import Invoice", "import invoices").replace(
+                        "invoice: Invoice", "invoice: invoices.Invoice"
+                    ),
+                },
+                "3. local import": {
+                    "invoices.py": INVOICE_CLASS.replace(
+                        "return self.amount", "from tax import tax_for\\n\\n        return self.amount"
+                    ),
+                    "tax.py": BROKEN_TAX,
+                },
+                "4. TYPE_CHECKING": {
+                    "invoices.py": BROKEN_INVOICES["invoices.py"],
+                    "tax.py": BROKEN_TAX.replace(
+                        "from invoices import Invoice",
+                        "from typing import TYPE_CHECKING\\n\\n"
+                        "if TYPE_CHECKING:\\n    from invoices import Invoice",
+                    ),
+                },
             }
             for label, files in invoice_fixes.items():
                 print(f"{label:<18} {check_invoice_fix(files)}")
@@ -995,6 +1127,9 @@ def _importlib_cells() -> list[NotebookNode]:
             | Entry points | Plugins advertised by **installed distributions** in their metadata (`[project.entry-points."group"]`) |
 
             #### `importlib.import_module`
+
+            `json` and its submodules are already loaded in this kernel, so these calls only
+            look them up in `sys.modules`.
             """
         ),
         code(
@@ -1012,20 +1147,28 @@ def _importlib_cells() -> list[NotebookNode]:
 
             `files(package)` returns a `Traversable` (like a read-only `pathlib.Path`) for the
             package's folder, wherever it really lives. `as_file()` gives a real file path when
-            a library insists on one (extracting from a zip if needed).
+            a library insists on one (extracting from a zip if needed). Reading the
+            already-imported `json` package is safe in the kernel; the `brand` package with a
+            data file runs in a child.
             """
         ),
         code(
+            '''
+            json_files = sorted(item.name for item in importlib.resources.files("json").iterdir())
+            print(f"json package files (read in the kernel): {json_files[:4]}")
+            BRAND_FILES = {"brand/__init__.py": "", "brand/assets/tagline.txt": "Fresh groceries, fast.\\n"}
+            RESOURCES_SCRIPT = """
+            import importlib.resources
+
+            assets = importlib.resources.files("brand") / "assets"
+            print("type:", type(assets).__name__, "| contents:", [item.name for item in assets.iterdir()])
+            print("tagline:", (assets / "tagline.txt").read_text().strip())
+            with importlib.resources.as_file(assets / "tagline.txt") as real_path:
+                print("as_file gives a real path:", real_path.exists())
             """
-            brand_files = {"brand/__init__.py": "", "brand/assets/tagline.txt": "Fresh groceries, fast.\\n"}
-            with temporary_modules(brand_files):
-                assets = importlib.resources.files("brand") / "assets"
-                print(f"{type(assets).__name__=}")
-                print(f"{[item.name for item in assets.iterdir()]=}")
-                print(f"{(assets / 'tagline.txt').read_text().strip()=}")
-                with importlib.resources.as_file(assets / "tagline.txt") as real_path:
-                    print(f"as_file gives a real path: {real_path.exists()=}")
-            """
+            with scratch_project("unit33_resources", BRAND_FILES) as root:
+                print(run_script(root, RESOURCES_SCRIPT))
+            '''
         ),
         md(
             """
@@ -1062,22 +1205,28 @@ def _importlib_cells() -> list[NotebookNode]:
             A distribution can advertise objects under a named **group** in its metadata;
             the host application discovers and loads them without knowing their modules in
             advance. `console_scripts` is the group behind installed commands; nbconvert finds
-            its exporters through the `nbconvert.exporters` group.
+            its exporters through the `nbconvert.exporters` group. Listing entry points only
+            reads metadata; **loading** one imports its module, so that part runs in a child.
             """
         ),
         code(
-            """
+            '''
             console_scripts = importlib.metadata.entry_points(group="console_scripts")
             jupyter_commands = sorted(ep.name for ep in console_scripts if ep.name.startswith("jupyter"))
             print(f"jupyter commands: {jupyter_commands[:5]}")
             exporters = importlib.metadata.entry_points(group="nbconvert.exporters")
             if exporters:
-                markdown_exporter = next(ep for ep in exporters if ep.name == "markdown")
-                print(f"{markdown_exporter.name} -> {markdown_exporter.value}")
-                print(f"loaded: {markdown_exporter.load().__name__}")
+                print(f"nbconvert exporters advertised: {sorted(ep.name for ep in exporters)[:6]}")
+                LOAD_SCRIPT = """
+                from importlib.metadata import entry_points
+
+                markdown = next(ep for ep in entry_points(group="nbconvert.exporters") if ep.name == "markdown")
+                print(markdown.name, "->", markdown.value, "| loaded:", markdown.load().__name__)
+                """
+                print(run_python("-c", textwrap.dedent(LOAD_SCRIPT)))
             else:
                 print("Skipped: no nbconvert.exporters entry points installed")
-            """
+            '''
         ),
     ]
 
@@ -1100,53 +1249,58 @@ def _hook_cells() -> list[NotebookNode]:
             A finder implements `find_spec(fullname, path, target=None)` and returns a
             `ModuleSpec` or `None`; the spec names a loader that implements
             `create_module(spec)` (return `None` for a default module) and
-            `exec_module(module)`. The demo serves `<name>.json` files as modules whose
-            attributes are the JSON keys.
+            `exec_module(module)`. The demo's `json_importer.py` serves `<name>.json` files
+            from a folder as modules whose attributes are the JSON keys; a child script
+            installs it and imports `store_settings` from `settings/store_settings.json`.
             """
         ),
         code(
             '''
-            class JsonModuleImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-                """Import `settings` from settings.json in a folder: keys become attributes."""
+            HOOK_FILES = {
+                "json_importer.py": """
+                    import importlib.abc
+                    import importlib.util
+                    import json
+                    from pathlib import Path
 
-                def __init__(self, folder: Path) -> None:
-                    self.folder = folder
 
-                def find_spec(
-                    self, fullname: str, path: object, target: object = None
-                ) -> importlib.machinery.ModuleSpec | None:
-                    candidate = self.folder / f"{fullname}.json"
-                    if "." in fullname or not candidate.exists():
-                        return None  # not ours: the next finder tries
-                    return importlib.util.spec_from_loader(fullname, self, origin=str(candidate))
+                    class JsonModuleImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+                        # Import `name` from name.json in a folder: the JSON keys become attributes.
 
-                def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
-                    return None  # default module object
+                        def __init__(self, folder):
+                            self.folder = Path(folder)
 
-                def exec_module(self, module: types.ModuleType) -> None:
-                    module.__dict__.update(json.loads(Path(module.__spec__.origin).read_text()))
-            '''
-        ),
-        md("Install it at the front of `sys.meta_path`, import, and remove it again:"),
-        code(
+                        def find_spec(self, fullname, path, target=None):
+                            candidate = self.folder / f"{fullname}.json"
+                            if "." in fullname or not candidate.exists():
+                                return None  # not ours: the next finder tries
+                            return importlib.util.spec_from_loader(fullname, self, origin=str(candidate))
+
+                        def create_module(self, spec):
+                            return None  # use the default module object
+
+                        def exec_module(self, module):
+                            module.__dict__.update(json.loads(Path(module.__spec__.origin).read_text()))
+                    """,
+                "settings/store_settings.json": '{"currency": "INR", "free_shipping_above": 499}',
+            }
+            HOOK_SCRIPT = """
+            import sys
+
+            from json_importer import JsonModuleImporter
+
+            sys.meta_path.insert(0, JsonModuleImporter("settings"))
+            import store_settings
+
+            print("currency:", store_settings.currency, "| free above:", store_settings.free_shipping_above)
+            print("loader:", type(store_settings.__loader__).__name__)
+            print("origin:", store_settings.__spec__.origin)
             """
-            with tempfile.TemporaryDirectory() as folder:
-                Path(folder, "store_settings.json").write_text(
-                    '{"currency": "INR", "free_shipping_above": 499}'
-                )
-                importer = JsonModuleImporter(Path(folder))
-                sys.meta_path.insert(0, importer)
-                try:
-                    import store_settings
-
-                    print(f"{store_settings.currency=}  {store_settings.free_shipping_above=}")
-                    print(f"{type(store_settings.__loader__).__name__=}")
-                finally:
-                    sys.meta_path.remove(importer)
-                    sys.modules.pop("store_settings", None)
+            with scratch_project("unit33_import_hook", HOOK_FILES) as root:
+                print(run_script(root, HOOK_SCRIPT))
             hook_names = [getattr(hook, "__name__", type(hook).__name__) for hook in sys.path_hooks]
-            print(f"sys.path_hooks: {hook_names}")
-            """
+            print(f"this kernel's sys.path_hooks: {hook_names}")
+            '''
         ),
     ]
 
@@ -1171,39 +1325,55 @@ def _lazy_cells() -> list[NotebookNode]:
             | Global switch | `sys.set_lazy_imports("all")`, `python -X lazy_imports=all`, `PYTHON_LAZY_IMPORTS=all` make ordinary top-level imports lazy too; a filter (`sys.set_lazy_imports_filter`) can opt modules out |
             | Inspecting | `sys.lazy_modules` lists modules imported lazily but not yet loaded |
 
-            Lazy syntax is 3.15-only, so the cells compile it from strings inside a version
-            check (older kernels could not even parse the cell). First, the proxy and its first
-            use, on a module that prints when it really runs:
+            Lazy syntax is 3.15-only, so it never appears in a notebook cell's own code (an
+            older kernel could not even parse the cell): it lives in **separate files** run by a
+            child interpreter, or in strings passed to `compile()`, all behind a
+            `sys.version_info >= (3, 15)` check. First, the proxy and its first use, on a module
+            that prints when it really runs:
             """
         ),
         code(
             '''
-            LAZY_DEMO = """
-            import sys
-            lazy import heavy_report
-            print("1. after `lazy import`:", "heavy_report" in sys.modules, type(globals()["heavy_report"]))
-            print("2. first use returns:", heavy_report.summary())
-            print("3. after first use:", "heavy_report" in sys.modules, type(globals()["heavy_report"]))
-            """
-            heavy_files = {
+            LAZY_FILES = {
                 "heavy_report.py": """
                     print("   heavy_report: module code runs now")
 
                     def summary():
                         return "ok"
                     """,
+                "lazy_demo.py": """
+                    import sys
+
+                    lazy import heavy_report
+
+                    kind = type(globals()["heavy_report"]).__name__
+                    print("1. after `lazy import`:", "heavy_report" in sys.modules, kind)
+                    print("2. first use returns:", heavy_report.summary())
+                    kind = type(globals()["heavy_report"]).__name__
+                    print("3. after first use:", "heavy_report" in sys.modules, kind)
+                    """,
+                "missing_demo.py": """
+                    lazy import no_such_reporting_lib
+
+                    print("the lazy import line passed")
+                    try:
+                        no_such_reporting_lib.render()
+                    except ModuleNotFoundError as error:
+                        print("first use ->", type(error).__name__ + ":", error)
+                    """,
             }
             if sys.version_info >= (3, 15):
-                with temporary_modules(heavy_files):
-                    exec(compile(LAZY_DEMO, "<lazy demo>", "exec"), {"__name__": "lazy_demo"})
+                with scratch_project("unit33_lazy", LAZY_FILES) as root:
+                    print(run_python("lazy_demo.py", cwd=root))
+                    print(run_python("missing_demo.py", cwd=root))
             else:
                 print("Skipped: lazy imports need Python 3.15+")
             '''
         ),
         md(
             """
-            **Restrictions and late errors.** Where the keyword is refused, and what happens
-            when the module does not exist.
+            **Restrictions.** Where the keyword is refused, checked with `compile()` on strings
+            (nothing is imported), plus this kernel's global mode.
             """
         ),
         code(
@@ -1213,14 +1383,11 @@ def _lazy_cells() -> list[NotebookNode]:
                 in_try = "try:\\n    lazy import json\\nexcept ImportError:\\n    pass\\n"
                 print(f"in try:        {compile_error(in_try)}")
                 print(f"star import:   {compile_error('lazy from json import *\\n')}")
-                missing_demo = "lazy import no_such_reporting_lib\\nno_such_reporting_lib.render()\\n"
-                print(
-                    raised_message(
-                        lambda: exec(compile(missing_demo, "<lazy>", "exec"), {"__name__": "missing_demo"})
-                    )
-                )
+                print(f"module level:  {compile_error('lazy import json\\n')}")
                 pending_count = len(sys.lazy_modules)
-                print(f"{sys.get_lazy_imports()=}  ({pending_count} stdlib modules still pending here)")
+                print(
+                    f"{sys.get_lazy_imports()=}  ({pending_count} stdlib modules still pending in this kernel)"
+                )
             else:
                 print("Skipped: lazy imports need Python 3.15+")
             """
@@ -1253,13 +1420,18 @@ def _lazy_cells() -> list[NotebookNode]:
             """
             **`importlib.util.LazyLoader`** (3.5+) gives the same effect for one module on any
             version: the module object is created at once, and its code runs on the first
-            attribute access.
+            attribute access. It registers the module in `sys.modules`, so it runs in a child.
             """
         ),
         code(
             '''
-            def lazy_load(module_name: str) -> types.ModuleType:
-                """Import module_name with LazyLoader: its code runs on first attribute access."""
+            LAZY_LOADER_SCRIPT = """
+            import importlib.util
+            import sys
+
+
+            def lazy_load(module_name):
+                # Import module_name with LazyLoader: its code runs on first attribute access.
                 spec = importlib.util.find_spec(module_name)
                 spec.loader = importlib.util.LazyLoader(spec.loader)
                 module = importlib.util.module_from_spec(spec)
@@ -1268,10 +1440,14 @@ def _lazy_cells() -> list[NotebookNode]:
                 return module
 
 
-            with temporary_modules(heavy_files):
-                report_module = lazy_load("heavy_report")
-                print(f"module object exists: {type(report_module).__name__}")
-                print(f"first attribute access -> {report_module.summary()=}")
+            report_module = lazy_load("heavy_report")
+            print("module object exists:", type(report_module).__name__)
+            print("first attribute access ->", report_module.summary())
+            """
+            with scratch_project(
+                "unit33_lazy_loader", {"heavy_report.py": LAZY_FILES["heavy_report.py"]}
+            ) as root:
+                print(run_script(root, LAZY_LOADER_SCRIPT))
             '''
         ),
         md(
@@ -1299,7 +1475,7 @@ def _lazy_cells() -> list[NotebookNode]:
 
 
 def _js_bridge_cells() -> list[NotebookNode]:
-    """3.3.13 JS bridge."""
+    """3.3.13 JS bridge, the predict question and the kernel-isolation check."""
     return [
         md(
             """
@@ -1323,16 +1499,23 @@ def _js_bridge_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
-            with temporary_modules({"counter_module.py": "print('counter_module runs')\\nhits = 0\\n"}):
-                import counter_module
+            '''
+            RERUN_SCRIPT = """
+            import sys
 
-                first_object = counter_module
-                del sys.modules["counter_module"]
-                import counter_module
+            import counter_module
 
-                print(f"{first_object is counter_module=}  (a fresh module object)")
+            first_object = counter_module
+            del sys.modules["counter_module"]
+            import counter_module
+
+            print("first_object is counter_module:", first_object is counter_module, "(a fresh module object)")
             """
+            with scratch_project(
+                "unit33_rerun", {"counter_module.py": "print('counter_module runs')\\n"}
+            ) as root:
+                print(run_script(root, RERUN_SCRIPT))
+            '''
         ),
         *predict_cells(
             """
@@ -1353,14 +1536,40 @@ def _js_bridge_cells() -> list[NotebookNode]:
             points at `False`. In JavaScript, an ESM named import would see `true` (live
             binding).
             """,
-            """
-            with temporary_modules({"settings.py": "DEBUG = False\\n"}):
-                import settings
-                from settings import DEBUG
+            '''
+            PREDICT_SCRIPT = """
+            import settings
+            from settings import DEBUG
 
-                settings.DEBUG = True
-                print(DEBUG, settings.DEBUG)
-            """,
+            settings.DEBUG = True
+            print(DEBUG, settings.DEBUG)
+            """
+            with scratch_project("unit33_predict", {"settings.py": "DEBUG = False\\n"}) as root:
+                print(run_script(root, PREDICT_SCRIPT))
+            ''',
+        ),
+        md(
+            """
+            #### Proof that the demos stayed out of this kernel
+
+            Every module above was imported by a child interpreter. The kernel's `sys.path` is
+            the same list as when the setup cell ran, none of the demo modules are in its
+            `sys.modules`, and every scratch folder has been deleted.
+            """
+        ),
+        code(
+            """
+            DEMO_MODULE_NAMES = {
+                "checkout_rules", "checkout_helpers", "discounts", "fake_payments", "config", "shop",
+                "settings", "app_state", "billing", "shipping", "rates", "tools", "inventory", "plugins",
+                "greeter", "invoices", "tax", "brand", "json_importer", "store_settings", "heavy_report",
+                "lazy_demo", "missing_demo", "counter_module",
+            }  # fmt: skip
+            print(f"kernel sys.path unchanged since the setup cell: {sys.path == KERNEL_PATH_AT_START}")
+            print(f"demo modules in the kernel's sys.modules: {sorted(DEMO_MODULE_NAMES & set(sys.modules))}")
+            leftover_folders = sorted(path.name for path in scratch_dir.glob("unit33_*"))
+            print(f"demo folders left in notebooks/_scratch: {leftover_folders}")
+            """
         ),
     ]
 
@@ -1373,8 +1582,15 @@ def _lab_package_cells() -> list[NotebookNode]:
             ### Lab 3.3
 
             Six exercises. For each, complete the stub, then run the check cell. Until then the
-            checks print FAIL; that is expected. Packages are written to temporary folders by
-            `temporary_modules` and forgotten afterwards, so you can re-run checks freely.
+            checks print FAIL; that is expected.
+
+            - Exercises 1, 2 and 6 hand over files or source code, so their checks run your
+              packages in **child processes** from `notebooks/_scratch/`, like the demos.
+            - Exercises 3–5 test functions you write **in this kernel** (`load_plugins`,
+              `DictImporter`, the `importlib.resources` readers), so those checks must import
+              into the kernel. `temporary_modules` writes the packages under
+              `notebooks/_scratch/` and, on exit, removes the folder from `sys.path` and forgets
+              every module imported from it, so you can re-run checks freely.
 
             #### Exercise 1 — build a `shop/` package and test its imports
 
@@ -1396,73 +1612,65 @@ def _lab_package_cells() -> list[NotebookNode]:
                 raise NotImplementedError("Lab 3.3: write the shop package")
             '''
         ),
-        md("Run the checks. Each one writes the package to a fresh temporary folder."),
+        md(
+            "Run the checks. Each one writes your package to `notebooks/_scratch/` and inspects it in a child process."
+        ),
         code(
-            '''
-            def with_shop(action: Callable[[Path], object]) -> object:
-                """Write the learner's package, run action(root), forget the package."""
-                with temporary_modules(shop_package_files()) as root:
-                    return action(root)
+            """
+            SHOP_SCRIPT = \"\"\"
+            import json
+            from decimal import Decimal
+
+            import shop
+            import shop.cart
+            import shop.payments
+
+            namespace = {}
+            exec("from shop import *", namespace)
+            cart = shop.Cart()
+            cart.add(shop.Product("tea", Decimal("120.50")), quantity=2)
+            cart.add(shop.Product("rice", Decimal("80")))
+            report = {
+                "all": sorted(shop.__all__),
+                "version": shop.__version__,
+                "star": sorted(name for name in namespace if not name.startswith("__")),
+                "same_class": shop.Cart is shop.cart.Cart,
+                "total": str(cart.total()),
+                "charge": shop.payments.charge(Decimal("321")),
+            }
+            print(json.dumps(report))
+            \"\"\"
 
 
-            def shop_total(root: Path) -> Decimal:
-                shop = importlib.import_module("shop")
-                cart = shop.Cart()
-                cart.add(shop.Product("tea", Decimal("120.50")), quantity=2)
-                cart.add(shop.Product("rice", Decimal("80")))
-                return cart.total()
+            def shop_report() -> dict[str, object]:
+                \"\"\"Write the learner's package and inspect it in a child process.\"\"\"
+                with scratch_project("unit33_lab_shop", shop_package_files()) as root:
+                    return child_json(run_script(root, SHOP_SCRIPT))
 
 
-            def shop_star_names(root: Path) -> list[str]:
-                namespace: dict[str, object] = {}
-                exec("from shop import *", namespace)
-                return sorted(name for name in namespace if not name.startswith("__"))
+            def shop_run_as_module() -> str:
+                \"\"\"Output of `python -m shop` in the package folder.\"\"\"
+                with scratch_project("unit33_lab_shop", shop_package_files()) as root:
+                    return run_python("-m", "shop", cwd=root)
 
 
             run_checks(
                 [
-                    (
-                        "__all__",
-                        lambda: with_shop(lambda root: sorted(importlib.import_module("shop").__all__)),
-                        ["Cart", "Product"],
-                    ),
-                    (
-                        "__version__",
-                        lambda: with_shop(lambda root: importlib.import_module("shop").__version__),
-                        "1.0",
-                    ),
-                    ("star import", lambda: with_shop(shop_star_names), ["Cart", "Product"]),
-                    (
-                        "re-export is the same class",
-                        lambda: with_shop(
-                            lambda root: (
-                                importlib.import_module("shop").Cart
-                                is importlib.import_module("shop.cart").Cart
-                            )
-                        ),
-                        True,
-                    ),
-                    ("cart total", lambda: with_shop(shop_total), Decimal("321.00")),
-                    (
-                        "subpackage",
-                        lambda: with_shop(
-                            lambda root: importlib.import_module("shop.payments").charge(Decimal("321"))
-                        ),
-                        "charged INR 321.00",
-                    ),
+                    ("__all__", lambda: shop_report()["all"], ["Cart", "Product"]),
+                    ("__version__", lambda: shop_report()["version"], "1.0"),
+                    ("star import", lambda: shop_report()["star"], ["Cart", "Product"]),
+                    ("re-export is the same class", lambda: shop_report()["same_class"], True),
+                    ("cart total", lambda: shop_report()["total"], "321.00"),
+                    ("subpackage", lambda: shop_report()["charge"], "charged INR 321.00"),
                     (
                         "relative import in cart.py",
                         lambda: "from .models import" in shop_package_files()["shop/cart.py"],
                         True,
                     ),
-                    (
-                        "python -m shop",
-                        lambda: with_shop(lambda root: run_python("-m", "shop", cwd=root)),
-                        "shop 1.0",
-                    ),
+                    ("python -m shop", shop_run_as_module, "shop 1.0"),
                 ]
             )
-            '''
+            """
         ),
         md(
             """
@@ -1514,9 +1722,9 @@ def _lab_package_cells() -> list[NotebookNode]:
                             return order
                     """,
             }
-            with temporary_modules(BROKEN_ORDERS):
-                failure = raised_message(lambda: importlib.import_module("customers")).split(" (/")[0]
-                print(f"given version: {failure}")
+            FROM_SRC = "import sys\\nsys.path.insert(0, 'src')\\n"
+            with scratch_project("unit33_lab_orders", in_src(BROKEN_ORDERS)) as root:
+                print(f"given version: {run_script(root, FROM_SRC + 'import customers').splitlines()[-1]}")
             '''
         ),
         md("The stubs:"),
@@ -1537,19 +1745,35 @@ def _lab_package_cells() -> list[NotebookNode]:
                 raise NotImplementedError("Lab 3.3: fix with a third module")
             '''
         ),
-        md("Run the checks. Each fix is imported in both orders."),
+        md("Run the checks. Each fix runs in child processes, imported in both orders."),
         code(
             '''
+            ORDERS_SCRIPT = """
+            import importlib
+            import json
+            import sys
+
+            sys.path.insert(0, "src")
+            importlib.import_module(sys.argv[1])  # this module is imported first
+            import customers
+            import orders
+
+            outcome = [customers.Customer("Asha").place_order(7).describe()]
+            try:
+                orders.Order(1, "nobody")
+                outcome.append("no error")
+            except Exception as error:
+                outcome.append(type(error).__name__)
+            print(json.dumps(outcome))
+            """
+
+
             def orders_scenario(files: dict[str, str]) -> list[str]:
-                """Run the scenario after importing customers first, then orders first."""
-                outcomes = []
+                """Run the scenario in child processes: customers imported first, then orders first."""
+                outcomes: list[str] = []
                 for first_import in ("customers", "orders"):
-                    with temporary_modules(files):
-                        importlib.import_module(first_import)
-                        customers = importlib.import_module("customers")
-                        orders = importlib.import_module("orders")
-                        outcomes.append(customers.Customer("Asha").place_order(7).describe())
-                        outcomes.append(raised_error_name(lambda: orders.Order(1, "nobody")))  # noqa: B023 (called at once)
+                    with scratch_project("unit33_lab_orders", in_src(files)) as root:
+                        outcomes.extend(child_json(run_script(root, ORDERS_SCRIPT, first_import)))
                 return outcomes
 
 

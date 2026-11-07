@@ -6,15 +6,14 @@ from nb_builder import code, md, predict_cells
 
 PROJECT_SETUP_SOURCE = '''
 import ast
-import importlib
 import inspect
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import sysconfig
-import tempfile
 import textwrap
 import tracemalloc
 from collections.abc import Callable, Iterator
@@ -23,6 +22,7 @@ from pathlib import Path
 
 CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0"}
 PROJECTS_DIR = find_repo_root() / "projects"
+scratch_dir = find_repo_root() / "notebooks" / "_scratch"  # git-ignored
 if str(PROJECTS_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECTS_DIR))  # so the notebook can import pyinspect
 
@@ -58,7 +58,7 @@ def run_pyinspect(*arguments: str, cwd: Path = PROJECTS_DIR) -> tuple[int, str]:
 
 
 def run_python(*arguments: str, cwd: Path | None = None) -> str:
-    """Run the kernel's interpreter in a child process; return stdout and stderr, stripped."""
+    """Run the kernel's interpreter in a child process; return its output (cwd as <project>)."""
     completed = subprocess.run(
         [sys.executable, *arguments],
         capture_output=True,
@@ -67,36 +67,30 @@ def run_python(*arguments: str, cwd: Path | None = None) -> str:
         env=CHILD_ENV,
         timeout=120,
     )
-    return (completed.stdout + completed.stderr).strip()
+    output = (completed.stdout + completed.stderr).strip()
+    return output.replace(str(cwd), "<project>") if cwd is not None else output
 
 
 @contextmanager
-def temporary_modules(files: dict[str, str]) -> Iterator[Path]:
-    """Write modules to a temporary folder first on sys.path; forget them afterwards (Unit 3.3)."""
-    with tempfile.TemporaryDirectory(prefix="project3_") as folder:
-        root = Path(folder)
-        for relative_path, text in files.items():
-            (root / relative_path).parent.mkdir(parents=True, exist_ok=True)
-            (root / relative_path).write_text(textwrap.dedent(text))
-        sys.path.insert(0, folder)
-        importlib.invalidate_caches()
-        try:
-            yield root
-        finally:
-            sys.path.remove(folder)
-            for name, module in list(sys.modules.items()):
-                if str(getattr(getattr(module, "__spec__", None), "origin", "") or "").startswith(
-                    folder
-                ):
-                    del sys.modules[name]
-
-
-def write_tree(root: Path, files: dict[str, str]) -> None:
-    """Write {relative path: source} under root (dedented, leading blank line removed)."""
+def scratch_project(name: str, files: dict[str, str]) -> Iterator[Path]:
+    """Write files under notebooks/_scratch/<name>/ (Unit 3.3); delete them afterwards."""
+    root = scratch_dir / name
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
     for relative_path, text in files.items():
         target = root / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(textwrap.dedent(text).lstrip("\\n"))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def run_script(root: Path, script: str) -> str:
+    """Save script as root/main.py and run it in a child interpreter from root (Unit 3.3)."""
+    (root / "main.py").write_text(textwrap.dedent(script).lstrip("\\n"))
+    return run_python("main.py", cwd=root)
 
 
 print(interpreter_label())
@@ -335,11 +329,10 @@ def _scanner_cells() -> list[NotebookNode]:
                 "app/broken.py": "def broken(:\\n    pass\\n",
                 "app/.cache/ignored.py": "def ignored(x=[]):\\n    pass\\n",
             }
-            with tempfile.TemporaryDirectory() as folder:
-                write_tree(Path(folder), SAMPLE_PROJECT)
-                sample_findings = pyinspect.scan_paths([Path(folder) / "app"], relative_to=folder)
-                cli_status, cli_text = run_pyinspect("scan", "app", cwd=Path(folder))
-                json_status, json_text = run_pyinspect("scan", "app", "--json", cwd=Path(folder))
+            with scratch_project("project3_sample", SAMPLE_PROJECT) as folder:
+                sample_findings = pyinspect.scan_paths([folder / "app"], relative_to=folder)
+                cli_status, cli_text = run_pyinspect("scan", "app", cwd=folder)
+                json_status, json_text = run_pyinspect("scan", "app", "--json", cwd=folder)
             print(pyinspect.format_findings(sample_findings))
             same_text = cli_text == pyinspect.format_findings(sample_findings)
             print(f"\\nCLI exit status: {cli_status}; same text as in-process: {same_text}")
@@ -485,9 +478,8 @@ def _self_check_cells() -> list[NotebookNode]:
 
 
             def sample_scan() -> list[tuple[str, int, str]]:
-                with tempfile.TemporaryDirectory() as folder:
-                    write_tree(Path(folder), SAMPLE_PROJECT)
-                    findings = pyinspect.scan_paths([Path(folder) / "app"], relative_to=folder)
+                with scratch_project("project3_sample", SAMPLE_PROJECT) as folder:
+                    findings = pyinspect.scan_paths([folder / "app"], relative_to=folder)
                 return [(finding.path, finding.line, finding.code) for finding in findings]
 
 
@@ -819,16 +811,21 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
         The module's code runs once; later imports find it in `sys.modules` (3.3.4). `again`
         is the same module object, so it sees the incremented `hits`.
         """,
+        '''
+        COUNTER_SCRIPT = """
+        import counter_mod
+        import counter_mod
+
+        counter_mod.hits += 1
+        import counter_mod as again
+
+        print(again.hits)
         """
-        with temporary_modules({"counter_mod.py": "print('loading')\\nhits = 0\\n"}):
-            import counter_mod  # noqa: I001 (the repeated import is the point)
-            import counter_mod
-
-            counter_mod.hits += 1
-            import counter_mod as again
-
-            print(again.hits)
-        """,
+        with scratch_project(
+            "project3_counter", {"counter_mod.py": "print('loading')\\nhits = 0\\n"}
+        ) as root:
+            print(run_script(root, COUNTER_SCRIPT))
+        ''',
     ),
     (
         "3.3",
@@ -846,15 +843,26 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
         `square` is public but not listed, and `_scale` would be skipped even without
         `__all__` (3.3.3).
         """,
+        '''
+        SHAPES_FILES = {
+            "shapes.py": """
+                __all__ = ["circle"]
+
+                def circle(): ...
+
+                def square(): ...
+
+                _scale = 2
+                """,
+        }
+        SHAPES_SCRIPT = """
+        from shapes import *
+
+        print("circle" in dir(), "square" in dir(), "_scale" in dir())
         """
-        shapes_source = (
-            "__all__ = ['circle']\\n\\ndef circle():\\n    pass\\n\\ndef square():\\n    pass\\n\\n_scale = 2\\n"
-        )
-        with temporary_modules({"shapes.py": shapes_source}):
-            star_namespace: dict[str, object] = {}
-            exec("from shapes import *", star_namespace)
-            print("circle" in star_namespace, "square" in star_namespace, "_scale" in star_namespace)
-        """,
+        with scratch_project("project3_shapes", SHAPES_FILES) as root:
+            print(run_script(root, SHAPES_SCRIPT))
+        ''',
     ),
     (
         "3.3",
@@ -882,10 +890,8 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
             "cycle_a.py": "import cycle_b\\n\\nVALUE = 42\\n",
             "cycle_b.py": "import cycle_a\\n\\nprint(hasattr(cycle_a, 'VALUE'))\\n",
         }
-        with temporary_modules(cycle_files):
-            import cycle_a
-
-            print(cycle_a.VALUE)
+        with scratch_project("project3_cycle", cycle_files) as root:
+            print(run_script(root, "import cycle_a\\n\\nprint(cycle_a.VALUE)\\n"))
         """,
     ),
     (
@@ -901,15 +907,17 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
         `43`. `import` checks `sys.modules` first and returns whatever is cached there, even an
         int (3.3.2). Test doubles and some plugin systems use this on purpose.
         """,
-        """
-        sys.modules["config"] = 42
-        try:
-            import config
+        '''
+        CONFIG_SCRIPT = """
+        import sys
 
-            print(config + 1)
-        finally:
-            del sys.modules["config"]
-        """,
+        sys.modules["config"] = 42
+        import config
+
+        print(config + 1)
+        """
+        print(run_python("-c", textwrap.dedent(CONFIG_SCRIPT)))
+        ''',
     ),
     (
         "3.3",
@@ -929,9 +937,10 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
         `if __name__ == "__main__":` guard tests.
         """,
         """
-        with temporary_modules({"tools/__init__.py": "", "tools/report.py": "print(__name__)\\n"}) as root:
+        tools_files = {"tools/__init__.py": "", "tools/report.py": "print(__name__)\\n"}
+        with scratch_project("project3_tools", tools_files) as root:
             print(run_python("-m", "tools.report", cwd=root))
-            import tools.report  # noqa: F401 (imported for its print)
+            print(run_script(root, "import tools.report"))
         """,
     ),
 ]
@@ -953,8 +962,8 @@ def _question_cells() -> list[NotebookNode]:
             Fifteen short snippets, five from each unit. For each one, decide what it prints
             **before** opening the answer, then run the proof cell. If a question surprises
             you, go back to the section it names. Snippets leave out type hints to stay short;
-            the proof cells add them (and use `temporary_modules` where a snippet needs a
-            module file).
+            the proof cells add them. Snippets that need module files run in a child
+            interpreter from `notebooks/_scratch/` (as in Unit 3.3), so the kernel stays clean.
 
             | Unit | Questions |
             | --- | --- |

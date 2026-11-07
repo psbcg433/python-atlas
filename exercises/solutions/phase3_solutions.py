@@ -37,7 +37,6 @@ import zipfile
 from collections import Counter, deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from decimal import Decimal
 from pathlib import Path
 
 type TestCase = tuple[str, Callable[[], object], object]
@@ -1201,6 +1200,38 @@ def run_python(*arguments: str, cwd: Path | None = None) -> str:
     return (completed.stdout + completed.stderr).strip()
 
 
+@contextmanager
+def child_project(files: dict[str, str]) -> Iterator[Path]:
+    """Write files to a temporary folder for a child process (the notebook uses _scratch)."""
+    with tempfile.TemporaryDirectory(prefix="lab33_") as folder:
+        root = Path(folder)
+        for relative_path, text in files.items():
+            target = root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(textwrap.dedent(text).lstrip("\n"))
+        yield root
+
+
+def run_script(root: Path, script: str, *arguments: str) -> str:
+    """Save script as root/main.py and run it in a child interpreter from root."""
+    (root / "main.py").write_text(textwrap.dedent(script).lstrip("\n"))
+    return run_python("main.py", *arguments, cwd=root)
+
+
+def in_src(files: dict[str, str]) -> dict[str, str]:
+    """The same files moved into src/, a folder the script adds to sys.path itself."""
+    return {f"src/{relative_path}": text for relative_path, text in files.items()}
+
+
+def child_json(output: str) -> object:
+    """Parse the last line of a child's output as JSON; raise with the child's error if not."""
+    last_line = output.splitlines()[-1] if output else ""
+    try:
+        return json.loads(last_line)
+    except ValueError:
+        raise RuntimeError(f"child process failed: {last_line}") from None
+
+
 # Exercise 1 — the shop package
 
 
@@ -1419,70 +1450,80 @@ def make_lazy(source: str) -> str:
 def check_lab_3_3() -> None:
     """Run the same checks as the Lab 3.3 check cells in the notebook."""
     print("Exercise 1 — the shop package")
+    shop_script = """
+import json
+from decimal import Decimal
 
-    def with_shop(action: Callable[[Path], object]) -> object:
-        with temporary_modules(shop_package_files()) as root:
-            return action(root)
+import shop
+import shop.cart
+import shop.payments
 
-    def shop_total(root: Path) -> Decimal:
-        shop = importlib.import_module("shop")
-        cart = shop.Cart()
-        cart.add(shop.Product("tea", Decimal("120.50")), quantity=2)
-        cart.add(shop.Product("rice", Decimal("80")))
-        return cart.total()
+namespace = {}
+exec("from shop import *", namespace)
+cart = shop.Cart()
+cart.add(shop.Product("tea", Decimal("120.50")), quantity=2)
+cart.add(shop.Product("rice", Decimal("80")))
+report = {
+    "all": sorted(shop.__all__),
+    "version": shop.__version__,
+    "star": sorted(name for name in namespace if not name.startswith("__")),
+    "same_class": shop.Cart is shop.cart.Cart,
+    "total": str(cart.total()),
+    "charge": shop.payments.charge(Decimal("321")),
+}
+print(json.dumps(report))
+"""
 
-    def shop_star_names(root: Path) -> list[str]:
-        namespace: dict[str, object] = {}
-        exec("from shop import *", namespace)
-        return sorted(name for name in namespace if not name.startswith("__"))
+    def shop_report() -> dict[str, object]:
+        with child_project(shop_package_files()) as root:
+            return child_json(run_script(root, shop_script))
 
-    def same_class(root: Path) -> bool:
-        shop = importlib.import_module("shop")
-        return shop.Cart is importlib.import_module("shop.cart").Cart
-
-    def charge(root: Path) -> str:
-        return importlib.import_module("shop.payments").charge(Decimal("321"))
+    def shop_run_as_module() -> str:
+        with child_project(shop_package_files()) as root:
+            return run_python("-m", "shop", cwd=root)
 
     run_checks(
         [
-            (
-                "__all__",
-                lambda: with_shop(lambda root: sorted(importlib.import_module("shop").__all__)),
-                ["Cart", "Product"],
-            ),
-            (
-                "__version__",
-                lambda: with_shop(lambda root: importlib.import_module("shop").__version__),
-                "1.0",
-            ),
-            ("star import", lambda: with_shop(shop_star_names), ["Cart", "Product"]),
-            ("re-export is the same class", lambda: with_shop(same_class), True),
-            ("cart total", lambda: with_shop(shop_total), Decimal("321.00")),
-            ("subpackage", lambda: with_shop(charge), "charged INR 321.00"),
+            ("__all__", lambda: shop_report()["all"], ["Cart", "Product"]),
+            ("__version__", lambda: shop_report()["version"], "1.0"),
+            ("star import", lambda: shop_report()["star"], ["Cart", "Product"]),
+            ("re-export is the same class", lambda: shop_report()["same_class"], True),
+            ("cart total", lambda: shop_report()["total"], "321.00"),
+            ("subpackage", lambda: shop_report()["charge"], "charged INR 321.00"),
             (
                 "relative import in cart.py",
                 lambda: "from .models import" in shop_package_files()["shop/cart.py"],
                 True,
             ),
-            (
-                "python -m shop",
-                lambda: with_shop(lambda root: run_python("-m", "shop", cwd=root)),
-                "shop 1.0",
-            ),
+            ("python -m shop", shop_run_as_module, "shop 1.0"),
         ]
     )
 
     print("Exercise 2 — circular imports fixed three ways")
+    orders_script = """
+import importlib
+import json
+import sys
+
+sys.path.insert(0, "src")
+importlib.import_module(sys.argv[1])  # this module is imported first
+import customers
+import orders
+
+outcome = [customers.Customer("Asha").place_order(7).describe()]
+try:
+    orders.Order(1, "nobody")
+    outcome.append("no error")
+except Exception as error:
+    outcome.append(type(error).__name__)
+print(json.dumps(outcome))
+"""
 
     def orders_scenario(files: dict[str, str]) -> list[str]:
-        outcomes = []
+        outcomes: list[str] = []
         for first_import in ("customers", "orders"):
-            with temporary_modules(files):
-                importlib.import_module(first_import)
-                customers = importlib.import_module("customers")
-                orders = importlib.import_module("orders")
-                outcomes.append(customers.Customer("Asha").place_order(7).describe())
-                outcomes.append(raised_error_name(lambda: orders.Order(1, "nobody")))  # noqa: B023
+            with child_project(in_src(files)) as root:
+                outcomes.extend(child_json(run_script(root, orders_script, first_import)))
         return outcomes
 
     def top_level_imports(source: str) -> list[str]:
