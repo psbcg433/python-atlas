@@ -107,7 +107,7 @@ uv run python exercises/solutions/phase0_solutions.py
 | 1 | `phase1_language_fundamentals.ipynb` | Done | [Done](notes/phase1/README.md) |
 | 2 | `phase2_oop_data_model.ipynb` | Done | — |
 | 3 | `phase3_python_internals.ipynb` | Done (project: [`projects/pyinspect/`](projects/pyinspect/)) | — |
-| 4 | `phase4_professional_python.ipynb` | Not started | — |
+| 4 | `phase4_professional_python.ipynb` | In progress (units 4.1–4.2) | — |
 | 5 | `phase5_concurrency_performance.ipynb` | Not started | — |
 | 6 | `phase6_web_fastapi.ipynb` | Not started | — |
 | — | `capstone_task_tracker.ipynb` | Not started | — |
