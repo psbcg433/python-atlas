@@ -105,7 +105,7 @@ uv run python exercises/solutions/phase0_solutions.py
 | --- | --- | --- | --- |
 | 0 | `phase0_environment_setup.ipynb` | Done | — |
 | 1 | `phase1_language_fundamentals.ipynb` | Done | [Done](notes/phase1/README.md) |
-| 2 | `phase2_oop_data_model.ipynb` | Not started | — |
+| 2 | `phase2_oop_data_model.ipynb` | Done | — |
 | 3 | `phase3_python_internals.ipynb` | Not started | — |
 | 4 | `phase4_professional_python.ipynb` | Not started | — |
 | 5 | `phase5_concurrency_performance.ipynb` | Not started | — |
