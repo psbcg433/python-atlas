@@ -6,7 +6,6 @@ from nb_builder import code, md, predict_cells
 
 UNIT_SETUP_SOURCE = r'''
 import ast
-import asyncio
 import contextlib
 import functools
 import importlib.util
@@ -645,7 +644,7 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             from _pytest.assertion.rewrite import rewrite_asserts  # pytest internals: may change
 
             test_source = "def test_total():\n    total = 1 + 1\n    assert total == 3\n"
@@ -653,7 +652,7 @@ def _fundamentals_cells() -> list[NotebookNode]:
             rewrite_asserts(syntax_tree, test_source.encode())
             rewritten = ast.unparse(syntax_tree)
             print("\n".join(line[:110] for line in rewritten.splitlines()))
-            '''
+            """
         ),
         md(
             """
@@ -668,7 +667,7 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             import pytest
 
             with pytest.raises(ValueError, match=r"at least 1, got 0") as error_info:
@@ -680,7 +679,7 @@ def _fundamentals_cells() -> list[NotebookNode]:
                     int("42")  # no exception: the check itself fails
             except BaseException as failure:  # pytest's Failed derives from BaseException
                 print(f"{type(failure).__name__}: {failure}")
-            '''
+            """
         ),
         md(
             """
@@ -732,14 +731,14 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             print(f"{0.1 + 0.2 == 0.3=}")
             print(f"{0.1 + 0.2 == pytest.approx(0.3)=}")
             print(f"{[0.1 + 0.2, 0.2 + 0.4] == pytest.approx([0.3, 0.6])=}")
             print(f"{ {'tax': 18.000001} == pytest.approx({'tax': 18.0})=}")
             print(f"{101 == pytest.approx(100, rel=0.05)=}, {101 == pytest.approx(100, abs=0.5)=}")
             print(f"{pytest.approx(0.3)!r}")
-            '''
+            """
         ),
         *predict_cells(
             """
@@ -812,10 +811,10 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             run_pytest(flags_demo, "-q", "--no-header", "--tb=no", "-k", "coupon or shipping")
             run_pytest(flags_demo, "-q", "--no-header", "--tb=no", "-k", "not total")
-            '''
+            """
         ),
         md(
             """
@@ -825,10 +824,10 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             run_pytest(flags_demo, "-x", "-q", "--no-header", "--tb=no")
             run_pytest(flags_demo, "-v", "--no-header", "--tb=no")
-            '''
+            """
         ),
         md(
             """
@@ -838,10 +837,10 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             run_pytest(flags_demo, "--lf", "-q", "--no-header", "--tb=no")
             print(f"{sorted(path.name for path in (flags_demo / '.pytest_cache' / 'v' / 'cache').iterdir())=}")
-            '''
+            """
         ),
         md(
             """
@@ -852,10 +851,10 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             run_pytest(flags_demo, "-q", "--no-header", "-k", "shipping")
             run_pytest(flags_demo, "-q", "--no-header", "-k", "shipping", "-s")
-            '''
+            """
         ),
         md(
             """
@@ -873,19 +872,31 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             in_kernel = project(
                 "in_kernel",
                 {
                     "pricing.py": "def with_gst(amount):\n    return amount * 118 // 100\n",
-                    "tests/test_pricing.py": "from pricing import with_gst\n\n\ndef test_gst():\n    assert with_gst(100) == 118\n",
+                    "tests/test_pricing.py": (
+                        "from pricing import with_gst\n\n\ndef test_gst():\n    assert with_gst(100) == 118\n"
+                    ),
                 },
             )
             path_before, modules_before = list(sys.path), set(sys.modules)
-            arguments = [str(in_kernel), "-q", "-p", "no:cacheprovider", "--capture=sys", "--rootdir", str(in_kernel)]
+            arguments = [
+                str(in_kernel),
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "--capture=sys",
+                "--rootdir",
+                str(in_kernel),
+            ]
             with contextlib.redirect_stdout(io.StringIO()):
                 first_exit = pytest.main(arguments)
-            (in_kernel / "pricing.py").write_text("def with_gst(amount):\n    return amount * 112 // 100  # bug\n")
+            (in_kernel / "pricing.py").write_text(
+                "def with_gst(amount):\n    return amount * 112 // 100  # bug\n"
+            )
             with contextlib.redirect_stdout(io.StringIO()):
                 second_exit = pytest.main(arguments)
             print(f"{first_exit!r}, {second_exit!r}  (the bug is invisible: pricing was cached)")
@@ -895,7 +906,7 @@ def _fundamentals_cells() -> list[NotebookNode]:
                     del sys.modules[name]
             sys.path[:] = path_before
             print(f"after clean-up: {'pricing' in sys.modules=}")
-            '''
+            """
         ),
         md(
             """
@@ -904,9 +915,9 @@ def _fundamentals_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             run_pytest(in_kernel, "-q", "--no-header", "--tb=line", "-p", "no:cacheprovider")
-            '''
+            """
         ),
     ]
 
@@ -1104,7 +1115,13 @@ def _fixture_cells() -> list[NotebookNode]:
                 },
             )
             run_pytest(conftest_demo, "-v", "--no-header")
-            run_pytest(conftest_demo, "--fixtures", "-q", "tests/api", keep=r"conftest|currency|customer|INR|USD|sample")
+            run_pytest(
+                conftest_demo,
+                "--fixtures",
+                "-q",
+                "tests/api",
+                keep=r"conftest|currency|customer|INR|USD|sample",
+            )
             '''
         ),
         md(
@@ -1222,7 +1239,8 @@ def _fixture_cells() -> list[NotebookNode]:
 
                         def write_report(folder: Path, totals: dict[str, int]) -> Path:
                             path = folder / "report.csv"
-                            path.write_text("sku,total\\n" + "".join(f"{sku},{total}\\n" for sku, total in totals.items()))
+                            rows = "".join(f"{sku},{total}\\n" for sku, total in totals.items())
+                            path.write_text("sku,total\\n" + rows)
                             return path
                     """,
                     "shop/__init__.py": "",
@@ -1463,7 +1481,9 @@ def _parametrize_cells() -> list[NotebookNode]:
 
 
                         @pytest.mark.parametrize("currency", ["INR", "USD", "EUR"])
-                        @pytest.mark.parametrize("amount", ["0.01", "999999.99"], ids=lambda value: f"amt{value}")
+                        @pytest.mark.parametrize(
+                            "amount", ["0.01", "999999.99"], ids=lambda value: f"amt{value}"
+                        )
                         def test_round_trip_through_str(amount, currency):
                             assert str(Money(amount, currency)).startswith(currency + " ")
                     """,
@@ -1587,12 +1607,12 @@ def _parametrize_cells() -> list[NotebookNode]:
         ),
         md("With `--strict-markers`, a misspelt marker stops collection with a clear error:"),
         code(
-            r'''
+            r"""
             (custom_markers / "tests" / "test_typo.py").write_text(
                 "import pytest\n\n\n@pytest.mark.solw\ndef test_typo():\n    assert True\n"
             )
             run_pytest(custom_markers, "-q", "--no-header", keep=r"solw|error|Error")
-            '''
+            """
         ),
     ]
 
@@ -1638,7 +1658,7 @@ def _double_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             mailer = mock.Mock()
             mailer.send.return_value = "queued"
 
@@ -1649,7 +1669,7 @@ def _double_cells() -> list[NotebookNode]:
             print(f"{type(mailer.sned('typo')).__name__=}  (a typo silently returns a Mock)")
             print(raised_message(lambda: mailer.assert_called_once()))
             print(raised_message(lambda: mailer.asert_called_once()))  # misspelt assert*: caught
-            '''
+            """
         ),
         *predict_cells(
             """
@@ -1684,7 +1704,7 @@ def _double_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             connection = mock.MagicMock()
             connection.__len__.return_value = 3
             connection.__iter__.return_value = iter(["TEA-500", "MUG-02", "JAR-750"])
@@ -1695,7 +1715,7 @@ def _double_cells() -> list[NotebookNode]:
                 print(f"{len(open_connection)=}, {list(open_connection)=}, {open_connection['TEA-500']=}")
             print(f"{connection.__exit__.called=}, {bool(connection)=}")
             print(raised_message(lambda: len(mock.Mock())))
-            '''
+            """
         ),
         md(
             """
@@ -1735,7 +1755,7 @@ def _double_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             failing = mock.Mock(side_effect=ConnectionError("rates service down"))
             print(raised_message(failing))
 
@@ -1746,7 +1766,7 @@ def _double_cells() -> list[NotebookNode]:
 
             lookup = mock.Mock(side_effect=lambda currency: {"USD": 83.12, "EUR": 90.4}[currency])
             print(f"{lookup('EUR')=}, {raised_message(lambda: lookup('JPY'))}")
-            '''
+            """
         ),
         md(
             """
@@ -1759,7 +1779,7 @@ def _double_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             audit = mock.Mock()
             audit.log("order created", order_id=7)
             audit.log("payment received", order_id=7, amount=679)
@@ -1767,7 +1787,12 @@ def _double_cells() -> list[NotebookNode]:
 
             audit.log.assert_called_with("payment received", order_id=7, amount=679)  # the last call
             audit.log.assert_any_call("order created", order_id=7)
-            audit.log.assert_has_calls([mock.call("order created", order_id=7), mock.call("payment received", order_id=7, amount=mock.ANY)])
+            audit.log.assert_has_calls(
+                [
+                    mock.call("order created", order_id=7),
+                    mock.call("payment received", order_id=7, amount=mock.ANY),
+                ]
+            )
             print(f"{audit.log.call_count=}")
             print(f"{audit.log.call_args_list=}")
             print(f"{audit.mock_calls=}")
@@ -1775,7 +1800,7 @@ def _double_cells() -> list[NotebookNode]:
             audit.reset_mock()
             audit.log.assert_not_called()
             print(f"after reset: {audit.log.call_count=}")
-            '''
+            """
         ),
         md(
             r"""
@@ -1793,9 +1818,12 @@ def _double_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             rates_module = types.ModuleType("shop_rates")
-            exec("def fetch_rate(currency):\n    raise ConnectionError('real network call')\n", rates_module.__dict__)
+            exec(
+                "def fetch_rate(currency):\n    raise ConnectionError('real network call')\n",
+                rates_module.__dict__,
+            )
             sys.modules["shop_rates"] = rates_module
 
             checkout_module = types.ModuleType("shop_checkout")
@@ -1813,7 +1841,7 @@ def _double_cells() -> list[NotebookNode]:
                 print(f"patched where used:    {checkout_module.total_in('USD', 830)=}")
                 fake_rate.assert_called_once_with("USD")
             print(f"restored: {checkout_module.fetch_rate is rates_module.fetch_rate=}")
-            '''
+            """
         ),
         md(
             """
@@ -1864,7 +1892,7 @@ def _double_cells() -> list[NotebookNode]:
 
             loose = mock.Mock()
             loose.send("asha@example.com")  # missing subject: accepted
-            loose.sendd("typo")             # misspelt method: accepted
+            loose.sendd("typo")  # misspelt method: accepted
 
             strict = mock.create_autospec(Mailer, instance=True)
             print(raised_message(lambda: strict.send("asha@example.com")))
@@ -1917,14 +1945,14 @@ def _double_cells() -> list[NotebookNode]:
                     return True
 
 
-            stub_store = mock.Mock(latest=mock.Mock(return_value=199))           # stub
+            stub_store = mock.Mock(latest=mock.Mock(return_value=199))  # stub
             print(f"stub:  {PriceAlerter(stub_store, mock.Mock()).check('MUG-02', 249, [])=}")
 
-            fake_store = InMemoryPriceStore()                                       # fake
+            fake_store = InMemoryPriceStore()  # fake
             fake_store.save("MUG-02", 259)
             print(f"fake:  {PriceAlerter(fake_store, mock.Mock()).check('MUG-02', 249, [])=}")
 
-            mock_mailer = mock.create_autospec(Mailer, instance=True)               # mock
+            mock_mailer = mock.create_autospec(Mailer, instance=True)  # mock
             PriceAlerter(stub_store, mock_mailer).check("MUG-02", 249, ["asha@example.com"])
             mock_mailer.send.assert_called_once_with("asha@example.com", "MUG-02 is now 199")
             print(f"mock:  {mock_mailer.send.call_args=}")
@@ -2052,7 +2080,14 @@ def _coverage_cells() -> list[NotebookNode]:
                     },
                 )
                 run_pytest(coverage_demo, "-q", "--no-header", "--cov=shop", "--cov-report=term-missing")
-                run_pytest(coverage_demo, "-q", "--no-header", "--cov=shop", "--cov-branch", "--cov-report=term-missing")
+                run_pytest(
+                    coverage_demo,
+                    "-q",
+                    "--no-header",
+                    "--cov=shop",
+                    "--cov-branch",
+                    "--cov-report=term-missing",
+                )
             '''
         ),
         md(
@@ -2069,7 +2104,8 @@ def _coverage_cells() -> list[NotebookNode]:
         code(
             r'''
             if importlib.util.find_spec("pytest_cov") is not None:
-                (coverage_demo / "pyproject.toml").write_text(textwrap.dedent("""
+                (coverage_demo / "pyproject.toml").write_text(
+                    textwrap.dedent("""
                     [tool.pytest.ini_options]
                     pythonpath = ["."]
                     testpaths = ["tests"]
@@ -2081,7 +2117,8 @@ def _coverage_cells() -> list[NotebookNode]:
                     [tool.coverage.report]
                     fail_under = 90
                     exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
-                """))
+                """)
+                )
                 run_pytest(coverage_demo, "-q", "--no-header")  # the test passes, the run fails
             '''
         ),
@@ -2130,7 +2167,7 @@ def _coverage_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             def shipping_fee(total_in_paise: int, express: bool) -> int:
                 if express:
                     return 9_900
@@ -2143,7 +2180,9 @@ def _coverage_cells() -> list[NotebookNode]:
             TOOL = monitoring.COVERAGE_ID
             executed_lines: set[int] = set()
             monitoring.use_tool_id(TOOL, "mini-coverage")
-            monitoring.register_callback(TOOL, monitoring.events.LINE, lambda code, line: executed_lines.add(line))
+            monitoring.register_callback(
+                TOOL, monitoring.events.LINE, lambda code, line: executed_lines.add(line)
+            )
             monitoring.set_local_events(TOOL, shipping_fee.__code__, monitoring.events.LINE)
             shipping_fee(60_000, express=False)
             monitoring.set_local_events(TOOL, shipping_fee.__code__, 0)
@@ -2152,15 +2191,29 @@ def _coverage_cells() -> list[NotebookNode]:
             first_line = shipping_fee.__code__.co_firstlineno
             body_lines = range(first_line + 1, first_line + 6)
             print(f"executed body lines: {sorted(line - first_line for line in executed_lines)}")
-            print(f"never executed:      {[line - first_line for line in body_lines if line not in executed_lines]}")
-            '''
+            print(
+                f"never executed:      "
+                f"{[line - first_line for line in body_lines if line not in executed_lines]}"
+            )
+            """
         ),
         md("coverage.py reports which measurement core it uses with `--debug=sys`:"),
         code(
-            r'''
+            r"""
             if importlib.util.find_spec("pytest_cov") is not None:
-                shell("coverage", "run", "--debug=sys", "-m", "pytest", "-q", "-p", "no:cacheprovider", cwd=useless, keep=r"^\s+(core|coverage_version|CTracer):")
-            '''
+                shell(
+                    "coverage",
+                    "run",
+                    "--debug=sys",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "-p",
+                    "no:cacheprovider",
+                    cwd=useless,
+                    keep=r"^\s+(core|coverage_version|CTracer):",
+                )
+            """
         ),
     ]
 
@@ -2199,7 +2252,7 @@ def _hypothesis_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             if importlib.util.find_spec("hypothesis") is None:
                 print("SKIP: hypothesis is not installed (uv add --dev hypothesis)")
             else:
@@ -2208,16 +2261,14 @@ def _hypothesis_cells() -> list[NotebookNode]:
 
                 generated: list[list[int]] = []
 
-
                 @settings(derandomize=True, max_examples=8, database=None)
                 @given(st.lists(st.integers(min_value=-5, max_value=5), max_size=4))
                 def record_examples(values: list[int]) -> None:
                     generated.append(values)
 
-
                 record_examples()
                 print(*generated, sep="\n")
-            '''
+            """
         ),
         md(
             """
@@ -2228,31 +2279,29 @@ def _hypothesis_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             if importlib.util.find_spec("hypothesis") is not None:
                 skus = st.from_regex(r"[A-Z]{3}-[0-9]{3}", fullmatch=True)
-
 
                 @st.composite
                 def order_lines(draw: st.DrawFn) -> tuple[str, int, Decimal]:
                     sku = draw(skus)
                     quantity = draw(st.integers(min_value=1, max_value=10))
-                    price = draw(st.integers(min_value=1, max_value=500_000).map(lambda paise: Decimal(paise) / 100))
+                    price = draw(
+                        st.integers(min_value=1, max_value=500_000).map(lambda paise: Decimal(paise) / 100)
+                    )
                     return sku, quantity, price
 
-
                 drawn_lines: list[tuple[str, int, Decimal]] = []
-
 
                 @settings(derandomize=True, max_examples=5, database=None)
                 @given(order_lines())
                 def record_lines(line: tuple[str, int, Decimal]) -> None:
                     drawn_lines.append(line)
 
-
                 record_lines()
                 print(*drawn_lines, sep="\n")
-            '''
+            """
         ),
         md(
             """
@@ -2297,9 +2346,19 @@ def _hypothesis_cells() -> list[NotebookNode]:
             if importlib.util.find_spec("hypothesis") is not None:
                 properties = project(
                     "properties",
-                    {**shop_files("billing"), "tests/conftest.py": HYPOTHESIS_CONFTEST, "tests/test_split_bill_properties.py": SPLIT_BILL_PROPERTIES},
+                    {
+                        **shop_files("billing"),
+                        "tests/conftest.py": HYPOTHESIS_CONFTEST,
+                        "tests/test_split_bill_properties.py": SPLIT_BILL_PROPERTIES,
+                    },
                 )
-                run_pytest(properties, "-q", "--no-header", "--hypothesis-show-statistics", keep=r"passed|test_|examples|Stopped")
+                run_pytest(
+                    properties,
+                    "-q",
+                    "--no-header",
+                    "--hypothesis-show-statistics",
+                    keep=r"passed|test_|examples|Stopped",
+                )
             '''
         ),
         md(
@@ -2323,7 +2382,13 @@ def _hypothesis_cells() -> list[NotebookNode]:
             """
             if importlib.util.find_spec("hypothesis") is not None:
                 write_files(properties, {"shop/billing.py": FLOAT_SPLIT_BILL})
-                run_pytest(properties, "-q", "--no-header", "--tb=short", keep=r"Falsifying|total_amount=|people_count=|^E  |passed|failed")
+                run_pytest(
+                    properties,
+                    "-q",
+                    "--no-header",
+                    "--tb=short",
+                    keep=r"Falsifying|total_amount=|people_count=|^E  |passed|failed",
+                )
             '''
         ),
         md(
@@ -2336,13 +2401,12 @@ def _hypothesis_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             if importlib.util.find_spec("hypothesis") is not None:
                 quiet = settings(derandomize=True, database=None)
                 print(f"{find(st.lists(st.integers()), lambda values: sum(values) > 100, settings=quiet)=}")
                 print(f"{find(st.text(), lambda text: len(text.encode()) > len(text), settings=quiet)=}")
                 print(f"{find(st.integers(), lambda number: number * number > 1_000, settings=quiet)=}")
-
 
                 @settings(derandomize=True, database=None, max_examples=50)
                 @example(total_amount="0.01", people_count=3)  # always tried first
@@ -2352,10 +2416,9 @@ def _hypothesis_cells() -> list[NotebookNode]:
                     base, leftover = divmod(total_in_paise, people_count)
                     assert base >= 0 and 0 <= leftover < people_count
 
-
                 property_shares_are_never_negative()
                 print("property held for the pinned example and 50 generated ones")
-            '''
+            """
         ),
     ]
 
@@ -2386,12 +2449,19 @@ def _debugging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            def pdb_session(*command: str, commands: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
+            def pdb_session(
+                *command: str, commands: list[str], cwd: Path, env: dict[str, str] | None = None
+            ) -> None:
                 """Run command (which starts pdb) with commands on stdin; print the transcript."""
                 completed = subprocess.run(
                     [sys.executable if command[0] == "python" else str(VENV_BIN / command[0]), *command[1:]],
-                    cwd=cwd, env={**(env or tool_env()), "PYTHONUNBUFFERED": "1"}, input="\n".join(commands) + "\n",
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+                    cwd=cwd,
+                    env={**(env or tool_env()), "PYTHONUNBUFFERED": "1"},
+                    input="\n".join(commands) + "\n",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=120,
                 )
                 pieces = tidy(completed.stdout).split("(Pdb) ")
                 transcript = [pieces[0].rstrip()] if pieces[0].strip() else []
@@ -2403,8 +2473,10 @@ def _debugging_cells() -> list[NotebookNode]:
                 print(textwrap.indent("\n".join(transcript), "  ", lambda line: True))
 
 
-            debug_demo = write_files(fresh_dir("debug_demo"), {
-                "cart.py": """
+            debug_demo = write_files(
+                fresh_dir("debug_demo"),
+                {
+                    "cart.py": """
                     def line_total(price, quantity):
                         subtotal = price * quantity
                         breakpoint()
@@ -2420,7 +2492,8 @@ def _debugging_cells() -> list[NotebookNode]:
 
                     print(cart_total([(240, 2), (12, "3")]))
                 """,
-            })
+                },
+            )
             print("cart.py written; line 14 passes one quantity as a string")
             '''
         ),
@@ -2434,9 +2507,24 @@ def _debugging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
-            pdb_session("python", "cart.py", cwd=debug_demo, commands=["p price, quantity", "w", "ll", "n", "p subtotal", "c", "p price, quantity", "p subtotal", "c"])
-            '''
+            r"""
+            pdb_session(
+                "python",
+                "cart.py",
+                cwd=debug_demo,
+                commands=[
+                    "p price, quantity",
+                    "w",
+                    "ll",
+                    "n",
+                    "p subtotal",
+                    "c",
+                    "p price, quantity",
+                    "p subtotal",
+                    "c",
+                ],
+            )
+            """
         ),
         md(
             """
@@ -2448,8 +2536,10 @@ def _debugging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(debug_demo, {
-                "show_locals.py": """
+            write_files(
+                debug_demo,
+                {
+                    "show_locals.py": """
                     import sys
 
 
@@ -2457,9 +2547,16 @@ def _debugging_cells() -> list[NotebookNode]:
                         caller = sys._getframe(1)
                         print(f"breakpoint in {caller.f_code.co_name}: {caller.f_locals}")
                 """,
-            })
+                },
+            )
             shell("python", "cart.py", cwd=debug_demo, env=tool_env(PYTHONBREAKPOINT="0"), keep=r"^\d|Error")
-            shell("python", "cart.py", cwd=debug_demo, env=tool_env(PYTHONBREAKPOINT="show_locals.report", PYTHONPATH=str(debug_demo)), keep=r"breakpoint in|^\d|Error")
+            shell(
+                "python",
+                "cart.py",
+                cwd=debug_demo,
+                env=tool_env(PYTHONBREAKPOINT="show_locals.report", PYTHONPATH=str(debug_demo)),
+                keep=r"breakpoint in|^\d|Error",
+            )
             '''
         ),
         md(
@@ -2473,11 +2570,12 @@ def _debugging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             print(f"{sys.breakpointhook is sys.__breakpointhook__=}, {sys.__breakpointhook__!r}")
             calls: list[str] = []
             sys.breakpointhook = lambda *args, **kwargs: calls.append(sys._getframe(1).f_code.co_name)
             try:
+
                 def checkout() -> None:
                     breakpoint()
 
@@ -2485,7 +2583,7 @@ def _debugging_cells() -> list[NotebookNode]:
             finally:
                 sys.breakpointhook = sys.__breakpointhook__
             print(f"{calls=}")
-            '''
+            """
         ),
         md(
             """
@@ -2513,8 +2611,10 @@ def _debugging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(debug_demo, {
-                "invoice.py": """
+            write_files(
+                debug_demo,
+                {
+                    "invoice.py": """
                     def gst(amount_in_paise):
                         return amount_in_paise * 18 // 100
 
@@ -2528,10 +2628,29 @@ def _debugging_cells() -> list[NotebookNode]:
 
                     print(invoice_total([("TEA-500", 24000), ("MUG-02", 19900), ("JAR-750", 35000)]))
                 """,
-            })
+                },
+            )
             pdb_session(
-                "python", "-m", "pdb", "invoice.py", cwd=debug_demo,
-                commands=["b 8, sku == 'MUG-02'", "c", "display total", "a", "s", "ll", "r", "u", "p sku, amount", "d", "n", "cl 1", "c"],
+                "python",
+                "-m",
+                "pdb",
+                "invoice.py",
+                cwd=debug_demo,
+                commands=[
+                    "b 8, sku == 'MUG-02'",
+                    "c",
+                    "display total",
+                    "a",
+                    "s",
+                    "ll",
+                    "r",
+                    "u",
+                    "p sku, amount",
+                    "d",
+                    "n",
+                    "cl 1",
+                    "c",
+                ],
             )
             '''
         ),
@@ -2553,8 +2672,10 @@ def _debugging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(debug_demo, {
-                "average.py": """
+            write_files(
+                debug_demo,
+                {
+                    "average.py": """
                     def average_order_value(totals):
                         return sum(totals) / len(totals)
 
@@ -2563,8 +2684,16 @@ def _debugging_cells() -> list[NotebookNode]:
                     for day, totals in daily_totals.items():
                         print(day, average_order_value(totals))
                 """,
-            })
-            pdb_session("python", "-m", "pdb", "average.py", cwd=debug_demo, commands=["c", "p totals", "u", "p day", "q"])
+                },
+            )
+            pdb_session(
+                "python",
+                "-m",
+                "pdb",
+                "average.py",
+                cwd=debug_demo,
+                commands=["c", "p totals", "u", "p day", "q"],
+            )
             '''
         ),
         md(
@@ -2576,8 +2705,10 @@ def _debugging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(debug_demo, {
-                "report_job.py": """
+            write_files(
+                debug_demo,
+                {
+                    "report_job.py": """
                     import pdb
                     import sys
 
@@ -2592,7 +2723,8 @@ def _debugging_cells() -> list[NotebookNode]:
                         sys.last_exc = error  # what the interactive REPL does for you
                         pdb.pm()
                 """,
-            })
+                },
+            )
             pdb_session("python", "report_job.py", cwd=debug_demo, commands=["p text", "w", "q"])
             '''
         ),
@@ -2606,15 +2738,25 @@ def _debugging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
-            ipython_input = "def average(values):\n    return sum(values) / len(values)\n\naverage([])\n%debug\np values\nq\nexit\n"
+            r"""
+            ipython_input = (
+                "def average(values):\n    return sum(values) / len(values)\n\n"
+                "average([])\n%debug\np values\nq\nexit\n"
+            )
             print(f"piped into ipython: {ipython_input.splitlines()}")
-            exit_code, ipython_output = run_tool("ipython", "--simple-prompt", "--no-banner", "--colors=NoColor", input_text=ipython_input, cwd=debug_demo)
+            exit_code, ipython_output = run_tool(
+                "ipython",
+                "--simple-prompt",
+                "--no-banner",
+                "--colors=NoColor",
+                input_text=ipython_input,
+                cwd=debug_demo,
+            )
             for line in ipython_output.splitlines():
                 if re.search(r"ZeroDivisionError|ipdb>|---->|^> ", line):
                     print(f"  {line}")
             print("(after each ipdb> prompt comes the output of the next piped command: `p values` printed [])")
-            '''
+            """
         ),
         md(
             """
@@ -2641,7 +2783,16 @@ def _debugging_cells() -> list[NotebookNode]:
                     """,
                 },
             )
-            pdb_session("pytest", "-q", "--no-header", "-p", "no:cacheprovider", "--pdb", cwd=pdb_test_project, commands=["p shares", "p sum(shares)", "c"])
+            pdb_session(
+                "pytest",
+                "-q",
+                "--no-header",
+                "-p",
+                "no:cacheprovider",
+                "--pdb",
+                cwd=pdb_test_project,
+                commands=["p shares", "p sum(shares)", "c"],
+            )
             '''
         ),
         md(
@@ -2669,13 +2820,15 @@ def _debugging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             for module_name in ("debugpy",):
                 if importlib.util.find_spec(module_name) is None:
                     print(f"{module_name}: not installed")
                 else:
-                    print(f"{module_name}: {importlib.metadata.version(module_name)} (installed with ipykernel)")
-            '''
+                    print(
+                        f"{module_name}: {importlib.metadata.version(module_name)} (installed with ipykernel)"
+                    )
+            """
         ),
         md(
             """
@@ -2689,16 +2842,30 @@ def _debugging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
-            write_files(debug_demo, {"crash.py": "import ctypes\n\n\ndef read_config():\n    return ctypes.string_at(0)\n\n\nread_config()\n"})
+            r"""
+            write_files(
+                debug_demo,
+                {
+                    "crash.py": (
+                        "import ctypes\n\n\ndef read_config():\n"
+                        "    return ctypes.string_at(0)\n\n\nread_config()\n"
+                    )
+                },
+            )
             completed = subprocess.run(
                 [sys.executable, "-X", "faulthandler", "crash.py"],
-                cwd=debug_demo, capture_output=True, text=True, env=tool_env(),
+                cwd=debug_demo,
+                capture_output=True,
+                text=True,
+                env=tool_env(),
             )
             python_part = tidy(completed.stderr).split("Current thread's C stack")[0]
             print(re.sub(r"0x[0-9a-f]+", "0x...", python_part).rstrip())
-            print(f"exit code: {completed.returncode} (negative = killed by signal {-completed.returncode}, SIGSEGV)")
-            '''
+            print(
+                f"exit code: {completed.returncode} "
+                f"(negative = killed by signal {-completed.returncode}, SIGSEGV)"
+            )
+            """
         ),
         md(
             """
@@ -2709,8 +2876,10 @@ def _debugging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(debug_demo, {
-                "hang.py": """
+            write_files(
+                debug_demo,
+                {
+                    "hang.py": """
                     import faulthandler
                     import time
 
@@ -2723,8 +2892,16 @@ def _debugging_cells() -> list[NotebookNode]:
                     faulthandler.dump_traceback_later(1, exit=True)
                     wait_for_payment_lock()
                 """,
-            })
-            completed = subprocess.run([sys.executable, "hang.py"], cwd=debug_demo, capture_output=True, text=True, env=tool_env(), timeout=30)
+                },
+            )
+            completed = subprocess.run(
+                [sys.executable, "hang.py"],
+                cwd=debug_demo,
+                capture_output=True,
+                text=True,
+                env=tool_env(),
+                timeout=30,
+            )
             print(re.sub(r"0x[0-9a-f]+", "0x...", tidy(completed.stderr)).rstrip())
             print(f"exit code: {completed.returncode}")
             '''
@@ -2810,16 +2987,33 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             record = api_logger.makeRecord(
-                "shop.orders.api", logging.WARNING, "orders.py", 42, "order %s is %d days late", (7, 3), None,
-                func="check_delays", extra={"order_id": 7},
+                "shop.orders.api",
+                logging.WARNING,
+                "orders.py",
+                42,
+                "order %s is %d days late",
+                (7, 3),
+                None,
+                func="check_delays",
+                extra={"order_id": 7},
             )
-            stable_keys = ["name", "levelname", "levelno", "pathname", "lineno", "funcName", "msg", "args", "order_id"]
+            stable_keys = [
+                "name",
+                "levelname",
+                "levelno",
+                "pathname",
+                "lineno",
+                "funcName",
+                "msg",
+                "args",
+                "order_id",
+            ]
             print({key: vars(record)[key] for key in stable_keys})
             print(f"{record.getMessage()=}")
             print(f"{sorted(set(vars(record)) - set(stable_keys))=}")
-            '''
+            """
         ),
         md(
             """
@@ -2839,23 +3033,25 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             shop_logger = logging.getLogger("shop")
             console = logging.StreamHandler(sys.stdout)
             console.setFormatter(logging.Formatter("%(levelname)-8s %(name)s: %(message)s"))
-            console.setLevel(logging.INFO)              # handler threshold
+            console.setLevel(logging.INFO)  # handler threshold
             shop_logger.addHandler(console)
-            shop_logger.setLevel(logging.DEBUG)          # logger threshold
+            shop_logger.setLevel(logging.DEBUG)  # logger threshold
             shop_logger.propagate = False
 
             orders_logger = logging.getLogger("shop.orders")
-            print(f"{orders_logger.level=} (NOTSET), {logging.getLevelName(orders_logger.getEffectiveLevel())=}")
-            orders_logger.debug("cart recalculated")     # passes the logger, blocked by the handler
+            print(
+                f"{orders_logger.level=} (NOTSET), {logging.getLevelName(orders_logger.getEffectiveLevel())=}"
+            )
+            orders_logger.debug("cart recalculated")  # passes the logger, blocked by the handler
             orders_logger.info("order %s placed", 7)
             orders_logger.warning("order %s has no delivery slot", 7)
             print(f"{orders_logger.isEnabledFor(logging.DEBUG)=}")
-            '''
+            """
         ),
         *predict_cells(
             """
@@ -2901,7 +3097,7 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             stream_target = io.StringIO()
             to_stderr_like = logging.StreamHandler(stream_target)
@@ -2912,7 +3108,7 @@ def _logging_cells() -> list[NotebookNode]:
             payments_logger.error("card declined for order %s", 7)
             print(f"{logging.StreamHandler().stream is sys.stderr=}")
             print(f"captured: {stream_target.getvalue()!r}")
-            '''
+            """
         ),
         md(
             """
@@ -2923,10 +3119,12 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             log_folder = fresh_dir("rotating_logs")
-            rotating = logging.handlers.RotatingFileHandler(log_folder / "shop.log", maxBytes=120, backupCount=2, encoding="utf-8")
+            rotating = logging.handlers.RotatingFileHandler(
+                log_folder / "shop.log", maxBytes=120, backupCount=2, encoding="utf-8"
+            )
             rotating.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
             audit_logger = logging.getLogger("shop.audit")
             audit_logger.addHandler(rotating)
@@ -2937,7 +3135,7 @@ def _logging_cells() -> list[NotebookNode]:
             reset_loggers("shop.audit")
             for path in sorted(log_folder.iterdir()):
                 print(f"{path.name:<11} {path.read_text().splitlines()}")
-            '''
+            """
         ),
         md(
             """
@@ -2950,7 +3148,7 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             log_queue: queue.Queue[logging.LogRecord] = queue.Queue()
             slow_console = logging.StreamHandler(sys.stdout)
@@ -2963,11 +3161,11 @@ def _logging_cells() -> list[NotebookNode]:
             orders_logger.propagate = False
 
             listener.start()
-            orders_logger.info("order 7 placed")       # returns immediately; the listener writes
+            orders_logger.info("order 7 placed")  # returns immediately; the listener writes
             orders_logger.warning("order 8 payment pending")
-            listener.stop()                            # flushes the queue and joins the thread
+            listener.stop()  # flushes the queue and joins the thread
             print(f"{log_queue.empty()=}")
-            '''
+            """
         ),
         md(
             """
@@ -2989,10 +3187,13 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             timestamped = logging.StreamHandler(sys.stdout)
-            utc_formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s %(funcName)s:%(lineno)d %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ")
+            utc_formatter = logging.Formatter(
+                "%(asctime)s %(levelname)-7s %(name)s %(funcName)s:%(lineno)d %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%SZ",
+            )
             utc_formatter.converter = time.gmtime
             timestamped.setFormatter(utc_formatter)
             timestamped.addFilter(FrozenClock())
@@ -3010,7 +3211,7 @@ def _logging_cells() -> list[NotebookNode]:
 
 
             ship_order(7)
-            '''
+            """
         ),
         md(
             """
@@ -3023,7 +3224,7 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             import contextvars
 
             request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
@@ -3054,7 +3255,7 @@ def _logging_cells() -> list[NotebookNode]:
             api_logger.info("POST /orders 201")
             request_id.reset(token)
             api_logger.info("GET /products 200")
-            '''
+            """
         ),
         md(
             """
@@ -3067,7 +3268,7 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             for logger_name in ("shop", "shop.orders"):
                 handler = logging.StreamHandler(sys.stdout)
@@ -3080,7 +3281,7 @@ def _logging_cells() -> list[NotebookNode]:
             logging.getLogger("shop.orders").propagate = False
             logging.getLogger("shop.orders").info("order 8 placed (printed once)")
             logging.getLogger("shop.payments").info("payment captured (no own handler: the parent prints it)")
-            '''
+            """
         ),
         md(
             """
@@ -3093,7 +3294,7 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             class UtcFormatter(logging.Formatter):
                 converter = time.gmtime  # timestamps in UTC, whatever the server's time zone
 
@@ -3103,7 +3304,11 @@ def _logging_cells() -> list[NotebookNode]:
                 "version": 1,
                 "disable_existing_loggers": False,
                 "formatters": {
-                    "console": {"()": UtcFormatter, "fmt": "%(asctime)s %(levelname)-7s %(name)s: %(message)s", "datefmt": "%H:%M:%S"},
+                    "console": {
+                        "()": UtcFormatter,
+                        "fmt": "%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+                        "datefmt": "%H:%M:%S",
+                    },
                 },
                 "filters": {
                     "frozen_clock": {"()": FrozenClock},  # demo only: stable timestamps
@@ -3128,8 +3333,11 @@ def _logging_cells() -> list[NotebookNode]:
             logging.getLogger("shop.payments").info("payment authorised (below WARNING: dropped)")
             logging.getLogger("shop.payments").warning("payment retry 2/3")
             console_handler = logging.getHandlerByName("console")  # New in 3.12
-            print(f"{type(console_handler).__name__}, {console_handler.name=}, {logging.getLevelName(console_handler.level)=}")
-            '''
+            print(
+                f"{type(console_handler).__name__}, {console_handler.name=}, "
+                f"{logging.getLevelName(console_handler.level)=}"
+            )
+            """
         ),
         md(
             """
@@ -3142,8 +3350,10 @@ def _logging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(fresh_dir("disable_existing"), {
-                "app.py": """
+            write_files(
+                fresh_dir("disable_existing"),
+                {
+                    "app.py": """
                     import logging
                     import logging.config
 
@@ -3153,13 +3363,16 @@ def _logging_cells() -> list[NotebookNode]:
                         logging.config.dictConfig({
                             "version": 1,
                             "disable_existing_loggers": disable,
-                            "handlers": {"out": {"class": "logging.StreamHandler", "stream": "ext://sys.stdout"}},
+                            "handlers": {
+                                "out": {"class": "logging.StreamHandler", "stream": "ext://sys.stdout"}
+                            },
                             "root": {"handlers": ["out"], "level": "INFO"},
                         })
                         print(f"disable_existing_loggers={disable}: logging...")
                         inventory_logger.warning("stock for TEA-500 is low")
                 """,
-            })
+                },
+            )
             shell("python", "app.py", cwd=UNIT43_DIR / "disable_existing")
             '''
         ),
@@ -3179,8 +3392,10 @@ def _logging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(fresh_dir("library_rules"), {
-                "rupee_tools/__init__.py": """
+            write_files(
+                fresh_dir("library_rules"),
+                {
+                    "rupee_tools/__init__.py": """
                     import logging
 
                     logger = logging.getLogger(__name__)
@@ -3191,7 +3406,7 @@ def _logging_cells() -> list[NotebookNode]:
                             logger.warning("ignoring thousands separators in %r", text)
                         return int(text.replace(",", ""))
                 """,
-                "rupee_tools_quiet/__init__.py": """
+                    "rupee_tools_quiet/__init__.py": """
                     import logging
 
                     logger = logging.getLogger(__name__)
@@ -3203,7 +3418,7 @@ def _logging_cells() -> list[NotebookNode]:
                             logger.warning("ignoring thousands separators in %r", text)
                         return int(text.replace(",", ""))
                 """,
-                "app.py": """
+                    "app.py": """
                     import logging
                     import sys
 
@@ -3217,7 +3432,8 @@ def _logging_cells() -> list[NotebookNode]:
                     print("app configured logging:")
                     rupee_tools_quiet.parse_amount("2,400")  # now reaches the app's handler
                 """,
-            })
+                },
+            )
             shell("python", "app.py", cwd=UNIT43_DIR / "library_rules", merged=True)
             '''
         ),
@@ -3233,12 +3449,16 @@ def _logging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(fresh_dir("exception_logging"), {
-                "worker.py": """
+            write_files(
+                fresh_dir("exception_logging"),
+                {
+                    "worker.py": """
                     import logging
                     import sys
 
-                    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+                    logging.basicConfig(
+                        stream=sys.stdout, level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+                    )
                     logger = logging.getLogger("shop.worker")
 
 
@@ -3253,7 +3473,8 @@ def _logging_cells() -> list[NotebookNode]:
                             logger.exception("charging order %s failed", order_id)
                             break
                 """,
-            })
+                },
+            )
             shell("python", "worker.py", cwd=UNIT43_DIR / "exception_logging")
             '''
         ),
@@ -3304,7 +3525,7 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             context_handler = logging.StreamHandler(sys.stdout)
             context_handler.setFormatter(logging.Formatter("order=%(order_id)s %(levelname)s %(message)s"))
@@ -3321,7 +3542,7 @@ def _logging_cells() -> list[NotebookNode]:
                 context_handler.setFormatter(logging.Formatter("order=%(order_id)s step=%(step)s %(message)s"))
                 merged = logging.LoggerAdapter(orders_logger, {"order_id": 8}, merge_extra=True)
                 merged.info("packed", extra={"step": "warehouse"})
-            '''
+            """
         ),
         md(
             """
@@ -3398,8 +3619,10 @@ def _quality_gate_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            lint_demo = write_files(fresh_dir("lint_demo"), {
-                "pyproject.toml": """
+            lint_demo = write_files(
+                fresh_dir("lint_demo"),
+                {
+                    "pyproject.toml": """
                     [tool.ruff]
                     line-length = 100
                     target-version = "py315"
@@ -3407,7 +3630,7 @@ def _quality_gate_cells() -> list[NotebookNode]:
                     [tool.ruff.lint]
                     select = ["E", "W", "F", "I", "UP", "B", "S", "G"]
                 """,
-                "orders.py": """
+                    "orders.py": """
                     import sys, os
                     import logging
                     import subprocess
@@ -3428,7 +3651,8 @@ def _quality_gate_cells() -> list[NotebookNode]:
                         except:
                             pass
                 """,
-            })
+                },
+            )
             shell("ruff", "check", "--output-format=concise", ".", cwd=lint_demo)
             '''
         ),
@@ -3441,10 +3665,10 @@ def _quality_gate_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             shell("ruff", "rule", "B006", cwd=lint_demo, max_lines=12)
             shell("ruff", "check", "--fix", "--statistics", ".", cwd=lint_demo)
-            '''
+            """
         ),
         md(
             """
@@ -3453,11 +3677,19 @@ def _quality_gate_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
-            write_files(lint_demo, {"cart.py": "def total( prices ):\n    return sum( [ p*1.18 for p in prices ] )\nTAX_RATES={'GST':18,'cess':1}\n"})
+            r"""
+            write_files(
+                lint_demo,
+                {
+                    "cart.py": (
+                        "def total( prices ):\n    return sum( [ p*1.18 for p in prices ] )\n"
+                        "TAX_RATES={'GST':18,'cess':1}\n"
+                    )
+                },
+            )
             shell("ruff", "format", "--diff", "cart.py", cwd=lint_demo)
             shell("ruff", "format", "--check", ".", cwd=lint_demo)
-            '''
+            """
         ),
         md(
             """
@@ -3485,8 +3717,10 @@ def _quality_gate_cells() -> list[NotebookNode]:
         code(
             r'''
             HOOK_ENV = tool_env(PATH=f"{VENV_BIN}{os.pathsep}{os.environ['PATH']}")
-            hooks_repo = write_files(fresh_dir("precommit_demo"), {
-                ".pre-commit-config.yaml": """
+            hooks_repo = write_files(
+                fresh_dir("precommit_demo"),
+                {
+                    ".pre-commit-config.yaml": """
                     repos:
                       - repo: local
                         hooks:
@@ -3501,9 +3735,10 @@ def _quality_gate_cells() -> list[NotebookNode]:
                             language: system
                             types: [python]
                 """,
-                "pyproject.toml": '[tool.ruff.lint]\nselect = ["E", "F", "I", "UP", "B"]\n',
-                "shop.py": "import os\nimport sys\ndef discount( total ):\n  return total==None\n",
-            })
+                    "pyproject.toml": '[tool.ruff.lint]\nselect = ["E", "F", "I", "UP", "B"]\n',
+                    "shop.py": "import os\nimport sys\ndef discount( total ):\n  return total==None\n",
+                },
+            )
             for command in (("git", "init", "-q", "-b", "main"), ("pre-commit", "install")):
                 shell(*command, cwd=hooks_repo, env=HOOK_ENV)
             '''
@@ -3517,20 +3752,22 @@ def _quality_gate_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             shell("git", "add", "-A", cwd=hooks_repo, env=HOOK_ENV)
             shell("git", "commit", "-q", "-m", "Add discount rule", cwd=hooks_repo, env=HOOK_ENV)
             show_file(hooks_repo / "shop.py")
-            '''
+            """
         ),
         md("After fixing the comparison by hand, the hooks pass and the commit goes through:"),
         code(
-            r'''
-            (hooks_repo / "shop.py").write_text((hooks_repo / "shop.py").read_text().replace("total == None", "total is None"))
+            r"""
+            (hooks_repo / "shop.py").write_text(
+                (hooks_repo / "shop.py").read_text().replace("total == None", "total is None")
+            )
             shell("git", "add", "-A", cwd=hooks_repo, env=HOOK_ENV)
             shell("git", "commit", "-m", "Add discount rule", cwd=hooks_repo, env=HOOK_ENV)
             shell("pre-commit", "run", "--all-files", cwd=hooks_repo, env=HOOK_ENV)
-            '''
+            """
         ),
         md(
             """
@@ -3594,13 +3831,22 @@ def _quality_gate_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             print(f"act installed: {shutil.which('act') is not None}")
             if importlib.util.find_spec("pytest_cov") is not None:
                 local_ci = [
                     ("ruff", "check", "."),
                     ("ruff", "format", "--check", "."),
-                    ("pytest", "-q", "--no-header", "-p", "no:cacheprovider", "--cov=shop", "--cov-branch", "--cov-fail-under=80"),
+                    (
+                        "pytest",
+                        "-q",
+                        "--no-header",
+                        "-p",
+                        "no:cacheprovider",
+                        "--cov=shop",
+                        "--cov-branch",
+                        "--cov-fail-under=80",
+                    ),
                 ]
                 for step in local_ci:
                     exit_code, output = run_tool(*step, cwd=coverage_demo)
@@ -3608,7 +3854,7 @@ def _quality_gate_cells() -> list[NotebookNode]:
                     print(f"{status:<14} {shlex.join(step)}")
                     if exit_code:
                         print(textwrap.indent("\n".join(output.splitlines()[-6:]), "    "))
-            '''
+            """
         ),
     ]
 
@@ -3910,7 +4156,9 @@ INVENTORY_MODULE = """
         def ship(self, warehouse_code: str, sku: str, quantity: int, note: str = "") -> int:
             return self._record(warehouse_code, sku, MovementType.SHIPPED, quantity, note)
 
-        def accept_return(self, warehouse_code: str, sku: str, quantity: int, note: str = "") -> int:
+        def accept_return(
+            self, warehouse_code: str, sku: str, quantity: int, note: str = ""
+        ) -> int:
             return self._record(warehouse_code, sku, MovementType.RETURNED, quantity, note)
 
         def adjust(self, warehouse_code: str, sku: str, change: int, note: str) -> int:
@@ -3942,11 +4190,18 @@ INVENTORY_MODULE = """
             return lines
 
         def _record(
-            self, warehouse_code: str, sku: str, movement_type: MovementType, quantity: int, note: str
+            self,
+            warehouse_code: str,
+            sku: str,
+            movement_type: MovementType,
+            quantity: int,
+            note: str,
         ) -> int:
             warehouse = self.repository.get_warehouse(warehouse_code)
             old_quantity = warehouse[sku]
-            movement = StockMovement(warehouse_code, sku, movement_type, quantity, self.clock(), note)
+            movement = StockMovement(
+                warehouse_code, sku, movement_type, quantity, self.clock(), note
+            )
             new_quantity = warehouse.apply(movement)
             self.repository.record_movement(movement)
             self.repository.save_warehouse(warehouse)
@@ -3992,8 +4247,21 @@ from shop.inventory import (  # noqa: E402
 from shop.money import CurrencyMismatchError, Money  # noqa: E402
 from shop.rates import ExchangeRateClient, RateLookupError  # noqa: E402
 
-LAB_NAMES = (EventBus, InMemoryInventoryRepository, InsufficientStockError, InventoryService, LowStockAlert)
-LAB_NAMES += (MovementType, Product, StockMovement, UnknownProductError, UnknownWarehouseError, Warehouse)
+LAB_NAMES = (
+    EventBus,
+    InMemoryInventoryRepository,
+    InsufficientStockError,
+    InventoryService,
+    LowStockAlert,
+)
+LAB_NAMES += (
+    MovementType,
+    Product,
+    StockMovement,
+    UnknownProductError,
+    UnknownWarehouseError,
+    Warehouse,
+)
 LAB_NAMES += (CurrencyMismatchError, Money, ExchangeRateClient, RateLookupError, split_bill)
 print(f"shop package at <scratch>/lab/shop_src: {sorted(LAB_MODULES)}")
 print(f"imported into the kernel: {', '.join(obj.__name__ for obj in LAB_NAMES)}")
@@ -4057,7 +4325,10 @@ def lab_test_source(objects: list[object]) -> str:
     try:
         return LAB_TEST_PRELUDE + "\n\n" + "\n\n".join(source_of(obj) for obj in objects)
     except (OSError, TypeError) as error:
-        return LAB_TEST_PRELUDE + f"\n\ndef test_source_unavailable():\n    raise RuntimeError({str(error)!r})\n"
+        return (
+            LAB_TEST_PRELUDE
+            + f"\n\ndef test_source_unavailable():\n    raise RuntimeError({str(error)!r})\n"
+        )
 
 
 def run_lab_tests(
@@ -4090,13 +4361,29 @@ def _cached_lab_run(
     files["tests/conftest.py"] = LAB_CONFTEST + "\n" + conftest_source
     for relative_path, text in files.items():
         (root / relative_path).parent.mkdir(parents=True, exist_ok=True)
-        (root / relative_path).write_text(textwrap.dedent(text).lstrip("\n") if relative_path.startswith("shop") else text)
-    command = [str(Path(sys.executable).parent / "pytest"), "-q", "-p", "no:cacheprovider", "--junit-xml=report.xml"]
+        (root / relative_path).write_text(
+            textwrap.dedent(text).lstrip("\n") if relative_path.startswith("shop") else text
+        )
+    command = [
+        str(Path(sys.executable).parent / "pytest"),
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "--junit-xml=report.xml",
+    ]
     if coverage_target:
         command += [f"--cov={coverage_target}", "--cov-branch", "--cov-report=json:coverage.json"]
-    environment = {key: value for key, value in os.environ.items() if not key.startswith(("PYTEST_", "PYTHONPATH", "COV"))}
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PYTEST_", "PYTHONPATH", "COV"))
+    }
     completed = subprocess.run(
-        command, cwd=root, capture_output=True, text=True, timeout=600,
+        command,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=600,
         env={**environment, "NO_COLOR": "1", "PY_COLORS": "0", "PYTHONDONTWRITEBYTECODE": "1"},
     )
     outcomes: dict[str, str] = {}
@@ -4104,7 +4391,9 @@ def _cached_lab_run(
         for case in ElementTree.parse(root / "report.xml").getroot().iter("testcase"):
             failed = case.find("failure") is not None or case.find("error") is not None
             skipped = case.find("skipped") is not None
-            outcomes[case.get("name", "?")] = "failed" if failed else "skipped" if skipped else "passed"
+            outcomes[case.get("name", "?")] = (
+                "failed" if failed else "skipped" if skipped else "passed"
+            )
     coverage_percent = None
     if coverage_target and (root / "coverage.json").exists():
         report = json.loads((root / "coverage.json").read_text())
@@ -4114,7 +4403,10 @@ def _cached_lab_run(
 
 def catches(test_source: str, mutation: tuple[str, str, str], conftest_source: str = "") -> bool:
     """True if the tests pass on the real shop package and fail on the mutant."""
-    return run_lab_tests(test_source, conftest_source).green and not run_lab_tests(test_source, conftest_source, mutation).green
+    return (
+        run_lab_tests(test_source, conftest_source).green
+        and not run_lab_tests(test_source, conftest_source, mutation).green
+    )
 
 
 print("lab runner ready: run_lab_tests(source), catches(source, mutation)")
@@ -4223,15 +4515,30 @@ def _lab_exercise_cells() -> list[NotebookNode]:
                 "half-even rounding": ("shop/money.py", "rounding=ROUND_HALF_UP", 'rounding="ROUND_HALF_EVEN"'),
                 "no currency check": ("shop/money.py", "if other._currency != self._currency:", "if False:"),
                 "floats accepted": ("shop/money.py", "if isinstance(amount, float):", "if False:"),
-                "reversed subtraction": ("shop/money.py", "Money(self._amount - other._amount", "Money(other._amount - self._amount"),
+                "reversed subtraction": (
+                    "shop/money.py",
+                    "Money(self._amount - other._amount",
+                    "Money(other._amount - self._amount",
+                ),
             }
             money_source = lab_test_source(MONEY_TESTS)
             run_checks(
                 [
                     ("tests pass on the real Money", lambda: run_lab_tests(money_source).green, True),
-                    ("test_money_rounding: 4+ cases with ids", lambda: parametrized_with_ids(MONEY_TESTS[0]), True),
-                    ("test_money_arithmetic: 4+ cases with ids", lambda: parametrized_with_ids(MONEY_TESTS[1]), True),
-                    *[(f"catches: {name}", lambda mutation=mutation: catches(money_source, mutation), True) for name, mutation in MONEY_MUTANTS.items()],
+                    (
+                        "test_money_rounding: 4+ cases with ids",
+                        lambda: parametrized_with_ids(MONEY_TESTS[0]),
+                        True,
+                    ),
+                    (
+                        "test_money_arithmetic: 4+ cases with ids",
+                        lambda: parametrized_with_ids(MONEY_TESTS[1]),
+                        True,
+                    ),
+                    *[
+                        (f"catches: {name}", lambda mutation=mutation: catches(money_source, mutation), True)
+                        for name, mutation in MONEY_MUTANTS.items()
+                    ],
                 ]
             )
             '''
@@ -4285,7 +4592,7 @@ def _lab_exercise_cells() -> list[NotebookNode]:
         md("Check exercise 2 (each line is one hidden test that uses your fixtures):"),
         code(
             r'''
-            FIXTURE_CHECKS = """
+            FIXTURE_CHECKS = textwrap.dedent("""
             SEEN_CATALOGUES = []
 
 
@@ -4293,7 +4600,8 @@ def _lab_exercise_cells() -> list[NotebookNode]:
                 assert sorted(catalogue) == ["JAR-750", "MUG-02", "TEA-500"]
                 tea = catalogue["TEA-500"]
                 assert (tea.unit_price, tea.reorder_level) == (Money("240"), 10)
-                assert (catalogue["MUG-02"].unit_price, catalogue["JAR-750"].reorder_level) == (Money("199"), 3)
+                mug, jar = catalogue["MUG-02"], catalogue["JAR-750"]
+                assert (mug.unit_price, jar.reorder_level) == (Money("199"), 3)
                 SEEN_CATALOGUES.append(catalogue)
 
 
@@ -4302,7 +4610,8 @@ def _lab_exercise_cells() -> list[NotebookNode]:
 
 
             def test_repository_warehouses(repository):
-                assert [(w.code, w.city) for w in repository.list_warehouses()] == [("BLR1", "Bengaluru"), ("PNQ1", "Pune")]
+                places = [(w.code, w.city) for w in repository.list_warehouses()]
+                assert places == [("BLR1", "Bengaluru"), ("PNQ1", "Pune")]
                 assert all(len(w) == 3 and not w for w in repository.list_warehouses())
 
 
@@ -4341,15 +4650,23 @@ def _lab_exercise_cells() -> list[NotebookNode]:
                 first.ship("PNQ1", "MUG-02", 2)
                 assert first.events is not second.events
                 assert [(alert.sku, alert.quantity) for alert in alerts] == [("MUG-02", 4)]
-            """
+            """)  # dedent: the solutions file runs this cell inside a function
+
+
             def fixture_outcome(test_name: str) -> str | None:
                 """Outcome of one hidden test run against the learner's fixtures."""
-                return run_lab_tests(LAB_TEST_PRELUDE + FIXTURE_CHECKS, lab_test_source(INVENTORY_FIXTURES)).outcomes.get(test_name)
+                return run_lab_tests(
+                    LAB_TEST_PRELUDE + FIXTURE_CHECKS, lab_test_source(INVENTORY_FIXTURES)
+                ).outcomes.get(test_name)
 
 
             run_checks(
                 [
-                    (name.removeprefix("test_").replace("_", " "), lambda name=name: fixture_outcome(name), "passed")
+                    (
+                        name.removeprefix("test_").replace("_", " "),
+                        lambda name=name: fixture_outcome(name),
+                        "passed",
+                    )
                     for name in re.findall(r"^def (test_\w+)", FIXTURE_CHECKS, re.MULTILINE)
                 ]
             )
@@ -4377,7 +4694,7 @@ def _lab_exercise_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             def test_rate_is_parsed_exactly() -> None:
                 raise NotImplementedError
 
@@ -4400,15 +4717,19 @@ def _lab_exercise_cells() -> list[NotebookNode]:
                 test_http_error_is_rejected_before_reading_the_body,
                 test_same_currency_conversion_skips_the_service,
             ]
-            '''
+            """
         ),
         md("Check exercise 3:"),
         code(
-            r'''
+            r"""
             RATE_MUTANTS = {
-                "missing timeout": ("shop/rates.py", ', timeout=5.0\n', "\n"),
+                "missing timeout": ("shop/rates.py", ", timeout=5.0\n", "\n"),
                 "wrong query parameter": ("shop/rates.py", '"symbols": quote', '"symbol": quote'),
-                "Decimal(float)": ("shop/rates.py", 'Decimal(str(response.json()["rates"][quote]))', 'Decimal(response.json()["rates"][quote])'),
+                "Decimal(float)": (
+                    "shop/rates.py",
+                    'Decimal(str(response.json()["rates"][quote]))',
+                    'Decimal(response.json()["rates"][quote])',
+                ),
                 "no status check": ("shop/rates.py", "if response.status_code != 200:", "if False:"),
                 "service called for same currency": ("shop/rates.py", "if base == quote:", "if False:"),
             }
@@ -4416,11 +4737,18 @@ def _lab_exercise_cells() -> list[NotebookNode]:
             run_checks(
                 [
                     ("tests pass on the real client", lambda: run_lab_tests(rate_source).green, True),
-                    ("tests use unittest.mock", lambda: bool(re.search(r"\bmock\.|Mock\(|patch", "".join(map(source_of, RATE_TESTS)))), True),
-                    *[(f"catches: {name}", lambda mutation=mutation: catches(rate_source, mutation), True) for name, mutation in RATE_MUTANTS.items()],
+                    (
+                        "tests use unittest.mock",
+                        lambda: bool(re.search(r"\bmock\.|Mock\(|patch", "".join(map(source_of, RATE_TESTS)))),
+                        True,
+                    ),
+                    *[
+                        (f"catches: {name}", lambda mutation=mutation: catches(rate_source, mutation), True)
+                        for name, mutation in RATE_MUTANTS.items()
+                    ],
                 ]
             )
-            '''
+            """
         ),
         md(
             """
@@ -4444,7 +4772,7 @@ def _lab_exercise_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             def test_share_count() -> None:
                 raise NotImplementedError
 
@@ -4472,16 +4800,24 @@ def _lab_exercise_cells() -> list[NotebookNode]:
                 test_shares_never_increase,
                 test_invalid_people_count_is_rejected,
             ]
-            '''
+            """
         ),
         md("Check exercise 4:"),
         code(
-            r'''
+            r"""
             BILL_MUTANTS = {
-                "leftover to the last people": ("shop/billing.py", "(1 if index < leftover_paise else 0)", "(1 if index >= people_count - leftover_paise else 0)"),
+                "leftover to the last people": (
+                    "shop/billing.py",
+                    "(1 if index < leftover_paise else 0)",
+                    "(1 if index >= people_count - leftover_paise else 0)",
+                ),
                 "leftover dropped": ("shop/billing.py", "(1 if index < leftover_paise else 0)", "0"),
                 "zero people accepted": ("shop/billing.py", "if people_count < 1:", "if people_count < 0:"),
-                "float conversion": ("shop/billing.py", "int(Decimal(total_amount).quantize(PAISE, rounding=ROUND_HALF_UP) * 100)", "int(float(total_amount) * 100)"),
+                "float conversion": (
+                    "shop/billing.py",
+                    "int(Decimal(total_amount).quantize(PAISE, rounding=ROUND_HALF_UP) * 100)",
+                    "int(float(total_amount) * 100)",
+                ),
             }
             bill_source = lab_test_source(SPLIT_BILL_TESTS)
             hypothesis_ready = importlib.util.find_spec("hypothesis") is not None
@@ -4489,12 +4825,19 @@ def _lab_exercise_cells() -> list[NotebookNode]:
                 print("SKIP: hypothesis is not installed (uv add --dev hypothesis)")
             run_checks(
                 [
-                    ("every test uses @given", lambda: all(getattr(test, "is_hypothesis_test", False) for test in SPLIT_BILL_TESTS), True),
+                    (
+                        "every test uses @given",
+                        lambda: all(getattr(test, "is_hypothesis_test", False) for test in SPLIT_BILL_TESTS),
+                        True,
+                    ),
                     ("tests pass on the real split_bill", lambda: run_lab_tests(bill_source).green, True),
-                    *[(f"catches: {name}", lambda mutation=mutation: catches(bill_source, mutation), True) for name, mutation in BILL_MUTANTS.items()],
+                    *[
+                        (f"catches: {name}", lambda mutation=mutation: catches(bill_source, mutation), True)
+                        for name, mutation in BILL_MUTANTS.items()
+                    ],
                 ]
             )
-            '''
+            """
         ),
     ]
 
@@ -4556,7 +4899,7 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
                     payments.info("payment authorised")
                     payments.warning("payment retry %d/3", 2)
                     try:
-                        1 / 0
+                        _ = 1 / 0
                     except ZeroDivisionError:
                         orders.exception("charging order %s failed", 8)
                 finally:
@@ -4573,14 +4916,52 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
             UTC_ISO = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?\+00:00"
             run_checks(
                 [
-                    ("three lines (DEBUG, /health and payments INFO dropped)", lambda: len(json_log_lines()), 3),
-                    ("line 1 fields", lambda: {key: json_log_lines()[0].get(key) for key in ("level", "logger", "message")}, {"level": "INFO", "logger": "shop.orders", "message": "order 7 placed"}),
-                    ("line 1 extras", lambda: (json_log_lines()[0].get("order_id"), json_log_lines()[0].get("customer")), (7, "Asha")),
-                    ("time is UTC ISO 8601", lambda: all(re.fullmatch(UTC_ISO, str(line.get("time"))) is not None for line in json_log_lines()), True),
-                    ("no standard attributes leak", lambda: sorted(STANDARD_KEYS & set(json_log_lines()[0])), []),
+                    (
+                        "three lines (DEBUG, /health and payments INFO dropped)",
+                        lambda: len(json_log_lines()),
+                        3,
+                    ),
+                    (
+                        "line 1 fields",
+                        lambda: {key: json_log_lines()[0].get(key) for key in ("level", "logger", "message")},
+                        {"level": "INFO", "logger": "shop.orders", "message": "order 7 placed"},
+                    ),
+                    (
+                        "line 1 extras",
+                        lambda: (json_log_lines()[0].get("order_id"), json_log_lines()[0].get("customer")),
+                        (7, "Asha"),
+                    ),
+                    (
+                        "time is UTC ISO 8601",
+                        lambda: all(
+                            re.fullmatch(UTC_ISO, str(line.get("time"))) is not None
+                            for line in json_log_lines()
+                        ),
+                        True,
+                    ),
+                    (
+                        "no standard attributes leak",
+                        lambda: sorted(STANDARD_KEYS & set(json_log_lines()[0])),
+                        [],
+                    ),
                     ("no exception key without exc_info", lambda: "exception" in json_log_lines()[0], False),
-                    ("line 2 from shop.payments", lambda: (json_log_lines()[1].get("logger"), json_log_lines()[1].get("message"), json_log_lines()[1].get("level")), ("shop.payments", "payment retry 2/3", "WARNING")),
-                    ("line 3 has the traceback", lambda: (json_log_lines()[2].get("level"), "ZeroDivisionError" in str(json_log_lines()[2].get("exception"))), ("ERROR", True)),
+                    (
+                        "line 2 from shop.payments",
+                        lambda: (
+                            json_log_lines()[1].get("logger"),
+                            json_log_lines()[1].get("message"),
+                            json_log_lines()[1].get("level"),
+                        ),
+                        ("shop.payments", "payment retry 2/3", "WARNING"),
+                    ),
+                    (
+                        "line 3 has the traceback",
+                        lambda: (
+                            json_log_lines()[2].get("level"),
+                            "ZeroDivisionError" in str(json_log_lines()[2].get("exception")),
+                        ),
+                        ("ERROR", True),
+                    ),
                 ]
             )
             '''
@@ -4645,12 +5026,23 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
             def lab_pdb_session(commands: list[str]) -> list[tuple[str, str]]:
                 """Run `python -m pdb coupon.py` with commands; return (command, its output) pairs."""
                 completed = subprocess.run(
-                    [sys.executable, "-m", "pdb", "coupon.py"], cwd=COUPON_DIR, input="\n".join(commands) + "\n",
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+                    [sys.executable, "-m", "pdb", "coupon.py"],
+                    cwd=COUPON_DIR,
+                    input="\n".join(commands) + "\n",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=60,
                     env={**os.environ, "PYTHON_COLORS": "0", "NO_COLOR": "1"},
                 )
-                pieces = completed.stdout.split("(Pdb) ")
-                return [(command, pieces[index + 1] if index + 1 < len(pieces) else "") for index, command in enumerate(commands)]
+                transcript = completed.stdout.replace(str(COUPON_DIR), "<lab>").replace(
+                    sys.base_prefix, "<python>"
+                )
+                pieces = transcript.split("(Pdb) ")
+                return [
+                    (command, pieces[index + 1] if index + 1 < len(pieces) else "")
+                    for index, command in enumerate(commands)
+                ]
 
 
             def run_fixed_coupon(line_number: int, fixed_line: str) -> str:
@@ -4659,28 +5051,63 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
                 original = lines[line_number - 1]
                 lines[line_number - 1] = original[: len(original) - len(original.lstrip())] + fixed_line.strip()
                 (COUPON_DIR / "coupon_fixed.py").write_text("\n".join(lines) + "\n")
-                completed = subprocess.run([sys.executable, "coupon_fixed.py"], cwd=COUPON_DIR, capture_output=True, text=True, timeout=60)
+                completed = subprocess.run(
+                    [sys.executable, "coupon_fixed.py"],
+                    cwd=COUPON_DIR,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
                 return (completed.stdout + completed.stderr).strip()
 
 
             def printed(session: list[tuple[str, str]], name: str, value: str) -> bool:
                 """Did a p/pp/display command mentioning name print value?"""
-                return any(re.match(rf"(p|pp|print|display)\b.*\b{name}\b", command.strip()) and re.search(rf"\b{value}\b", output) for command, output in session)
+                return any(
+                    re.match(rf"(p|pp|print|display)\b.*\b{name}\b", command.strip())
+                    and re.search(rf"\b{value}\b", output)
+                    for command, output in session
+                )
 
 
             run_checks(
                 [
-                    ("stopped inside apply_coupon", lambda: any("apply_coupon()" in output for _, output in lab_pdb_session(coupon_debug_commands())), True),
-                    ("printed percent (10)", lambda: printed(lab_pdb_session(coupon_debug_commands()), "percent", "10"), True),
-                    ("printed discount (67900)", lambda: printed(lab_pdb_session(coupon_debug_commands()), "discount", "67900"), True),
-                    ("showed the call stack", lambda: any(command.strip() in {"w", "where", "bt"} and "checkout()" in output for command, output in lab_pdb_session(coupon_debug_commands())), True),
+                    (
+                        "stopped inside apply_coupon",
+                        lambda: any(
+                            "apply_coupon()" in output for _, output in lab_pdb_session(coupon_debug_commands())
+                        ),
+                        True,
+                    ),
+                    (
+                        "printed percent (10)",
+                        lambda: printed(lab_pdb_session(coupon_debug_commands()), "percent", "10"),
+                        True,
+                    ),
+                    (
+                        "printed discount (67900)",
+                        lambda: printed(lab_pdb_session(coupon_debug_commands()), "discount", "67900"),
+                        True,
+                    ),
+                    (
+                        "showed the call stack",
+                        lambda: any(
+                            command.strip() in {"w", "where", "bt"} and "checkout()" in output
+                            for command, output in lab_pdb_session(coupon_debug_commands())
+                        ),
+                        True,
+                    ),
                     ("bug line", lambda: coupon_bug_report()[0], 6),
                     ("fixed script prints 61110", lambda: run_fixed_coupon(*coupon_bug_report()), "61110"),
                 ]
             )
             try:
                 for command, output in lab_pdb_session(coupon_debug_commands()):
-                    print(f"(Pdb) {command}\n{textwrap.indent(output.rstrip(), '      ')}" if output.strip() else f"(Pdb) {command}")
+                    print(
+                        f"(Pdb) {command}\n{textwrap.indent(output.rstrip(), '      ')}"
+                        if output.strip()
+                        else f"(Pdb) {command}"
+                    )
             except Exception as error:  # the transcript must never stop Run All
                 print(f"(no session yet: {type(error).__name__})")
             '''
@@ -4700,20 +5127,31 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             def test_inventory_placeholder() -> None:
                 raise NotImplementedError
 
 
             INVENTORY_TESTS = [test_inventory_placeholder]
-            '''
+            """
         ),
-        md("Check exercise 7 (this runs pytest with `--cov-branch` a few times; allow some seconds):"),
+        md(
+            "Check exercise 7 (this runs pytest with `--cov-branch` a few times; allow some seconds):"
+        ),
         code(
-            r'''
+            r"""
             INVENTORY_MUTANTS = {
-                "alert on every low sale": ("shop/inventory.py", "if old_quantity > reorder_level >= new_quantity:", "if reorder_level >= new_quantity:"),
-                "adjustment sign ignored": ("shop/inventory.py", "if self.movement_type is MovementType.ADJUSTED:\n                return self.quantity", "if self.movement_type is MovementType.ADJUSTED:\n                return abs(self.quantity)"),
+                "alert on every low sale": (
+                    "shop/inventory.py",
+                    "if old_quantity > reorder_level >= new_quantity:",
+                    "if reorder_level >= new_quantity:",
+                ),
+                "adjustment sign ignored": (
+                    "shop/inventory.py",
+                    "if self.movement_type is MovementType.ADJUSTED:\n                return self.quantity",
+                    "if self.movement_type is MovementType.ADJUSTED:\n"
+                    "                return abs(self.quantity)",
+                ),
             }
             inventory_source = lab_test_source(INVENTORY_TESTS)
 
@@ -4724,17 +5162,41 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
 
             run_checks(
                 [
-                    ("at least 8 tests", lambda: len([test for test in INVENTORY_TESTS if getattr(test, "__name__", "").startswith("test_")]) >= 8, True),
+                    (
+                        "at least 8 tests",
+                        lambda: (
+                            len(
+                                [
+                                    test
+                                    for test in INVENTORY_TESTS
+                                    if getattr(test, "__name__", "").startswith("test_")
+                                ]
+                            )
+                            >= 8
+                        ),
+                        True,
+                    ),
                     ("all tests pass", lambda: inventory_coverage_run().green, True),
-                    ("branch coverage >= 90%", lambda: (inventory_coverage_run().coverage_percent or 0) >= 90, True),
-                    *[(f"catches: {name}", lambda mutation=mutation: catches(inventory_source, mutation), True) for name, mutation in INVENTORY_MUTANTS.items()],
+                    (
+                        "branch coverage >= 90%",
+                        lambda: (inventory_coverage_run().coverage_percent or 0) >= 90,
+                        True,
+                    ),
+                    *[
+                        (
+                            f"catches: {name}",
+                            lambda mutation=mutation: catches(inventory_source, mutation),
+                            True,
+                        )
+                        for name, mutation in INVENTORY_MUTANTS.items()
+                    ],
                 ]
             )
             try:
                 print(f"branch coverage of shop/inventory.py: {inventory_coverage_run().coverage_percent}%")
             except Exception as error:  # never stop Run All
                 print(f"coverage not measured: {type(error).__name__}")
-            '''
+            """
         ),
     ]
 

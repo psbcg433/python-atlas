@@ -10,14 +10,24 @@ throwaway projects under notebooks/_scratch/ (git-ignored), like the notebook.
 """
 
 import annotationlib
+import argparse
 import base64
+import contextlib
 import email.parser
 import functools
+import graphlib
 import hashlib
+import heapq
+import hmac
+import importlib.util
 import inspect
+import io
 import json
 import linecache
+import logging
+import logging.config
 import os
+import random
 import re
 import shlex
 import shutil
@@ -28,12 +38,20 @@ import textwrap
 import time
 import tomllib
 import typing
+import xml.etree.ElementTree as ElementTree
 import zipfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Annotated, Literal, get_type_hints, overload
+from typing import IO, TYPE_CHECKING, Annotated, Literal, get_type_hints, overload
+from unittest import mock
+from zoneinfo import ZoneInfo
+
+import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 type TestCase = tuple[str, Callable[[], object], object]
 
@@ -1654,7 +1672,2195 @@ def check_lab_4_2() -> None:
     )
 
 
+# ===============================================================================================
+# Lab 4.3 — helpers copied from the notebook's lab cells
+# ===============================================================================================
+
+if TYPE_CHECKING:  # the lab tests run in a child process whose prelude imports these names
+    from shop.billing import split_bill
+    from shop.inventory import (
+        DuplicateProductError,
+        EventBus,
+        InMemoryInventoryRepository,
+        InventoryRepository,
+        InventoryService,
+        LowStockAlert,
+        MovementType,
+        StockChanged,
+        StockMovement,
+        UnknownProductError,
+        UnknownWarehouseError,
+    )
+    from shop.rates import ExchangeRateClient, RateLookupError
+
+MONEY_MODULE = """
+    \"\"\"The shared Money value type (Lab 2.4, exercise 1; Phase 2 Project, Step 1).\"\"\"
+
+    from __future__ import annotations
+
+    import functools
+    from decimal import ROUND_HALF_UP, Decimal
+
+    PAISE = Decimal("0.01")
+
+
+    class CurrencyMismatchError(ValueError):
+        \"\"\"Two Money values in different currencies were combined or compared.\"\"\"
+
+
+    @functools.total_ordering
+    class Money:
+        __slots__ = ("_amount", "_currency")
+
+        def __init__(self, amount: Decimal | int | str, currency: str = "INR") -> None:
+            if isinstance(amount, float):
+                raise TypeError("amount must be Decimal, int or str, not float")
+            if not (len(currency) == 3 and currency.isalpha() and currency.isupper()):
+                raise ValueError(f"invalid currency code: {currency!r}")
+            self._amount = Decimal(amount).quantize(PAISE, rounding=ROUND_HALF_UP)
+            self._currency = currency
+
+        @property
+        def amount(self) -> Decimal:
+            return self._amount
+
+        @property
+        def currency(self) -> str:
+            return self._currency
+
+        def __repr__(self) -> str:
+            return f"Money({str(self._amount)!r}, {self._currency!r})"
+
+        def __str__(self) -> str:
+            return f"{self._currency} {self._amount:,.2f}"
+
+        def _same_currency(self, other: Money) -> None:
+            if other._currency != self._currency:
+                raise CurrencyMismatchError(
+                    f"currency mismatch: {self._currency} vs {other._currency}"
+                )
+
+        def __eq__(self, other: object) -> bool:
+            if not isinstance(other, Money):
+                return NotImplemented
+            return (self._amount, self._currency) == (other._amount, other._currency)
+
+        def __hash__(self) -> int:
+            return hash((self._amount, self._currency))
+
+        def __lt__(self, other: object) -> bool:
+            if not isinstance(other, Money):
+                return NotImplemented
+            self._same_currency(other)
+            return self._amount < other._amount
+
+        def __add__(self, other: object) -> Money:
+            if not isinstance(other, Money):
+                return NotImplemented
+            self._same_currency(other)
+            return Money(self._amount + other._amount, self._currency)
+
+        def __radd__(self, other: object) -> Money:
+            if isinstance(other, int) and not isinstance(other, bool) and other == 0:
+                return self  # sum() starts from 0
+            return NotImplemented
+
+        def __sub__(self, other: object) -> Money:
+            if not isinstance(other, Money):
+                return NotImplemented
+            self._same_currency(other)
+            return Money(self._amount - other._amount, self._currency)
+
+        def __mul__(self, factor: object) -> Money:
+            if isinstance(factor, bool) or not isinstance(factor, (int, Decimal)):
+                return NotImplemented
+            return Money(self._amount * factor, self._currency)
+
+        __rmul__ = __mul__
+
+        def __neg__(self) -> Money:
+            return Money(-self._amount, self._currency)
+
+        def __bool__(self) -> bool:
+            return bool(self._amount)
+"""
+
+BILLING_MODULE = """
+    \"\"\"split_bill from Lab 1.3.\"\"\"
+
+    from decimal import ROUND_HALF_UP, Decimal
+
+    PAISE = Decimal("0.01")
+
+
+    def split_bill(total_amount: str, people_count: int) -> list[Decimal]:
+        \"\"\"Split a rupee amount into people_count parts, exact to the paisa.\"\"\"
+        if people_count < 1:
+            raise ValueError(f"people_count must be at least 1, got {people_count}")
+        total_in_paise = int(Decimal(total_amount).quantize(PAISE, rounding=ROUND_HALF_UP) * 100)
+        base_share_in_paise, leftover_paise = divmod(total_in_paise, people_count)
+        return [
+            (Decimal(base_share_in_paise + (1 if index < leftover_paise else 0)) / 100).quantize(
+                PAISE
+            )
+            for index in range(people_count)
+        ]
+"""
+
+RATES_MODULE = """
+    \"\"\"Exchange rates from an HTTP service; the HTTP client is injected.\"\"\"
+
+    from decimal import Decimal
+
+
+    class RateLookupError(Exception):
+        \"\"\"The rate service failed or returned something unusable.\"\"\"
+
+
+    class ExchangeRateClient:
+        def __init__(self, http, base_url: str = "https://rates.example.com/v1") -> None:
+            self.http = http  # anything with .get(url, *, params, timeout) -> response
+            self.base_url = base_url.rstrip("/")
+
+        def rate(self, base: str, quote: str) -> Decimal:
+            \"\"\"How many units of quote one unit of base buys.\"\"\"
+            response = self.http.get(
+                f"{self.base_url}/latest", params={"base": base, "symbols": quote}, timeout=5.0
+            )
+            if response.status_code != 200:
+                raise RateLookupError(f"rate service returned HTTP {response.status_code}")
+            try:
+                return Decimal(str(response.json()["rates"][quote]))
+            except (KeyError, TypeError) as error:
+                raise RateLookupError(f"no {quote} rate in the response") from error
+
+        def convert(self, amount: Decimal, base: str, quote: str) -> Decimal:
+            \"\"\"amount in base currency -> quote currency, rounded to 2 places.\"\"\"
+            if base == quote:
+                return amount
+            return (amount * self.rate(base, quote)).quantize(Decimal("0.01"))
+"""
+
+INVENTORY_MODULE = """
+    \"\"\"The Phase 2 inventory domain model (Phase 2 Project, Steps 2-8).\"\"\"
+
+    from __future__ import annotations
+
+    import re
+    from collections import defaultdict
+    from collections.abc import Callable, Iterator
+    from dataclasses import dataclass
+    from datetime import datetime
+    from enum import StrEnum, auto
+    from typing import Any, Protocol, runtime_checkable
+
+    from shop.money import Money
+
+    SKU_PATTERN = re.compile(r"[A-Z]{2,5}-\\d{2,4}")
+
+
+    @dataclass(frozen=True, slots=True)
+    class Product:
+        sku: str
+        name: str
+        unit_price: Money
+        reorder_level: int = 5
+
+        def __post_init__(self) -> None:
+            if not SKU_PATTERN.fullmatch(self.sku):
+                raise ValueError(f"invalid SKU {self.sku!r}: expected e.g. 'TEA-500'")
+            if not self.name.strip():
+                raise ValueError("product name is required")
+            if not isinstance(self.unit_price, Money) or self.unit_price.amount <= 0:
+                raise ValueError("unit_price must be a positive Money")
+            if self.reorder_level < 0:
+                raise ValueError("reorder_level must be >= 0")
+
+
+    class MovementType(StrEnum):
+        RECEIVED = auto()
+        SHIPPED = auto()
+        RETURNED = auto()
+        ADJUSTED = auto()
+
+        @property
+        def direction(self) -> int:
+            match self:
+                case MovementType.RECEIVED | MovementType.RETURNED:
+                    return 1
+                case MovementType.SHIPPED:
+                    return -1
+                case _:
+                    return 0
+
+
+    @dataclass(frozen=True, slots=True)
+    class StockMovement:
+        warehouse_code: str
+        sku: str
+        movement_type: MovementType
+        quantity: int
+        occurred_at: datetime
+        note: str = ""
+
+        def __post_init__(self) -> None:
+            if self.movement_type is MovementType.ADJUSTED:
+                if self.quantity == 0:
+                    raise ValueError("an adjustment must change the quantity")
+            elif self.quantity <= 0:
+                raise ValueError(f"{self.movement_type} quantity must be positive")
+
+        @property
+        def delta(self) -> int:
+            if self.movement_type is MovementType.ADJUSTED:
+                return self.quantity
+            return self.quantity * self.movement_type.direction
+
+
+    class InventoryError(Exception):
+        error_code = "inventory_error"
+
+        def to_dict(self) -> dict[str, str]:
+            return {"error": self.error_code, "message": str(self)}
+
+
+    class UnknownWarehouseError(InventoryError, LookupError):
+        error_code = "unknown_warehouse"
+
+        def __init__(self, warehouse_code: str) -> None:
+            super().__init__(f"no warehouse with code {warehouse_code!r}")
+            self.warehouse_code = warehouse_code
+
+
+    class UnknownProductError(InventoryError, LookupError):
+        error_code = "unknown_product"
+
+        def __init__(self, sku: str, warehouse_code: str) -> None:
+            super().__init__(f"{sku} is not stocked in {warehouse_code}")
+            self.sku, self.warehouse_code = sku, warehouse_code
+
+
+    class DuplicateProductError(InventoryError, ValueError):
+        error_code = "duplicate_product"
+
+        def __init__(self, sku: str, warehouse_code: str) -> None:
+            super().__init__(f"{sku} is already stocked in {warehouse_code}")
+            self.sku, self.warehouse_code = sku, warehouse_code
+
+
+    class InsufficientStockError(InventoryError):
+        error_code = "insufficient_stock"
+
+        def __init__(self, sku: str, available: int, requested: int) -> None:
+            super().__init__(f"not enough {sku}: {available} available, {requested} requested")
+            self.sku, self.available, self.requested = sku, available, requested
+
+
+    class Warehouse:
+        def __init__(self, code: str, city: str) -> None:
+            self.code, self.city = code, city
+            self._products: dict[str, Product] = {}
+            self._quantities: dict[str, int] = {}
+
+        def __repr__(self) -> str:
+            return f"Warehouse({self.code!r}, {self.city!r}, products={len(self)})"
+
+        def __eq__(self, other: object) -> bool:
+            return self.code == other.code if isinstance(other, Warehouse) else NotImplemented
+
+        def __hash__(self) -> int:
+            return hash(self.code)
+
+        def __len__(self) -> int:
+            return len(self._products)
+
+        def __contains__(self, item: object) -> bool:
+            sku = item.sku if isinstance(item, Product) else item
+            return sku in self._products
+
+        def __getitem__(self, sku: str) -> int:
+            if sku not in self._products:
+                raise UnknownProductError(sku, self.code)
+            return self._quantities[sku]
+
+        def __iter__(self) -> Iterator[Product]:
+            return iter(sorted(self._products.values(), key=lambda product: product.sku))
+
+        def __bool__(self) -> bool:
+            return any(self._quantities.values())
+
+        def product(self, sku: str) -> Product:
+            if sku not in self._products:
+                raise UnknownProductError(sku, self.code)
+            return self._products[sku]
+
+        def add_product(self, product: Product) -> None:
+            if product.sku in self._products:
+                raise DuplicateProductError(product.sku, self.code)
+            self._products[product.sku] = product
+            self._quantities[product.sku] = 0
+
+        def apply(self, movement: StockMovement) -> int:
+            available = self[movement.sku]
+            if available + movement.delta < 0:
+                raise InsufficientStockError(movement.sku, available, -movement.delta)
+            self._quantities[movement.sku] = available + movement.delta
+            return self._quantities[movement.sku]
+
+        def stock_value(self) -> Money:
+            return sum((product.unit_price * self[product.sku] for product in self), Money(0))
+
+        def low_stock(self) -> list[Product]:
+            return [product for product in self if self[product.sku] <= product.reorder_level]
+
+
+    @runtime_checkable
+    class InventoryRepository(Protocol):
+        def get_warehouse(self, code: str) -> Warehouse: ...
+        def save_warehouse(self, warehouse: Warehouse) -> None: ...
+        def list_warehouses(self) -> list[Warehouse]: ...
+        def record_movement(self, movement: StockMovement) -> None: ...
+        def movements(self, *, sku: str | None = None) -> list[StockMovement]: ...
+
+
+    class InMemoryInventoryRepository:
+        def __init__(self) -> None:
+            self._warehouses: dict[str, Warehouse] = {}
+            self._movements: list[StockMovement] = []
+
+        def get_warehouse(self, code: str) -> Warehouse:
+            try:
+                return self._warehouses[code]
+            except KeyError:
+                raise UnknownWarehouseError(code) from None
+
+        def save_warehouse(self, warehouse: Warehouse) -> None:
+            self._warehouses[warehouse.code] = warehouse
+
+        def list_warehouses(self) -> list[Warehouse]:
+            return sorted(self._warehouses.values(), key=lambda warehouse: warehouse.code)
+
+        def record_movement(self, movement: StockMovement) -> None:
+            self._movements.append(movement)
+
+        def movements(self, *, sku: str | None = None) -> list[StockMovement]:
+            return [movement for movement in self._movements if sku is None or movement.sku == sku]
+
+
+    @dataclass(frozen=True)
+    class StockChanged:
+        warehouse_code: str
+        sku: str
+        old_quantity: int
+        new_quantity: int
+        movement_type: MovementType
+
+
+    @dataclass(frozen=True)
+    class LowStockAlert:
+        warehouse_code: str
+        sku: str
+        quantity: int
+        reorder_level: int
+
+
+    class EventBus:
+        def __init__(self) -> None:
+            self._handlers: defaultdict[type, list[Callable[[Any], None]]] = defaultdict(list)
+
+        def subscribe(self, event_type: type, handler: Callable[[Any], None]) -> None:
+            self._handlers[event_type].append(handler)
+
+        def publish(self, event: object) -> int:
+            handlers = self._handlers.get(type(event), [])
+            for handler in handlers:
+                handler(event)
+            return len(handlers)
+
+
+    class InventoryService:
+        def __init__(
+            self,
+            repository: InventoryRepository,
+            events: EventBus,
+            clock: Callable[[], datetime] = datetime.now,
+        ) -> None:
+            self.repository, self.events, self.clock = repository, events, clock
+
+        def open_warehouse(self, code: str, city: str) -> Warehouse:
+            warehouse = Warehouse(code, city)
+            self.repository.save_warehouse(warehouse)
+            return warehouse
+
+        def register_product(self, warehouse_code: str, product: Product) -> None:
+            warehouse = self.repository.get_warehouse(warehouse_code)
+            warehouse.add_product(product)
+            self.repository.save_warehouse(warehouse)
+
+        def receive(self, warehouse_code: str, sku: str, quantity: int, note: str = "") -> int:
+            return self._record(warehouse_code, sku, MovementType.RECEIVED, quantity, note)
+
+        def ship(self, warehouse_code: str, sku: str, quantity: int, note: str = "") -> int:
+            return self._record(warehouse_code, sku, MovementType.SHIPPED, quantity, note)
+
+        def accept_return(
+            self, warehouse_code: str, sku: str, quantity: int, note: str = ""
+        ) -> int:
+            return self._record(warehouse_code, sku, MovementType.RETURNED, quantity, note)
+
+        def adjust(self, warehouse_code: str, sku: str, change: int, note: str) -> int:
+            return self._record(warehouse_code, sku, MovementType.ADJUSTED, change, note)
+
+        def transfer(self, from_code: str, to_code: str, sku: str, quantity: int) -> None:
+            source = self.repository.get_warehouse(from_code)
+            destination = self.repository.get_warehouse(to_code)
+            if source[sku] < quantity:
+                raise InsufficientStockError(sku, source[sku], quantity)
+            if sku not in destination:
+                self.register_product(to_code, source.product(sku))
+            self.ship(from_code, sku, quantity, note=f"transfer to {to_code}")
+            self.receive(to_code, sku, quantity, note=f"transfer from {from_code}")
+
+        def total_value(self) -> Money:
+            return sum(
+                (warehouse.stock_value() for warehouse in self.repository.list_warehouses()),
+                Money(0),
+            )
+
+        def stock_report(self, warehouse_code: str) -> list[str]:
+            warehouse = self.repository.get_warehouse(warehouse_code)
+            lines = [f"{warehouse.code} ({warehouse.city})"]
+            for product in warehouse:
+                flag = "  LOW" if product in warehouse.low_stock() else ""
+                lines.append(f"{product.sku:<9}{warehouse[product.sku]:>5}{flag}")
+            lines.append(f"total {warehouse.stock_value()}")
+            return lines
+
+        def _record(
+            self,
+            warehouse_code: str,
+            sku: str,
+            movement_type: MovementType,
+            quantity: int,
+            note: str,
+        ) -> int:
+            warehouse = self.repository.get_warehouse(warehouse_code)
+            old_quantity = warehouse[sku]
+            movement = StockMovement(
+                warehouse_code, sku, movement_type, quantity, self.clock(), note
+            )
+            new_quantity = warehouse.apply(movement)
+            self.repository.record_movement(movement)
+            self.repository.save_warehouse(warehouse)
+            self.events.publish(
+                StockChanged(warehouse_code, sku, old_quantity, new_quantity, movement_type)
+            )
+            reorder_level = warehouse.product(sku).reorder_level
+            if old_quantity > reorder_level >= new_quantity:
+                self.events.publish(LowStockAlert(warehouse_code, sku, new_quantity, reorder_level))
+            return new_quantity
+"""
+
+LAB_MODULES = {
+    "shop/__init__.py": "",
+    "shop/money.py": MONEY_MODULE,
+    "shop/billing.py": BILLING_MODULE,
+    "shop/rates.py": RATES_MODULE,
+    "shop/inventory.py": INVENTORY_MODULE,
+}
+LAB43_DIR = find_repo_root() / "notebooks" / "_scratch" / "unit43" / "lab"
+
+LAB_TEST_PRELUDE = """
+from collections.abc import Callable
+from datetime import datetime
+from decimal import Decimal
+from unittest import mock
+
+import pytest
+from hypothesis import assume, example, given, settings
+from hypothesis import strategies as st
+
+from shop.billing import split_bill
+from shop.inventory import (
+    DuplicateProductError, EventBus, InMemoryInventoryRepository, InsufficientStockError,
+    InventoryError, InventoryRepository, InventoryService, LowStockAlert, MovementType, Product,
+    StockChanged, StockMovement, UnknownProductError, UnknownWarehouseError, Warehouse,
+)
+from shop.money import CurrencyMismatchError, Money
+from shop.rates import ExchangeRateClient, RateLookupError
+"""
+LAB_CONFTEST = """
+from hypothesis import settings
+
+settings.register_profile("lab", derandomize=True, database=None, deadline=None)
+settings.load_profile("lab")
+"""
+LAB_PYPROJECT = """
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+"""
+
+
+@dataclass(frozen=True)
+class LabRun:
+    """Outcome of one pytest run: test name -> "passed" / "failed" / "skipped", plus coverage."""
+
+    outcomes: dict[str, str]
+    coverage_percent: float | None
+    output: str
+
+    @property
+    def green(self) -> bool:
+        """At least one test ran and nothing failed or errored."""
+        return bool(self.outcomes) and set(self.outcomes.values()) <= {"passed"}
+
+
+def lab_test_source(objects: list[object]) -> str:
+    """The prelude followed by the source of each test or fixture function (never raises)."""
+    try:
+        return LAB_TEST_PRELUDE + "\n\n" + "\n\n".join(source_of(obj) for obj in objects)
+    except (OSError, TypeError) as error:
+        return (
+            LAB_TEST_PRELUDE
+            + f"\n\ndef test_source_unavailable():\n    raise RuntimeError({str(error)!r})\n"
+        )
+
+
+def run_lab_tests(
+    test_source: str,
+    conftest_source: str = "",
+    mutation: tuple[str, str, str] | None = None,
+    coverage_target: str | None = None,
+) -> LabRun:
+    """Run test_source with pytest in a child process against the shop package (or a mutant)."""
+    return _cached_lab_run(test_source, conftest_source, mutation, coverage_target)
+
+
+@functools.cache
+def _cached_lab_run(
+    test_source: str,
+    conftest_source: str,
+    mutation: tuple[str, str, str] | None,
+    coverage_target: str | None,
+) -> LabRun:
+    """The run behind run_lab_tests; identical runs are done once."""
+    modules = dict(LAB_MODULES)
+    if mutation is not None:
+        path, old, new = mutation
+        if old not in modules[path]:
+            raise ValueError(f"mutation target not found in {path}: {old!r}")
+        modules[path] = modules[path].replace(old, new)
+    root = LAB43_DIR / "run"
+    shutil.rmtree(root, ignore_errors=True)
+    files = {**modules, "pyproject.toml": LAB_PYPROJECT, "tests/test_lab.py": test_source}
+    files["tests/conftest.py"] = LAB_CONFTEST + "\n" + conftest_source
+    for relative_path, text in files.items():
+        (root / relative_path).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative_path).write_text(
+            textwrap.dedent(text).lstrip("\n") if relative_path.startswith("shop") else text
+        )
+    command = [
+        str(Path(sys.executable).parent / "pytest"),
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "--junit-xml=report.xml",
+    ]
+    if coverage_target:
+        command += [f"--cov={coverage_target}", "--cov-branch", "--cov-report=json:coverage.json"]
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PYTEST_", "PYTHONPATH", "COV"))
+    }
+    completed = subprocess.run(
+        command,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env={**environment, "NO_COLOR": "1", "PY_COLORS": "0", "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    outcomes: dict[str, str] = {}
+    if (root / "report.xml").exists():
+        for case in ElementTree.parse(root / "report.xml").getroot().iter("testcase"):
+            failed = case.find("failure") is not None or case.find("error") is not None
+            skipped = case.find("skipped") is not None
+            outcomes[case.get("name", "?")] = (
+                "failed" if failed else "skipped" if skipped else "passed"
+            )
+    coverage_percent = None
+    if coverage_target and (root / "coverage.json").exists():
+        report = json.loads((root / "coverage.json").read_text())
+        coverage_percent = round(report["totals"]["percent_covered"], 1)
+    return LabRun(outcomes, coverage_percent, completed.stdout + completed.stderr)
+
+
+def catches(test_source: str, mutation: tuple[str, str, str], conftest_source: str = "") -> bool:
+    """True if the tests pass on the real shop package and fail on the mutant."""
+    return (
+        run_lab_tests(test_source, conftest_source).green
+        and not run_lab_tests(test_source, conftest_source, mutation).green
+    )
+
+
+COUPON_SCRIPT = """
+COUPONS = {"DIWALI10": 10, "FLAT5": 5}
+
+
+def apply_coupon(total_paise, coupon):
+    percent = COUPONS.get(coupon, 0)
+    discount = total_paise * percent // 10
+    return total_paise - discount
+
+
+def checkout(cart, coupon):
+    total = sum(price * quantity for price, quantity in cart)
+    return apply_coupon(total, coupon)
+
+
+print(checkout([(24000, 2), (19900, 1)], "DIWALI10"))
+"""
+COUPON_DIR = LAB43_DIR / "coupon"
+COUPON_DIR.mkdir(parents=True, exist_ok=True)
+(COUPON_DIR / "coupon.py").write_text(textwrap.dedent(COUPON_SCRIPT).lstrip("\n"))
+
+
+# Lab 4.3 solutions -----------------------------------------------------------------------------
+
+# Exercise 1 ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw_amount", "expected"),
+    [("0.125", "0.13"), ("0.124", "0.12"), ("-0.125", "-0.13"), ("19", "19.00")],
+    ids=["half-up", "below-half", "negative-half", "whole-rupees"],
+)
+def test_money_rounding(raw_amount: str, expected: str) -> None:
+    """Amounts are rounded half-up to the paisa."""
+    assert Money(raw_amount).amount == Decimal(expected)
+
+
+@pytest.mark.parametrize(
+    ("left", "operator", "right", "expected"),
+    [
+        pytest.param(Money("240"), "+", Money("199"), Money("439"), id="add"),
+        pytest.param(Money("0.10"), "+", Money("0.20"), Money("0.30"), id="add-paise"),
+        pytest.param(Money("240"), "-", Money("199"), Money("41"), id="subtract"),
+        pytest.param(Money("1"), "-", Money("2.50"), Money("-1.50"), id="subtract-below-zero"),
+    ],
+)
+def test_money_arithmetic(left: Money, operator: str, right: Money, expected: Money) -> None:
+    """+ and - keep exact paise and the currency."""
+    result = left + right if operator == "+" else left - right
+    assert result == expected
+
+
+def test_money_rejects_bad_input() -> None:
+    """Floats and mixed currencies are refused."""
+    with pytest.raises(TypeError, match="float"):
+        Money(0.1)  # type: ignore[arg-type]
+    with pytest.raises(CurrencyMismatchError, match="INR vs USD"):
+        Money(1) + Money(1, "USD")
+
+
+MONEY_TESTS = [test_money_rounding, test_money_arithmetic, test_money_rejects_bad_input]
+
+
+# Exercise 2 ------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def catalogue() -> dict[str, Product]:
+    """TEA-500 (240, reorder 10), MUG-02 (199, reorder 5), JAR-750 (350, reorder 3)."""
+    products = [
+        Product("TEA-500", "Masala tea 500 g", Money("240"), reorder_level=10),
+        Product("MUG-02", "Steel mug", Money("199"), reorder_level=5),
+        Product("JAR-750", "Pickle jar 750 ml", Money("350"), reorder_level=3),
+    ]
+    return {product.sku: product for product in products}
+
+
+@pytest.fixture
+def repository(catalogue: dict[str, Product]) -> InMemoryInventoryRepository:
+    """PNQ1 (Pune) and BLR1 (Bengaluru), each carrying every product, zero stock."""
+    fresh_repository = InMemoryInventoryRepository()
+    for code, city in (("PNQ1", "Pune"), ("BLR1", "Bengaluru")):
+        warehouse = Warehouse(code, city)
+        for product in catalogue.values():
+            warehouse.add_product(product)
+        fresh_repository.save_warehouse(warehouse)
+    return fresh_repository
+
+
+@pytest.fixture
+def clock() -> Callable[[], datetime]:
+    """Always returns datetime(2026, 11, 7, 9, 30)."""
+    return lambda: datetime(2026, 11, 7, 9, 30)
+
+
+@pytest.fixture
+def make_service(
+    repository: InMemoryInventoryRepository, clock: Callable[[], datetime]
+) -> Callable[..., InventoryService]:
+    """Factory: make_service(stock=None) -> InventoryService, stock received into PNQ1."""
+
+    def build(stock: dict[str, int] | None = None) -> InventoryService:
+        service = InventoryService(repository, EventBus(), clock)
+        for sku, quantity in (stock or {}).items():
+            service.receive("PNQ1", sku, quantity)
+        return service
+
+    return build
+
+
+INVENTORY_FIXTURES = [catalogue, repository, clock, make_service]
+
+
+# Exercise 3 ------------------------------------------------------------------------------------
+
+
+def fake_http(status_code: int = 200, payload: object = None) -> mock.Mock:
+    """A stub HTTP client whose get() returns one canned response."""
+    response = mock.Mock(status_code=status_code)
+    response.json.return_value = payload if payload is not None else {"rates": {"USD": 0.012}}
+    http = mock.Mock()
+    http.get.return_value = response
+    return http
+
+
+def test_rate_is_parsed_exactly() -> None:
+    """A JSON number becomes the exact Decimal it was written as."""
+    client = ExchangeRateClient(fake_http(payload={"rates": {"USD": 0.012}}))
+    assert client.rate("INR", "USD") == Decimal("0.012")
+
+
+def test_rate_request_is_well_formed() -> None:
+    """URL, query parameters and timeout are exactly as the service expects."""
+    http = fake_http()
+    ExchangeRateClient(http, base_url="https://rates.test/v1/").rate("INR", "USD")
+    http.get.assert_called_once_with(
+        "https://rates.test/v1/latest", params={"base": "INR", "symbols": "USD"}, timeout=5.0
+    )
+
+
+def test_http_error_is_rejected_before_reading_the_body() -> None:
+    """A 503 raises RateLookupError and the body is never parsed."""
+    http = fake_http(status_code=503)
+    with pytest.raises(RateLookupError, match="503"):
+        ExchangeRateClient(http).rate("INR", "USD")
+    http.get.return_value.json.assert_not_called()
+
+
+def test_same_currency_conversion_skips_the_service() -> None:
+    """INR -> INR needs no HTTP call."""
+    http = fake_http()
+    assert ExchangeRateClient(http).convert(Decimal("100"), "INR", "INR") == Decimal("100")
+    http.get.assert_not_called()
+
+
+RATE_TESTS = [
+    fake_http,
+    test_rate_is_parsed_exactly,
+    test_rate_request_is_well_formed,
+    test_http_error_is_rejected_before_reading_the_body,
+    test_same_currency_conversion_skips_the_service,
+]
+
+
+# Exercise 4 ------------------------------------------------------------------------------------
+
+
+@given(
+    st.decimals(min_value=0, max_value=100_000, places=2).map(str),
+    st.integers(min_value=1, max_value=50),
+)
+def test_share_count(total_amount: str, people_count: int) -> None:
+    """One share per person."""
+    assert len(split_bill(total_amount, people_count)) == people_count
+
+
+@given(
+    st.decimals(min_value=0, max_value=100_000, places=2).map(str),
+    st.integers(min_value=1, max_value=50),
+)
+def test_shares_add_up_exactly(total_amount: str, people_count: int) -> None:
+    """Nothing is lost or invented."""
+    assert sum(split_bill(total_amount, people_count)) == Decimal(total_amount)
+
+
+@given(
+    st.decimals(min_value=0, max_value=100_000, places=2).map(str),
+    st.integers(min_value=1, max_value=50),
+)
+def test_shares_differ_by_at_most_one_paisa(total_amount: str, people_count: int) -> None:
+    """The split is as fair as paise allow."""
+    shares = split_bill(total_amount, people_count)
+    assert max(shares) - min(shares) <= Decimal("0.01")
+
+
+@given(
+    st.decimals(min_value=0, max_value=100_000, places=2).map(str),
+    st.integers(min_value=1, max_value=50),
+)
+def test_shares_never_increase(total_amount: str, people_count: int) -> None:
+    """The leftover paise go to the first people."""
+    shares = split_bill(total_amount, people_count)
+    assert all(earlier >= later for earlier, later in zip(shares, shares[1:], strict=False))
+
+
+@given(st.integers(max_value=0))
+def test_invalid_people_count_is_rejected(people_count: int) -> None:
+    """Zero or negative people is an error."""
+    with pytest.raises(ValueError):
+        split_bill("100.00", people_count)
+
+
+SPLIT_BILL_TESTS = [
+    test_share_count,
+    test_shares_add_up_exactly,
+    test_shares_differ_by_at_most_one_paisa,
+    test_shares_never_increase,
+    test_invalid_people_count_is_rejected,
+]
+
+
+# Exercise 5 ------------------------------------------------------------------------------------
+
+
+class JsonFormatter(logging.Formatter):
+    """Format each record as one line of JSON."""
+
+    STANDARD_ATTRIBUTES = frozenset(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "time": datetime.fromtimestamp(record.created, UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        payload |= {
+            key: value for key, value in vars(record).items() if key not in self.STANDARD_ATTRIBUTES
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+class HealthCheckFilter(logging.Filter):
+    """Drop health-check noise."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health" not in record.getMessage()
+
+
+def build_logging_config(stream: IO[str]) -> dict[str, object]:
+    """A dictConfig dict: JSON lines to stream for the shop loggers."""
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {"json": {"()": JsonFormatter}},
+        "filters": {"no_health": {"()": HealthCheckFilter}},
+        "handlers": {
+            "json_stream": {
+                "class": "logging.StreamHandler",
+                "stream": stream,
+                "formatter": "json",
+                "level": "INFO",
+                "filters": ["no_health"],
+            },
+        },
+        "loggers": {
+            "shop": {"handlers": ["json_stream"], "level": "DEBUG", "propagate": False},
+            "shop.payments": {"level": "WARNING"},
+        },
+    }
+
+
+# Exercise 6 ------------------------------------------------------------------------------------
+
+
+def coupon_debug_commands() -> list[str]:
+    """The pdb commands of the session, in order."""
+    return ["b apply_coupon", "c", "n", "p percent", "n", "p discount", "w", "c"]
+
+
+def coupon_bug_report() -> tuple[int, str]:
+    """(line number of the bug, the corrected line)."""
+    return 6, "discount = total_paise * percent // 100"
+
+
+# Exercise 7 ------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stocked() -> InventoryService:
+    """Two warehouses; PNQ1 carries tea (40 units, reorder 10) and mugs (none, reorder 5)."""
+    service = InventoryService(
+        InMemoryInventoryRepository(), EventBus(), lambda: datetime(2026, 11, 7, 9, 30)
+    )
+    service.open_warehouse("PNQ1", "Pune")
+    service.open_warehouse("BLR1", "Bengaluru")
+    service.register_product("PNQ1", Product("TEA-500", "Masala tea", Money("240"), 10))
+    service.register_product("PNQ1", Product("MUG-02", "Steel mug", Money("199"), 5))
+    service.receive("PNQ1", "TEA-500", 40)
+    return service
+
+
+@pytest.mark.parametrize(
+    ("sku", "name", "price", "reorder_level", "message"),
+    [
+        ("tea", "Tea", "1", 5, "invalid SKU"),
+        ("TEA-500", "  ", "1", 5, "name is required"),
+        ("TEA-500", "Tea", "0", 5, "positive Money"),
+        ("TEA-500", "Tea", "1", -1, "reorder_level"),
+    ],
+    ids=["sku", "name", "price", "reorder-level"],
+)
+def test_product_validation(
+    sku: str, name: str, price: str, reorder_level: int, message: str
+) -> None:
+    """Every rule in Product.__post_init__ rejects bad data."""
+    with pytest.raises(ValueError, match=message):
+        Product(sku, name, Money(price), reorder_level)
+
+
+def test_product_requires_money() -> None:
+    """A plain number is not a price."""
+    with pytest.raises(ValueError, match="positive Money"):
+        Product("TEA-500", "Tea", 240)
+
+
+def test_movement_directions_and_deltas() -> None:
+    """Each movement type has the right sign; adjustments carry their own."""
+    moment = datetime(2026, 11, 7, 9, 30)
+    assert [movement_type.direction for movement_type in MovementType] == [1, -1, 1, 0]
+    shipped = StockMovement("PNQ1", "TEA-500", MovementType.SHIPPED, 3, moment)
+    adjusted = StockMovement("PNQ1", "TEA-500", MovementType.ADJUSTED, -2, moment, "damaged")
+    assert (shipped.delta, adjusted.delta) == (-3, -2)
+
+
+def test_movement_validation() -> None:
+    """Zero adjustments and non-positive quantities are refused."""
+    moment = datetime(2026, 11, 7, 9, 30)
+    with pytest.raises(ValueError, match="adjustment"):
+        StockMovement("PNQ1", "TEA-500", MovementType.ADJUSTED, 0, moment)
+    with pytest.raises(ValueError, match="positive"):
+        StockMovement("PNQ1", "TEA-500", MovementType.RECEIVED, 0, moment)
+
+
+def test_error_payloads() -> None:
+    """Errors expose a code, a message and structured attributes."""
+    shortage = InsufficientStockError("TEA-500", 2, 5)
+    assert shortage.to_dict() == {
+        "error": "insufficient_stock",
+        "message": "not enough TEA-500: 2 available, 5 requested",
+    }
+    assert UnknownWarehouseError("NOPE").to_dict()["error"] == "unknown_warehouse"
+    assert isinstance(DuplicateProductError("TEA-500", "PNQ1"), ValueError)
+
+
+def test_warehouse_container_protocol(stocked: InventoryService) -> None:
+    """len, in, [], iteration, bool, equality, hashing and repr."""
+    pune = stocked.repository.get_warehouse("PNQ1")
+    bengaluru = stocked.repository.get_warehouse("BLR1")
+    assert (len(pune), "TEA-500" in pune, pune.product("TEA-500") in pune) == (2, True, True)
+    assert [product.sku for product in pune] == ["MUG-02", "TEA-500"]
+    assert (bool(pune), bool(bengaluru), pune["TEA-500"]) == (True, False, 40)
+    assert pune == Warehouse("PNQ1", "Mumbai") and pune != "PNQ1"
+    assert len({pune, Warehouse("PNQ1", "Mumbai")}) == 1
+    assert repr(pune) == "Warehouse('PNQ1', 'Pune', products=2)"
+
+
+def test_warehouse_errors(stocked: InventoryService) -> None:
+    """Unknown products, duplicates and overselling raise domain errors."""
+    pune = stocked.repository.get_warehouse("PNQ1")
+    with pytest.raises(UnknownProductError):
+        pune["JAR-750"]
+    with pytest.raises(UnknownProductError):
+        pune.product("JAR-750")
+    with pytest.raises(DuplicateProductError):
+        pune.add_product(pune.product("TEA-500"))
+    with pytest.raises(InsufficientStockError):
+        stocked.ship("PNQ1", "TEA-500", 41)
+
+
+def test_values_and_low_stock(stocked: InventoryService) -> None:
+    """Stock value and the low-stock list."""
+    pune = stocked.repository.get_warehouse("PNQ1")
+    assert pune.stock_value() == Money("9600")
+    assert [product.sku for product in pune.low_stock()] == ["MUG-02"]
+    assert stocked.total_value() == Money("9600")
+
+
+def test_repository_queries(stocked: InventoryService) -> None:
+    """Listing, lookup errors and movement filtering."""
+    repository = stocked.repository
+    assert [warehouse.code for warehouse in repository.list_warehouses()] == ["BLR1", "PNQ1"]
+    with pytest.raises(UnknownWarehouseError):
+        repository.get_warehouse("NOPE")
+    stocked.receive("PNQ1", "MUG-02", 3)
+    assert len(repository.movements()) == 2
+    assert [movement.sku for movement in repository.movements(sku="MUG-02")] == ["MUG-02"]
+
+
+def test_event_bus_dispatch() -> None:
+    """Handlers run for their exact event class only."""
+    bus = EventBus()
+    received: list[object] = []
+    bus.subscribe(LowStockAlert, received.append)
+    alert = LowStockAlert("PNQ1", "TEA-500", 3, 10)
+    assert bus.publish(alert) == 1 and received == [alert]
+    assert bus.publish(StockChanged("PNQ1", "TEA-500", 5, 3, MovementType.SHIPPED)) == 0
+
+
+def test_service_movements(stocked: InventoryService) -> None:
+    """Receive, ship, return and adjust all update stock and are recorded."""
+    assert stocked.ship("PNQ1", "TEA-500", 5) == 35
+    assert stocked.accept_return("PNQ1", "TEA-500", 2) == 37
+    assert stocked.adjust("PNQ1", "TEA-500", -4, "damaged") == 33
+    assert stocked.adjust("PNQ1", "TEA-500", 1, "recount") == 34
+    times = {movement.occurred_at for movement in stocked.repository.movements()}
+    assert times == {datetime(2026, 11, 7, 9, 30)}
+
+
+def test_low_stock_alert_only_when_crossing(stocked: InventoryService) -> None:
+    """One alert when the level is crossed, none for later sales."""
+    alerts: list[LowStockAlert] = []
+    changes: list[StockChanged] = []
+    stocked.events.subscribe(LowStockAlert, alerts.append)
+    stocked.events.subscribe(StockChanged, changes.append)
+    stocked.ship("PNQ1", "TEA-500", 25)  # 15 left: above the level
+    stocked.ship("PNQ1", "TEA-500", 6)  # 9 left: crosses 10
+    stocked.ship("PNQ1", "TEA-500", 1)  # 8 left: already low
+    assert [(alert.sku, alert.quantity) for alert in alerts] == [("TEA-500", 9)]
+    assert [change.new_quantity for change in changes] == [15, 9, 8]
+
+
+def test_transfer(stocked: InventoryService) -> None:
+    """Transfers check stock first and register the product at the destination."""
+    with pytest.raises(InsufficientStockError):
+        stocked.transfer("PNQ1", "BLR1", "TEA-500", 50)
+    assert "TEA-500" not in stocked.repository.get_warehouse("BLR1")
+    stocked.transfer("PNQ1", "BLR1", "TEA-500", 10)
+    stocked.transfer("PNQ1", "BLR1", "TEA-500", 5)  # destination already carries it
+    pune = stocked.repository.get_warehouse("PNQ1")
+    bengaluru = stocked.repository.get_warehouse("BLR1")
+    assert (pune["TEA-500"], bengaluru["TEA-500"]) == (25, 15)
+
+
+def test_stock_report(stocked: InventoryService) -> None:
+    """The report lists each product, flags low stock and ends with the total."""
+    assert stocked.stock_report("PNQ1") == [
+        "PNQ1 (Pune)",
+        "MUG-02       0  LOW",
+        "TEA-500     40",
+        "total INR 9,600.00",
+    ]
+
+
+def test_repository_protocol() -> None:
+    """The in-memory repository satisfies the Protocol structurally."""
+    assert isinstance(InMemoryInventoryRepository(), InventoryRepository)
+
+
+INVENTORY_TESTS = [
+    stocked,
+    test_product_validation,
+    test_product_requires_money,
+    test_movement_directions_and_deltas,
+    test_movement_validation,
+    test_error_payloads,
+    test_warehouse_container_protocol,
+    test_warehouse_errors,
+    test_values_and_low_stock,
+    test_repository_queries,
+    test_event_bus_dispatch,
+    test_service_movements,
+    test_low_stock_alert_only_when_crossing,
+    test_transfer,
+    test_stock_report,
+    test_repository_protocol,
+]
+
+
+def check_lab_4_3() -> None:
+    """The notebook's Lab 4.3 check cells, verbatim."""
+
+    def parametrized_with_ids(test: object, minimum_cases: int = 4) -> bool:
+        """Does test carry a parametrize mark with enough cases, each with a readable id?"""
+        for mark in getattr(test, "pytestmark", []):
+            if mark.name != "parametrize" or len(mark.args) < 2:
+                continue
+            cases = list(mark.args[1])
+            explicit_ids = "ids" in mark.kwargs or all(getattr(case, "id", None) for case in cases)
+            if len(cases) >= minimum_cases and explicit_ids:
+                return True
+        return False
+
+    MONEY_MUTANTS = {
+        "half-even rounding": (
+            "shop/money.py",
+            "rounding=ROUND_HALF_UP",
+            'rounding="ROUND_HALF_EVEN"',
+        ),
+        "no currency check": (
+            "shop/money.py",
+            "if other._currency != self._currency:",
+            "if False:",
+        ),
+        "floats accepted": ("shop/money.py", "if isinstance(amount, float):", "if False:"),
+        "reversed subtraction": (
+            "shop/money.py",
+            "Money(self._amount - other._amount",
+            "Money(other._amount - self._amount",
+        ),
+    }
+    money_source = lab_test_source(MONEY_TESTS)
+    run_checks(
+        [
+            ("tests pass on the real Money", lambda: run_lab_tests(money_source).green, True),
+            (
+                "test_money_rounding: 4+ cases with ids",
+                lambda: parametrized_with_ids(MONEY_TESTS[0]),
+                True,
+            ),
+            (
+                "test_money_arithmetic: 4+ cases with ids",
+                lambda: parametrized_with_ids(MONEY_TESTS[1]),
+                True,
+            ),
+            *[
+                (
+                    f"catches: {name}",
+                    lambda mutation=mutation: catches(money_source, mutation),
+                    True,
+                )
+                for name, mutation in MONEY_MUTANTS.items()
+            ],
+        ]
+    )
+
+    FIXTURE_CHECKS = textwrap.dedent("""
+    SEEN_CATALOGUES = []
+
+
+    def test_catalogue_contents(catalogue):
+        assert sorted(catalogue) == ["JAR-750", "MUG-02", "TEA-500"]
+        tea = catalogue["TEA-500"]
+        assert (tea.unit_price, tea.reorder_level) == (Money("240"), 10)
+        mug, jar = catalogue["MUG-02"], catalogue["JAR-750"]
+        assert (mug.unit_price, jar.reorder_level) == (Money("199"), 3)
+        SEEN_CATALOGUES.append(catalogue)
+
+
+    def test_catalogue_is_session_scoped(catalogue):
+        assert SEEN_CATALOGUES and SEEN_CATALOGUES[0] is catalogue
+
+
+    def test_repository_warehouses(repository):
+        places = [(w.code, w.city) for w in repository.list_warehouses()]
+        assert places == [("BLR1", "Bengaluru"), ("PNQ1", "Pune")]
+        assert all(len(w) == 3 and not w for w in repository.list_warehouses())
+
+
+    def test_clock_is_fixed(clock):
+        assert clock() == datetime(2026, 11, 7, 9, 30) == clock()
+
+
+    def test_make_service_receives_stock(make_service, clock):
+        service = make_service({"TEA-500": 40, "MUG-02": 6})
+        pune = service.repository.get_warehouse("PNQ1")
+        assert (pune["TEA-500"], pune["MUG-02"], pune["JAR-750"]) == (40, 6, 0)
+        assert {movement.occurred_at for movement in service.repository.movements()} == {clock()}
+
+
+    def test_isolation_part_1(make_service):
+        service = make_service({"TEA-500": 5})
+        service.ship("PNQ1", "TEA-500", 2)
+        assert service.repository.get_warehouse("PNQ1")["TEA-500"] == 3
+
+
+    def test_isolation_part_2(repository):
+        assert repository.get_warehouse("PNQ1")["TEA-500"] == 0 and repository.movements() == []
+
+
+    def test_factory_shares_the_repository(make_service, repository):
+        first, second = make_service({"TEA-500": 40}), make_service({"TEA-500": 2})
+        assert first.repository is repository is second.repository
+        assert repository.get_warehouse("PNQ1")["TEA-500"] == 42
+
+
+    def test_each_service_has_its_own_event_bus(make_service):
+        first, second = make_service(), make_service()
+        alerts = []
+        first.events.subscribe(LowStockAlert, alerts.append)
+        first.receive("PNQ1", "MUG-02", 6)
+        first.ship("PNQ1", "MUG-02", 2)
+        assert first.events is not second.events
+        assert [(alert.sku, alert.quantity) for alert in alerts] == [("MUG-02", 4)]
+    """)  # dedent: the solutions file runs this cell inside a function
+
+    def fixture_outcome(test_name: str) -> str | None:
+        """Outcome of one hidden test run against the learner's fixtures."""
+        return run_lab_tests(
+            LAB_TEST_PRELUDE + FIXTURE_CHECKS, lab_test_source(INVENTORY_FIXTURES)
+        ).outcomes.get(test_name)
+
+    run_checks(
+        [
+            (
+                name.removeprefix("test_").replace("_", " "),
+                lambda name=name: fixture_outcome(name),
+                "passed",
+            )
+            for name in re.findall(r"^def (test_\w+)", FIXTURE_CHECKS, re.MULTILINE)
+        ]
+    )
+
+    RATE_MUTANTS = {
+        "missing timeout": ("shop/rates.py", ", timeout=5.0\n", "\n"),
+        "wrong query parameter": ("shop/rates.py", '"symbols": quote', '"symbol": quote'),
+        "Decimal(float)": (
+            "shop/rates.py",
+            'Decimal(str(response.json()["rates"][quote]))',
+            'Decimal(response.json()["rates"][quote])',
+        ),
+        "no status check": ("shop/rates.py", "if response.status_code != 200:", "if False:"),
+        "service called for same currency": ("shop/rates.py", "if base == quote:", "if False:"),
+    }
+    rate_source = lab_test_source(RATE_TESTS)
+    run_checks(
+        [
+            ("tests pass on the real client", lambda: run_lab_tests(rate_source).green, True),
+            (
+                "tests use unittest.mock",
+                lambda: bool(
+                    re.search(r"\bmock\.|Mock\(|patch", "".join(map(source_of, RATE_TESTS)))
+                ),
+                True,
+            ),
+            *[
+                (f"catches: {name}", lambda mutation=mutation: catches(rate_source, mutation), True)
+                for name, mutation in RATE_MUTANTS.items()
+            ],
+        ]
+    )
+
+    BILL_MUTANTS = {
+        "leftover to the last people": (
+            "shop/billing.py",
+            "(1 if index < leftover_paise else 0)",
+            "(1 if index >= people_count - leftover_paise else 0)",
+        ),
+        "leftover dropped": ("shop/billing.py", "(1 if index < leftover_paise else 0)", "0"),
+        "zero people accepted": ("shop/billing.py", "if people_count < 1:", "if people_count < 0:"),
+        "float conversion": (
+            "shop/billing.py",
+            "int(Decimal(total_amount).quantize(PAISE, rounding=ROUND_HALF_UP) * 100)",
+            "int(float(total_amount) * 100)",
+        ),
+    }
+    bill_source = lab_test_source(SPLIT_BILL_TESTS)
+    hypothesis_ready = importlib.util.find_spec("hypothesis") is not None
+    if not hypothesis_ready:
+        print("SKIP: hypothesis is not installed (uv add --dev hypothesis)")
+    run_checks(
+        [
+            (
+                "every test uses @given",
+                lambda: all(
+                    getattr(test, "is_hypothesis_test", False) for test in SPLIT_BILL_TESTS
+                ),
+                True,
+            ),
+            ("tests pass on the real split_bill", lambda: run_lab_tests(bill_source).green, True),
+            *[
+                (f"catches: {name}", lambda mutation=mutation: catches(bill_source, mutation), True)
+                for name, mutation in BILL_MUTANTS.items()
+            ],
+        ]
+    )
+
+    def json_log_lines() -> list[dict[str, object]]:
+        """Apply the learner's config, emit six records, return the parsed JSON lines."""
+        stream = io.StringIO()
+        logging.config.dictConfig(build_logging_config(stream))
+        orders, payments = logging.getLogger("shop.orders"), logging.getLogger("shop.payments")
+        try:
+            orders.debug("cart recalculated")
+            orders.info("order %s placed", 7, extra={"order_id": 7, "customer": "Asha"})
+            orders.info("GET /health 200")
+            payments.info("payment authorised")
+            payments.warning("payment retry %d/3", 2)
+            try:
+                _ = 1 / 0
+            except ZeroDivisionError:
+                orders.exception("charging order %s failed", 8)
+        finally:
+            for name in ("shop", "shop.orders", "shop.payments"):
+                logger = logging.getLogger(name)
+                for handler in logger.handlers[:]:
+                    logger.removeHandler(handler)
+                logger.setLevel(logging.NOTSET)
+                logger.propagate = True
+        return [json.loads(line) for line in stream.getvalue().splitlines()]
+
+    STANDARD_KEYS = set(vars(logging.makeLogRecord({}))) - {"message"}
+    UTC_ISO = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?\+00:00"
+    run_checks(
+        [
+            (
+                "three lines (DEBUG, /health and payments INFO dropped)",
+                lambda: len(json_log_lines()),
+                3,
+            ),
+            (
+                "line 1 fields",
+                lambda: {
+                    key: json_log_lines()[0].get(key) for key in ("level", "logger", "message")
+                },
+                {"level": "INFO", "logger": "shop.orders", "message": "order 7 placed"},
+            ),
+            (
+                "line 1 extras",
+                lambda: (json_log_lines()[0].get("order_id"), json_log_lines()[0].get("customer")),
+                (7, "Asha"),
+            ),
+            (
+                "time is UTC ISO 8601",
+                lambda: all(
+                    re.fullmatch(UTC_ISO, str(line.get("time"))) is not None
+                    for line in json_log_lines()
+                ),
+                True,
+            ),
+            (
+                "no standard attributes leak",
+                lambda: sorted(STANDARD_KEYS & set(json_log_lines()[0])),
+                [],
+            ),
+            (
+                "no exception key without exc_info",
+                lambda: "exception" in json_log_lines()[0],
+                False,
+            ),
+            (
+                "line 2 from shop.payments",
+                lambda: (
+                    json_log_lines()[1].get("logger"),
+                    json_log_lines()[1].get("message"),
+                    json_log_lines()[1].get("level"),
+                ),
+                ("shop.payments", "payment retry 2/3", "WARNING"),
+            ),
+            (
+                "line 3 has the traceback",
+                lambda: (
+                    json_log_lines()[2].get("level"),
+                    "ZeroDivisionError" in str(json_log_lines()[2].get("exception")),
+                ),
+                ("ERROR", True),
+            ),
+        ]
+    )
+
+    def lab_pdb_session(commands: list[str]) -> list[tuple[str, str]]:
+        """Run `python -m pdb coupon.py` with commands; return (command, its output) pairs."""
+        completed = subprocess.run(
+            [sys.executable, "-m", "pdb", "coupon.py"],
+            cwd=COUPON_DIR,
+            input="\n".join(commands) + "\n",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+            env={**os.environ, "PYTHON_COLORS": "0", "NO_COLOR": "1"},
+        )
+        transcript = completed.stdout.replace(str(COUPON_DIR), "<lab>").replace(
+            sys.base_prefix, "<python>"
+        )
+        pieces = transcript.split("(Pdb) ")
+        return [
+            (command, pieces[index + 1] if index + 1 < len(pieces) else "")
+            for index, command in enumerate(commands)
+        ]
+
+    def run_fixed_coupon(line_number: int, fixed_line: str) -> str:
+        """Replace one line of coupon.py (keeping its indentation) and run the result."""
+        lines = (COUPON_DIR / "coupon.py").read_text().splitlines()
+        original = lines[line_number - 1]
+        lines[line_number - 1] = (
+            original[: len(original) - len(original.lstrip())] + fixed_line.strip()
+        )
+        (COUPON_DIR / "coupon_fixed.py").write_text("\n".join(lines) + "\n")
+        completed = subprocess.run(
+            [sys.executable, "coupon_fixed.py"],
+            cwd=COUPON_DIR,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return (completed.stdout + completed.stderr).strip()
+
+    def printed(session: list[tuple[str, str]], name: str, value: str) -> bool:
+        """Did a p/pp/display command mentioning name print value?"""
+        return any(
+            re.match(rf"(p|pp|print|display)\b.*\b{name}\b", command.strip())
+            and re.search(rf"\b{value}\b", output)
+            for command, output in session
+        )
+
+    run_checks(
+        [
+            (
+                "stopped inside apply_coupon",
+                lambda: any(
+                    "apply_coupon()" in output
+                    for _, output in lab_pdb_session(coupon_debug_commands())
+                ),
+                True,
+            ),
+            (
+                "printed percent (10)",
+                lambda: printed(lab_pdb_session(coupon_debug_commands()), "percent", "10"),
+                True,
+            ),
+            (
+                "printed discount (67900)",
+                lambda: printed(lab_pdb_session(coupon_debug_commands()), "discount", "67900"),
+                True,
+            ),
+            (
+                "showed the call stack",
+                lambda: any(
+                    command.strip() in {"w", "where", "bt"} and "checkout()" in output
+                    for command, output in lab_pdb_session(coupon_debug_commands())
+                ),
+                True,
+            ),
+            ("bug line", lambda: coupon_bug_report()[0], 6),
+            ("fixed script prints 61110", lambda: run_fixed_coupon(*coupon_bug_report()), "61110"),
+        ]
+    )
+    try:
+        for command, output in lab_pdb_session(coupon_debug_commands()):
+            print(
+                f"(Pdb) {command}\n{textwrap.indent(output.rstrip(), '      ')}"
+                if output.strip()
+                else f"(Pdb) {command}"
+            )
+    except Exception as error:  # the transcript must never stop Run All
+        print(f"(no session yet: {type(error).__name__})")
+
+    INVENTORY_MUTANTS = {
+        "alert on every low sale": (
+            "shop/inventory.py",
+            "if old_quantity > reorder_level >= new_quantity:",
+            "if reorder_level >= new_quantity:",
+        ),
+        "adjustment sign ignored": (
+            "shop/inventory.py",
+            "if self.movement_type is MovementType.ADJUSTED:\n                return self.quantity",
+            "if self.movement_type is MovementType.ADJUSTED:\n"
+            "                return abs(self.quantity)",
+        ),
+    }
+    inventory_source = lab_test_source(INVENTORY_TESTS)
+
+    def inventory_coverage_run() -> LabRun:
+        return run_lab_tests(inventory_source, coverage_target="shop.inventory")
+
+    run_checks(
+        [
+            (
+                "at least 8 tests",
+                lambda: (
+                    len(
+                        [
+                            test
+                            for test in INVENTORY_TESTS
+                            if getattr(test, "__name__", "").startswith("test_")
+                        ]
+                    )
+                    >= 8
+                ),
+                True,
+            ),
+            ("all tests pass", lambda: inventory_coverage_run().green, True),
+            (
+                "branch coverage >= 90%",
+                lambda: (inventory_coverage_run().coverage_percent or 0) >= 90,
+                True,
+            ),
+            *[
+                (
+                    f"catches: {name}",
+                    lambda mutation=mutation: catches(inventory_source, mutation),
+                    True,
+                )
+                for name, mutation in INVENTORY_MUTANTS.items()
+            ],
+        ]
+    )
+    try:
+        print(f"branch coverage of shop/inventory.py: {inventory_coverage_run().coverage_percent}%")
+    except Exception as error:  # never stop Run All
+        print(f"coverage not measured: {type(error).__name__}")
+
+
+# ===============================================================================================
+# Lab 4.4 — helpers copied from the notebook's lab setup cell
+# ===============================================================================================
+
+LAB44_DIR = find_repo_root() / "notebooks" / "_scratch" / "unit44" / "lab"
+LAB44_DIR.mkdir(parents=True, exist_ok=True)
+MIB = 1024 * 1024
+
+
+# Lab 4.4 solutions -----------------------------------------------------------------------------
+
+# Exercise 1 ------------------------------------------------------------------------------------
+
+
+def find_large_files(root: Path, min_size_mb: float) -> list[tuple[str, int]]:
+    """Files of at least min_size_mb MiB under root, largest first."""
+    if not root.is_dir():
+        raise NotADirectoryError(f"{root} is not a directory")
+    threshold = min_size_mb * 1024 * 1024
+    found = [
+        (path.relative_to(root).as_posix(), size)
+        for path in root.rglob("*")
+        if not path.is_symlink() and path.is_file() and (size := path.stat().st_size) >= threshold
+    ]
+    return sorted(found, key=lambda item: (-item[1], item[0]))
+
+
+# Exercise 2 ------------------------------------------------------------------------------------
+
+NGINX_LOG_PATTERN = re.compile(
+    r"""
+    ^(?P<ip>\S+)                         # client address
+    \ \S+                                # identd (always '-')
+    \ (?P<user>\S+)                      # authenticated user or '-'
+    \ \[(?P<time>[^\]]+)\]               # [07/Nov/2026:09:30:00 +0530]
+    \ "(?P<method>[A-Z]+)                # "GET
+    \ (?P<path>\S+)                      #  /products/TEA-500?ref=home
+    \ (?P<protocol>HTTP/[\d.]+)"         #  HTTP/1.1"
+    \ (?P<status>\d{3})                  # 200
+    \ (?P<size>\d+|-)                    # bytes sent or '-'
+    \ "(?P<referrer>[^"]*)"              # "https://..." or "-"
+    \ "(?P<user_agent>[^"]*)"$           # "Mozilla/5.0 ..."
+    """,
+    re.VERBOSE,
+)
+
+
+def parse_access_line(line: str) -> dict[str, str | int | None] | None:
+    """One combined-format log line -> dict of fields, or None."""
+    log_match = NGINX_LOG_PATTERN.match(line)
+    if log_match is None:
+        return None
+    fields: dict[str, str | int | None] = dict(log_match.groupdict())
+    fields["status"] = int(log_match["status"])
+    fields["size"] = 0 if log_match["size"] == "-" else int(log_match["size"])
+    for key in ("user", "referrer"):
+        if fields[key] == "-":
+            fields[key] = None
+    return fields
+
+
+# Exercise 3 ------------------------------------------------------------------------------------
+
+
+def ist_to_utc(local_text: str) -> str:
+    """'YYYY-MM-DD HH:MM' in IST -> ISO 8601 in UTC."""
+    local = datetime.strptime(local_text, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+    return local.astimezone(UTC).isoformat()
+
+
+def utc_to_zone(utc_text: str, zone_name: str) -> str:
+    """ISO 8601 with offset -> ISO 8601 in zone_name."""
+    moment = datetime.fromisoformat(utc_text)
+    if moment.tzinfo is None:
+        raise ValueError(f"{utc_text!r} has no UTC offset")
+    return moment.astimezone(ZoneInfo(zone_name)).isoformat()
+
+
+def local_to_utc(local_text: str, zone_name: str) -> str:
+    """'YYYY-MM-DD HH:MM' wall-clock time in zone_name -> ISO 8601 in UTC."""
+    zone = ZoneInfo(zone_name)
+    wall_clock = datetime.strptime(local_text, "%Y-%m-%d %H:%M")
+    local = wall_clock.replace(tzinfo=zone, fold=0)  # fold=0: the earlier of two ambiguous times
+    round_trip = local.astimezone(UTC).astimezone(zone).replace(tzinfo=None)
+    if round_trip != wall_clock:
+        raise ValueError(f"{local_text} does not exist in {zone_name} (skipped by a DST change)")
+    return local.astimezone(UTC).isoformat()
+
+
+# Exercise 4 ------------------------------------------------------------------------------------
+
+
+def sign_webhook(secret: bytes, timestamp: int, body: bytes) -> str:
+    """'sha256=<hex>' signature of timestamp + '.' + body."""
+    digest = hmac.new(secret, f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+def verify_webhook(
+    secret: bytes,
+    timestamp: int,
+    body: bytes,
+    signature: str,
+    now: int,
+    tolerance_seconds: int = 300,
+) -> bool:
+    """True if the signature is valid and the timestamp is fresh."""
+    if abs(now - timestamp) > tolerance_seconds:
+        return False
+    return hmac.compare_digest(sign_webhook(secret, timestamp, body), signature)
+
+
+# Exercise 5 ------------------------------------------------------------------------------------
+
+
+def top_k(scores: Iterable[tuple[str, int]], k: int) -> list[tuple[str, int]]:
+    """The k highest (name, score) pairs, highest first, ties by name."""
+    if k <= 0:
+        return []
+    # nsmallest keeps a heap of only k items: (-score, name) puts high scores, then A-Z, first.
+    return heapq.nsmallest(k, scores, key=lambda pair: (-pair[1], pair[0]))
+
+
+# Exercise 6 ------------------------------------------------------------------------------------
+
+
+def build_batches(steps: Mapping[str, Iterable[str]]) -> list[list[str]]:
+    """Parallel batches of steps, each sorted alphabetically."""
+    sorter = graphlib.TopologicalSorter({step: list(needs) for step, needs in steps.items()})
+    try:
+        sorter.prepare()
+    except graphlib.CycleError as error:
+        raise ValueError(f"cycle: {' -> '.join(error.args[1])}") from error
+    batches = []
+    while sorter.is_active():
+        ready = sorted(sorter.get_ready())
+        batches.append(ready)
+        sorter.done(*ready)
+    return batches
+
+
+def build_order(steps: Mapping[str, Iterable[str]]) -> list[str]:
+    """All steps in a valid order (the batches, concatenated)."""
+    return [step for batch in build_batches(steps) for step in batch]
+
+
+# Exercise 7 ------------------------------------------------------------------------------------
+
+
+def _organizer_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="organize-files", exit_on_error=False)
+    commands = parser.add_subparsers(dest="command", required=True)
+    organize = commands.add_parser("organize", help="move files into subfolders")
+    organize.add_argument("folder", type=Path)
+    organize.add_argument("--by", choices=["extension", "month"], default="extension")
+    organize.add_argument("--dry-run", action="store_true")
+    summary = commands.add_parser("summary", help="count files per extension")
+    summary.add_argument("folder", type=Path)
+    return parser
+
+
+def _extension_of(path: Path) -> str:
+    return path.suffix.lower().removeprefix(".") or "no_extension"
+
+
+def _month_of(path: Path) -> str:
+    return datetime.fromtimestamp(path.stat().st_mtime, UTC).strftime("%Y-%m")
+
+
+def organizer_main(argv: list[str]) -> int:
+    """The file-organizer CLI; returns the exit code."""
+    try:
+        arguments = _organizer_parser().parse_args(argv)
+    except argparse.ArgumentError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    except SystemExit as exit_request:  # errors argparse still reports by exiting
+        return exit_request.code if isinstance(exit_request.code, int) else 2
+    folder: Path = arguments.folder
+    if not folder.is_dir():
+        print(f"error: {folder} is not a directory", file=sys.stderr)
+        return 2
+    files = sorted(
+        (path for path in folder.iterdir() if path.is_file() and not path.name.startswith(".")),
+        key=lambda path: path.name,
+    )
+    if arguments.command == "summary":
+        counts: dict[str, int] = {}
+        for path in files:
+            counts[_extension_of(path)] = counts.get(_extension_of(path), 0) + 1
+        for extension in sorted(counts):
+            print(f"{extension}: {counts[extension]}")
+        return 0
+    group_of = _month_of if arguments.by == "month" else _extension_of
+    verb = "would move" if arguments.dry_run else "moved"
+    for path in files:
+        target = folder / group_of(path) / path.name
+        if not arguments.dry_run:
+            target.parent.mkdir(exist_ok=True)
+            path.rename(target)
+        print(f"{verb} {path.name} -> {target.relative_to(folder).as_posix()}")
+    print(f"{len(files)} files {'would be moved' if arguments.dry_run else 'moved'}")
+    return 0
+
+
+def check_lab_4_4() -> None:
+    """The notebook's Lab 4.4 check cells, verbatim."""
+
+    def make_large_file_tree() -> Path:
+        """big.iso 5 MiB, two 2.5 MiB logs, edge.bin exactly 1 MiB, small files, a symlink."""
+        root = LAB44_DIR / "large_files"
+        shutil.rmtree(root, ignore_errors=True)
+        sizes = {
+            "big.iso": 5 * MIB,
+            "logs/app.log": 5 * MIB // 2,
+            "logs/old/app.1.log": 5 * MIB // 2,
+            "edge.bin": MIB,
+            "notes.txt": 10,
+            "logs/old/tiny.gz": 2048,
+        }
+        for relative_path, size in sizes.items():
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("wb") as handle:
+                handle.truncate(size)
+        (root / "big-link.iso").symlink_to("big.iso")
+        return root
+
+    large_root = make_large_file_tree()
+    run_checks(
+        [
+            (
+                "at least 1 MiB",
+                lambda: find_large_files(large_root, 1),
+                [
+                    ("big.iso", 5 * MIB),
+                    ("logs/app.log", 5 * MIB // 2),
+                    ("logs/old/app.1.log", 5 * MIB // 2),
+                    ("edge.bin", MIB),
+                ],
+            ),
+            ("at least 3 MiB", lambda: find_large_files(large_root, 3), [("big.iso", 5 * MIB)]),
+            (
+                "float threshold",
+                lambda: [path for path, _ in find_large_files(large_root, 2.5)],
+                ["big.iso", "logs/app.log", "logs/old/app.1.log"],
+            ),
+            ("nothing that large", lambda: find_large_files(large_root, 10), []),
+            (
+                "symlink skipped",
+                lambda: "big-link.iso" in [path for path, _ in find_large_files(large_root, 0)],
+                False,
+            ),
+            (
+                "root is a file",
+                lambda: raised_message(lambda: find_large_files(large_root / "notes.txt", 1)).split(
+                    ":"
+                )[0],
+                "NotADirectoryError",
+            ),
+        ]
+    )
+
+    GET_LINE = (
+        '203.0.113.7 - - [07/Nov/2026:09:30:00 +0530] "GET /products/TEA-500?ref=home HTTP/1.1" '
+        '200 5120 "https://shop.example.com/" "Mozilla/5.0 (X11; Linux x86_64)"'
+    )
+    POST_LINE = (
+        '198.51.100.23 - asha [07/Nov/2026:09:31:12 +0530] "POST /api/orders HTTP/2.0" '
+        '201 - "-" "curl/8.10.1"'
+    )
+    LOG_GROUPS = {
+        "ip",
+        "user",
+        "time",
+        "method",
+        "path",
+        "protocol",
+        "status",
+        "size",
+        "referrer",
+        "user_agent",
+    }
+    run_checks(
+        [
+            ("compiled with re.VERBOSE", lambda: bool(NGINX_LOG_PATTERN.flags & re.VERBOSE), True),
+            ("named groups", lambda: set(NGINX_LOG_PATTERN.groupindex), LOG_GROUPS),
+            (
+                "GET line",
+                lambda: parse_access_line(GET_LINE),
+                {
+                    "ip": "203.0.113.7",
+                    "user": None,
+                    "time": "07/Nov/2026:09:30:00 +0530",
+                    "method": "GET",
+                    "path": "/products/TEA-500?ref=home",
+                    "protocol": "HTTP/1.1",
+                    "status": 200,
+                    "size": 5120,
+                    "referrer": "https://shop.example.com/",
+                    "user_agent": "Mozilla/5.0 (X11; Linux x86_64)",
+                },
+            ),
+            (
+                "POST line: user, size '-', referrer '-'",
+                lambda: {
+                    key: parse_access_line(POST_LINE)[key]
+                    for key in ("user", "method", "status", "size", "referrer", "user_agent")
+                },
+                {
+                    "user": "asha",
+                    "method": "POST",
+                    "status": 201,
+                    "size": 0,
+                    "referrer": None,
+                    "user_agent": "curl/8.10.1",
+                },
+            ),
+            ("malformed line", lambda: parse_access_line("GET /index.html 200"), None),
+            (
+                "status must be 3 digits",
+                lambda: parse_access_line(GET_LINE.replace(" 200 ", " 20 ")),
+                None,
+            ),
+        ]
+    )
+
+    run_checks(
+        [
+            ("IST afternoon", lambda: ist_to_utc("2026-11-07 15:00"), "2026-11-07T09:30:00+00:00"),
+            (
+                "IST crosses midnight",
+                lambda: ist_to_utc("2026-01-01 03:00"),
+                "2025-12-31T21:30:00+00:00",
+            ),
+            (
+                "UTC -> IST",
+                lambda: utc_to_zone("2026-11-07T09:30:00+00:00", "Asia/Kolkata"),
+                "2026-11-07T15:00:00+05:30",
+            ),
+            (
+                "UTC -> New York before DST",
+                lambda: utc_to_zone("2026-03-06T14:00:00+00:00", "America/New_York"),
+                "2026-03-06T09:00:00-05:00",
+            ),
+            (
+                "UTC -> New York after DST",
+                lambda: utc_to_zone("2026-03-09T14:00:00+00:00", "America/New_York"),
+                "2026-03-09T10:00:00-04:00",
+            ),
+            (
+                "IST input -> London",
+                lambda: utc_to_zone("2026-07-01T19:30:00+05:30", "Europe/London"),
+                "2026-07-01T15:00:00+01:00",
+            ),
+            (
+                "naive input rejected",
+                lambda: raised_message(
+                    lambda: utc_to_zone("2026-11-07T09:30:00", "Asia/Kolkata")
+                ).split(":")[0],
+                "ValueError",
+            ),
+            (
+                "non-existent New York time",
+                lambda: raised_message(
+                    lambda: local_to_utc("2026-03-08 02:30", "America/New_York")
+                ).split(":")[0],
+                "ValueError",
+            ),
+            (
+                "ambiguous New York time: earlier",
+                lambda: local_to_utc("2026-11-01 01:30", "America/New_York"),
+                "2026-11-01T05:30:00+00:00",
+            ),
+            (
+                "London summer time",
+                lambda: local_to_utc("2026-07-01 09:00", "Europe/London"),
+                "2026-07-01T08:00:00+00:00",
+            ),
+        ]
+    )
+
+    SECRET, OTHER_SECRET = b"whsec_lab_secret", b"whsec_attacker_guess"
+    BODY = b'{"event": "payment.captured", "order_id": 7}'
+    SENT_AT = int(datetime(2026, 11, 7, 9, 30, tzinfo=UTC).timestamp())
+    EXPECTED_SIGNATURE = (
+        "sha256=" + hmac.new(SECRET, f"{SENT_AT}.".encode() + BODY, hashlib.sha256).hexdigest()
+    )
+    run_checks(
+        [
+            (
+                "signature format and value",
+                lambda: sign_webhook(SECRET, SENT_AT, BODY),
+                EXPECTED_SIGNATURE,
+            ),
+            (
+                "valid webhook",
+                lambda: verify_webhook(SECRET, SENT_AT, BODY, EXPECTED_SIGNATURE, SENT_AT + 30),
+                True,
+            ),
+            (
+                "tampered body",
+                lambda: verify_webhook(
+                    SECRET, SENT_AT, BODY.replace(b"7", b"8"), EXPECTED_SIGNATURE, SENT_AT
+                ),
+                False,
+            ),
+            (
+                "wrong secret",
+                lambda: verify_webhook(OTHER_SECRET, SENT_AT, BODY, EXPECTED_SIGNATURE, SENT_AT),
+                False,
+            ),
+            (
+                "timestamp is signed too",
+                lambda: verify_webhook(SECRET, SENT_AT + 1, BODY, EXPECTED_SIGNATURE, SENT_AT),
+                False,
+            ),
+            (
+                "stale (replayed) webhook",
+                lambda: verify_webhook(SECRET, SENT_AT, BODY, EXPECTED_SIGNATURE, SENT_AT + 301),
+                False,
+            ),
+            (
+                "from the future",
+                lambda: verify_webhook(SECRET, SENT_AT, BODY, EXPECTED_SIGNATURE, SENT_AT - 301),
+                False,
+            ),
+            (
+                "custom tolerance",
+                lambda: verify_webhook(
+                    SECRET, SENT_AT, BODY, EXPECTED_SIGNATURE, SENT_AT + 600, tolerance_seconds=900
+                ),
+                True,
+            ),
+            (
+                "uses hmac.compare_digest",
+                lambda: "compare_digest" in inspect.getsource(verify_webhook),
+                True,
+            ),
+        ]
+    )
+
+    LEADERBOARD = [("ravi", 75), ("meera", 90), ("john", 60), ("asha", 90), ("fatima", 82)]
+
+    def big_stream(count: int = 100_000):
+        """A seeded generator of (name, score) pairs; never materialized as a list."""
+        generator = random.Random(44)
+        for number in range(count):
+            yield f"customer-{number:06d}", generator.randint(0, 1_000_000)
+
+    def expected_top(pairs: list[tuple[str, int]], k: int) -> list[tuple[str, int]]:
+        return sorted(pairs, key=lambda pair: (-pair[1], pair[0]))[:k]
+
+    run_checks(
+        [
+            (
+                "top 3 with a tie",
+                lambda: top_k(LEADERBOARD, 3),
+                [("asha", 90), ("meera", 90), ("fatima", 82)],
+            ),
+            ("k = 1", lambda: top_k(LEADERBOARD, 1), [("asha", 90)]),
+            (
+                "k larger than the input",
+                lambda: top_k(LEADERBOARD, 10),
+                expected_top(LEADERBOARD, 10),
+            ),
+            ("k = 0", lambda: top_k(LEADERBOARD, 0), []),
+            ("generator input", lambda: top_k(iter(LEADERBOARD), 2), [("asha", 90), ("meera", 90)]),
+            (
+                "100,000-item stream",
+                lambda: top_k(big_stream(), 5),
+                expected_top(list(big_stream()), 5),
+            ),
+            ("uses heapq", lambda: "heapq" in inspect.getsource(top_k), True),
+        ]
+    )
+
+    PIPELINE = {
+        "package": ["test", "lint", "docs"],
+        "test": ["compile"],
+        "lint": [],
+        "docs": ["fetch"],
+        "compile": ["fetch"],
+    }
+    run_checks(
+        [
+            (
+                "batches",
+                lambda: build_batches(PIPELINE),
+                [["fetch", "lint"], ["compile", "docs"], ["test"], ["package"]],
+            ),
+            (
+                "order",
+                lambda: build_order(PIPELINE),
+                ["fetch", "lint", "compile", "docs", "test", "package"],
+            ),
+            ("implicit leaf step", lambda: build_order({"deploy": ["build"]}), ["build", "deploy"]),
+            (
+                "independent steps sorted",
+                lambda: build_batches({"b": [], "c": [], "a": []}),
+                [["a", "b", "c"]],
+            ),
+            ("empty", lambda: build_order({}), []),
+            (
+                "cycle message",
+                lambda: (
+                    re.fullmatch(
+                        r"ValueError: cycle: \w+( -> \w+)+",
+                        raised_message(
+                            lambda: build_order({"migrate": ["seed"], "seed": ["migrate"]})
+                        ),
+                    )
+                    is not None
+                ),
+                True,
+            ),
+            (
+                "cycle in batches too",
+                lambda: raised_message(
+                    lambda: build_batches({"a": ["b"], "b": ["c"], "c": ["a"]})
+                ).split(":")[0],
+                "ValueError",
+            ),
+        ]
+    )
+
+    ORGANIZER_FILES = {
+        "Invoice.PDF": (2026, 10, 30),
+        "photo.jpg": (2026, 11, 2),
+        "notes.txt": (2026, 11, 5),
+        "README": (2026, 9, 1),
+        "data.csv": (2026, 11, 6),
+        ".hidden": (2026, 11, 7),
+    }
+
+    def make_messy_folder() -> Path:
+        """Six files (one hidden) with fixed modification times, plus a subfolder."""
+        folder = LAB44_DIR / "messy"
+        shutil.rmtree(folder, ignore_errors=True)
+        (folder / "existing").mkdir(parents=True)
+        (folder / "existing" / "keep.txt").write_text("untouched", encoding="utf-8")
+        for name, (year, month, day) in ORGANIZER_FILES.items():
+            (folder / name).write_text(name, encoding="utf-8")
+            stamp = datetime(year, month, day, 12, tzinfo=UTC).timestamp()
+            os.utime(folder / name, (stamp, stamp))
+        return folder
+
+    def run_organizer(*arguments: str) -> tuple[int, list[str], str]:
+        """(exit code, stdout lines, stderr); "messy"/"missing" are folders in the lab folder."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exit_code = organizer_main(
+                [
+                    str(LAB44_DIR / argument) if argument in ("messy", "missing") else argument
+                    for argument in arguments
+                ]
+            )
+        return exit_code, stdout.getvalue().splitlines(), stderr.getvalue()
+
+    def folder_listing() -> list[str]:
+        folder = LAB44_DIR / "messy"
+        return sorted(
+            path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file()
+        )
+
+    def dry_run_then_listing() -> tuple[tuple[int, list[str], str], list[str]]:
+        make_messy_folder()
+        return run_organizer("organize", "messy", "--dry-run"), folder_listing()
+
+    def organize_then_listing(*options: str) -> tuple[list[str], list[str]]:
+        make_messy_folder()
+        return run_organizer("organize", "messy", *options)[1], folder_listing()
+
+    BY_EXTENSION = [
+        "Invoice.PDF -> pdf/Invoice.PDF",
+        "README -> no_extension/README",
+        "data.csv -> csv/data.csv",
+        "notes.txt -> txt/notes.txt",
+        "photo.jpg -> jpg/photo.jpg",
+    ]
+    run_checks(
+        [
+            (
+                "summary",
+                lambda: (make_messy_folder(), run_organizer("summary", "messy"))[1],
+                (0, ["csv: 1", "jpg: 1", "no_extension: 1", "pdf: 1", "txt: 1"], ""),
+            ),
+            (
+                "dry run output",
+                lambda: dry_run_then_listing()[0],
+                (
+                    0,
+                    [f"would move {line}" for line in BY_EXTENSION] + ["5 files would be moved"],
+                    "",
+                ),
+            ),
+            (
+                "dry run changes nothing",
+                lambda: dry_run_then_listing()[1],
+                sorted([*ORGANIZER_FILES, "existing/keep.txt"]),
+            ),
+            (
+                "organize by extension",
+                lambda: organize_then_listing()[0],
+                [f"moved {line}" for line in BY_EXTENSION] + ["5 files moved"],
+            ),
+            (
+                "files really moved",
+                lambda: organize_then_listing()[1],
+                [
+                    ".hidden",
+                    "csv/data.csv",
+                    "existing/keep.txt",
+                    "jpg/photo.jpg",
+                    "no_extension/README",
+                    "pdf/Invoice.PDF",
+                    "txt/notes.txt",
+                ],
+            ),
+            (
+                "organize by month",
+                lambda: organize_then_listing("--by", "month")[0],
+                [
+                    "moved Invoice.PDF -> 2026-10/Invoice.PDF",
+                    "moved README -> 2026-09/README",
+                    "moved data.csv -> 2026-11/data.csv",
+                    "moved notes.txt -> 2026-11/notes.txt",
+                    "moved photo.jpg -> 2026-11/photo.jpg",
+                    "5 files moved",
+                ],
+            ),
+            (
+                "missing folder",
+                lambda: run_organizer("organize", "missing"),
+                (2, [], f"error: {LAB44_DIR / 'missing'} is not a directory\n"),
+            ),
+            ("bad --by value", lambda: run_organizer("organize", "messy", "--by", "size")[0], 2),
+        ]
+    )
+
+
 if __name__ == "__main__":
-    for lab_title, check_lab in [("Lab 4.1", check_lab_4_1), ("Lab 4.2", check_lab_4_2)]:
+    selected = set(sys.argv[1:])
+    for lab_title, check_lab in [
+        ("Lab 4.1", check_lab_4_1),
+        ("Lab 4.2", check_lab_4_2),
+        ("Lab 4.3", check_lab_4_3),
+        ("Lab 4.4", check_lab_4_4),
+    ]:
+        if selected and lab_title not in selected:
+            continue
         print(f"===== {lab_title} =====")
         check_lab()
