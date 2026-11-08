@@ -1,0 +1,79 @@
+[project]
+name = "log-analyzer-psbcg433"
+version = "0.1.0"
+description = "Analyze web-server access logs (plain or gzip) and export them to CSV, JSON or SQLite."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "psbcg433" }]
+keywords = ["access-log", "log-analysis", "cli", "sqlite", "csv"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: System :: Logging",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Source = "https://github.com/psbcg433/python-atlas/tree/main/projects/log-analyzer"
+Issues = "https://github.com/psbcg433/python-atlas/issues"
+
+[project.scripts]
+log-analyzer = "log_analyzer.cli:main"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.170.15",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "log_analyzer"
+# The sdist also carries the tests, so anyone building from source can run them.
+source-include = ["tests/**"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--cov=log_analyzer",
+    "--cov-report=term-missing",
+    "--cov-fail-under=90",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["log_analyzer"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = ["if __name__ == .__main__.:", "assert_never\\(", "raise AssertionError"]

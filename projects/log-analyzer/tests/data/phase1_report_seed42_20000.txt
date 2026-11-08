@@ -1,0 +1,33 @@
+=====================ACCESS LOG REPORT======================
+Lines read                                            20,000
+Records parsed                                        19,569
+Malformed lines                                          431
+Overall p95 latency (ms)                                 225
+Status codes -----------------------------------------------
+Status  Class                        Requests          Share
+200     success                        15,690          80.2%
+201     success                           982           5.0%
+204     success                           384           2.0%
+304     redirect                          612           3.1%
+400     client error                      575           2.9%
+401     client error                      187           1.0%
+404     client error                      580           3.0%
+429     client error                      197           1.0%
+500     server error                      164           0.8%
+502     server error                       98           0.5%
+503     server error                      100           0.5%
+Top endpoints ----------------------------------------------
+Endpoint                               Requests       p95 ms
+GET /api/products                         5,904          120
+GET /api/products/{id}                    4,798           74
+POST /api/cart/items                      2,417          181
+GET /health                               2,051            6
+GET /api/orders/{id}                      1,928          245
+Malformed lines by reason ----------------------------------
+status out of range                                      110
+unknown method                                           105
+unrecognized format                                      216
+  e.g. line 64: '-'                                         
+  e.g. line 127: '2026-11-06T09:01:46Z 10.0.2.31 "GET /api/…
+  e.g. line 232: '-'                                        
+============================================================

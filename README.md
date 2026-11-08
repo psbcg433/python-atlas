@@ -44,12 +44,13 @@ every chapter.
 
 ```text
 .
+├── .github/workflows/    # CI: log-analyzer.yml tests and publishes the Phase 4 package
 ├── pyproject.toml        # project metadata, dependencies, ruff config
 ├── .python-version       # pins Python 3.15
 ├── uv.lock               # exact dependency versions and hashes
 ├── notebooks/            # one .ipynb per phase
 ├── notes/                # textbook-style study notes: notes/phaseN/
-├── projects/             # code that outgrows a notebook: pyinspect/ (Phase 3), FastAPI apps later
+├── projects/             # code that outgrows a notebook: pyinspect/ (Phase 3), log-analyzer/ (Phase 4), FastAPI apps later
 ├── exercises/solutions/  # lab reference solutions: phaseN_solutions.py
 └── scripts/              # notebook build scripts: nb_builder.py, phaseN/build.py, phaseN/unit_N_M.py
 ```
@@ -107,7 +108,7 @@ uv run python exercises/solutions/phase0_solutions.py
 | 1 | `phase1_language_fundamentals.ipynb` | Done | [Done](notes/phase1/README.md) |
 | 2 | `phase2_oop_data_model.ipynb` | Done | — |
 | 3 | `phase3_python_internals.ipynb` | Done (project: [`projects/pyinspect/`](projects/pyinspect/)) | — |
-| 4 | `phase4_professional_python.ipynb` | In progress (units 4.1–4.2) | — |
+| 4 | `phase4_professional_python.ipynb` | Done (project: [`projects/log-analyzer/`](projects/log-analyzer/), CI in `.github/workflows/log-analyzer.yml`) | — |
 | 5 | `phase5_concurrency_performance.ipynb` | Not started | — |
 | 6 | `phase6_web_fastapi.ipynb` | Not started | — |
 | — | `capstone_task_tracker.ipynb` | Not started | — |
