@@ -13,12 +13,15 @@ import annotationlib
 import argparse
 import base64
 import contextlib
+import csv
+import dataclasses
 import email.parser
 import functools
 import graphlib
 import hashlib
 import heapq
 import hmac
+import http.server
 import importlib.util
 import inspect
 import io
@@ -32,26 +35,41 @@ import re
 import shlex
 import shutil
 import socket
+import sqlite3
+import struct
 import subprocess
 import sys
+import tempfile
 import textwrap
+import threading
 import time
 import tomllib
 import typing
+import urllib.parse
+import uuid
+import wave
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Annotated, Literal, get_type_hints, overload
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import httpx
+import polars as pl
 import pytest
+import tenacity
+import typer
 from hypothesis import given
 from hypothesis import strategies as st
+from jinja2 import Environment, select_autoescape
+from pydantic import AwareDatetime, BaseModel, Field, PositiveInt, ValidationError
+from rich.console import Console
+from rich.table import Table
 
 type TestCase = tuple[str, Callable[[], object], object]
 
@@ -3852,6 +3870,885 @@ def check_lab_4_4() -> None:
     )
 
 
+# ===============================================================================================
+# Lab 4.5 — helpers copied from the notebook's lab setup cell
+# ===============================================================================================
+
+LAB45_DIR = find_repo_root() / "notebooks" / "_scratch" / "unit45" / "lab"
+LAB45_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Lab 4.5 solutions -------------------------------------------------------------------------
+
+# Exercise 1 ------------------------------------------------------------------------------------
+
+
+def tail(path: Path, n: int, chunk_size: int = 4096) -> list[str]:
+    """The last n lines of a UTF-8 file, read backwards in binary chunks."""
+    if n <= 0:
+        return []
+    with path.open("rb") as binary_file:
+        position = binary_file.seek(0, os.SEEK_END)
+        blocks: list[bytes] = []
+        newlines = 0
+        while position > 0 and newlines <= n:
+            step = min(chunk_size, position)
+            position -= step
+            binary_file.seek(position)
+            block = binary_file.read(step)
+            blocks.append(block)
+            newlines += block.count(b"\n")
+    text = b"".join(reversed(blocks)).decode("utf-8")
+    return text.splitlines()[-n:]
+
+
+# Exercise 2 ------------------------------------------------------------------------------------
+
+
+def write_json(path: Path, data: object) -> None:
+    """Atomically replace path with data as pretty-printed JSON."""
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"  # fails before touching disk
+    handle, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(text)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        os.unlink(temporary_name)
+        raise
+
+
+# Exercise 3 ------------------------------------------------------------------------------------
+
+
+def import_orders(csv_path: Path, connection: sqlite3.Connection) -> int:
+    """Import a CSV of orders in one transaction; return the number of rows."""
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS orders (order_id INTEGER PRIMARY KEY, customer TEXT,"
+        " sku TEXT, quantity INTEGER, unit_price TEXT)"
+    )
+    rows = []
+    with csv_path.open(newline="", encoding="utf-8") as csv_file:
+        for record in csv.DictReader(csv_file):
+            quantity_text = record["quantity"]
+            if not quantity_text.isdigit() or int(quantity_text) < 1:
+                raise ValueError(f"order {record['order_id']}: bad quantity {quantity_text!r}")
+            rows.append(
+                (
+                    int(record["order_id"]),
+                    record["customer"],
+                    record["sku"],
+                    int(quantity_text),
+                    str(Decimal(record["unit_price"])),
+                )
+            )
+    try:
+        with connection:  # one transaction: all rows or none
+            connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", rows)
+    except sqlite3.IntegrityError as error:
+        raise ValueError(f"{csv_path.name}: {error}") from error
+    return len(rows)
+
+
+# Exercise 4 ------------------------------------------------------------------------------------
+
+
+def parse_wav_header(data: bytes) -> dict[str, int | float]:
+    """Fields of a canonical 44-byte PCM WAV header."""
+    wav_header = struct.Struct("<4sI4s4sIHHIIHH4sI")
+    if len(data) < wav_header.size:
+        raise ValueError(f"need {wav_header.size} bytes, got {len(data)}")
+    (riff, _, wave_id, fmt, _, _, channels, sample_rate, byte_rate, _, bits, data_id, data_size) = (
+        wav_header.unpack_from(data)
+    )
+    if (riff, wave_id, fmt, data_id) != (b"RIFF", b"WAVE", b"fmt ", b"data"):
+        raise ValueError("not a canonical PCM WAV header")
+    return {
+        "channels": channels,
+        "sample_rate": sample_rate,
+        "bits_per_sample": bits,
+        "data_size": data_size,
+        "duration_seconds": round(data_size / byte_rate, 3),
+    }
+
+
+# Exercise 5 ------------------------------------------------------------------------------------
+
+
+class RichJSONEncoder(json.JSONEncoder):
+    """JSON for Decimal, datetime/date, UUID and dataclasses."""
+
+    def default(self, value: object) -> object:
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, datetime | date):
+            return value.isoformat()
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
+        return super().default(value)
+
+
+# Exercise 6 ------------------------------------------------------------------------------------
+
+
+def safe_extract_zip(archive: Path, destination: Path) -> list[str]:
+    """Extract archive into destination, refusing any member that escapes it."""
+    base = destination.resolve()
+    with zipfile.ZipFile(archive) as zip_file:
+        members = zip_file.infolist()
+        for member in members:
+            name = member.filename
+            parts = Path(name).parts
+            target = (base / name).resolve()
+            if Path(name).is_absolute() or ".." in parts or not target.is_relative_to(base):
+                raise ValueError(f"unsafe member {name!r}")
+        destination.mkdir(parents=True, exist_ok=True)
+        zip_file.extractall(destination)
+    return sorted(member.filename for member in members if not member.is_dir())
+
+
+def check_lab_4_5() -> None:
+    """The notebook's Lab 4.5 check cells, verbatim."""
+    big_log = LAB45_DIR / "big.log"
+    big_log.write_text(
+        "".join(f"line {number} ₹{number * 10}\n" for number in range(1, 20_001)), encoding="utf-8"
+    )
+    no_newline = LAB45_DIR / "no_newline.txt"
+    no_newline.write_text("first\nsecond\nthird", encoding="utf-8")
+    (LAB45_DIR / "empty.txt").write_text("", encoding="utf-8")
+    expected_tail = big_log.read_text(encoding="utf-8").splitlines()[-5:]
+    run_checks(
+        [
+            ("last 5 lines", lambda: tail(big_log, 5), expected_tail),
+            (
+                "tiny chunks (multi-byte split)",
+                lambda: tail(big_log, 5, chunk_size=7),
+                expected_tail,
+            ),
+            ("no trailing newline", lambda: tail(no_newline, 2), ["second", "third"]),
+            ("n larger than the file", lambda: tail(no_newline, 10), ["first", "second", "third"]),
+            ("empty file", lambda: tail(LAB45_DIR / "empty.txt", 3), []),
+            ("n = 0", lambda: tail(big_log, 0), []),
+            (
+                "uses seek, not read_text",
+                lambda: (
+                    "seek" in inspect.getsource(tail) and "read_text" not in inspect.getsource(tail)
+                ),
+                True,
+            ),
+        ]
+    )
+
+    json_dir = LAB45_DIR / "json_out"
+    shutil.rmtree(json_dir, ignore_errors=True)
+    json_dir.mkdir()
+    settings_target = json_dir / "settings.json"
+
+    def write_then_read(data: object) -> str:
+        write_json(settings_target, data)
+        return settings_target.read_text(encoding="utf-8")
+
+    def failed_write_keeps_old() -> tuple[str, str, list[str]]:
+        write_json(settings_target, {"currency": "₹"})
+        error = raised_message(lambda: write_json(settings_target, {"bad": {1, 2}}))
+        leftovers = sorted(path.name for path in json_dir.iterdir() if path.name != "settings.json")
+        return error.split(":")[0], settings_target.read_text(encoding="utf-8"), leftovers
+
+    run_checks(
+        [
+            (
+                "writes pretty JSON",
+                lambda: write_then_read({"gst": 18, "city": "Pune"}),
+                '{\n  "gst": 18,\n  "city": "Pune"\n}\n',
+            ),
+            ("keeps non-ASCII", lambda: write_then_read(["₹"]), '[\n  "₹"\n]\n'),
+            (
+                "overwrites",
+                lambda: (write_then_read({"v": 1}), write_then_read({"v": 2}))[1],
+                '{\n  "v": 2\n}\n',
+            ),
+            (
+                "failure leaves old file, no temp files",
+                failed_write_keeps_old,
+                ("TypeError", '{\n  "currency": "₹"\n}\n', []),
+            ),
+            (
+                "uses os.replace and fsync",
+                lambda: all(
+                    word in inspect.getsource(write_json) for word in ("os.replace", "fsync")
+                ),
+                True,
+            ),
+        ]
+    )
+
+    HEADER = "order_id,customer,sku,quantity,unit_price\n"
+    good_csv, bad_csv, duplicate_csv = (
+        LAB45_DIR / name for name in ("orders_good.csv", "orders_bad.csv", "orders_dup.csv")
+    )
+    good_csv.write_text(
+        HEADER
+        + '1,Asha,TEA-500,2,240.00\n2,O\'Brien,MUG-02,1,199.00\n3,"Rao, Ravi",JAR-750,3,350.50\n',
+        encoding="utf-8",
+    )
+    bad_csv.write_text(
+        HEADER + "4,Meera,TEA-500,1,240.00\n5,John,MUG-02,two,199.00\n", encoding="utf-8"
+    )
+    duplicate_csv.write_text(
+        HEADER + "6,Fatima,TEA-500,1,240.00\n1,Asha,TEA-500,9,240.00\n", encoding="utf-8"
+    )
+
+    def import_story() -> dict[str, object]:
+        database = sqlite3.connect(":memory:")
+        story: dict[str, object] = {"good": import_orders(good_csv, database)}
+        story["bad"] = raised_message(lambda: import_orders(bad_csv, database)).split(":")[0]
+        story["duplicate"] = raised_message(lambda: import_orders(duplicate_csv, database)).split(
+            ":"
+        )[0]
+        story["rows"] = database.execute(
+            "SELECT order_id, customer, quantity, unit_price FROM orders ORDER BY order_id"
+        ).fetchall()
+        database.close()
+        return story
+
+    run_checks(
+        [
+            ("rows inserted", lambda: import_story()["good"], 3),
+            (
+                "quotes and commas stored as data",
+                lambda: [row[1] for row in import_story()["rows"]],
+                ["Asha", "O'Brien", "Rao, Ravi"],
+            ),
+            ("types", lambda: import_story()["rows"][2], (3, "Rao, Ravi", 3, "350.50")),
+            ("invalid quantity -> ValueError", lambda: import_story()["bad"], "ValueError"),
+            ("duplicate id -> ValueError", lambda: import_story()["duplicate"], "ValueError"),
+            ("failed files insert nothing", lambda: len(import_story()["rows"]), 3),
+            (
+                "uses executemany with placeholders",
+                lambda: (
+                    "executemany" in inspect.getsource(import_orders)
+                    and "?" in inspect.getsource(import_orders)
+                ),
+                True,
+            ),
+        ]
+    )
+
+    def make_wav(channels: int, sample_rate: int, sample_width: int, frames: int) -> bytes:
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(sample_width)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(bytes(frames * channels * sample_width))
+        return buffer.getvalue()
+
+    run_checks(
+        [
+            (
+                "mono 8 kHz 16-bit",
+                lambda: parse_wav_header(make_wav(1, 8000, 2, 4000)),
+                {
+                    "channels": 1,
+                    "sample_rate": 8000,
+                    "bits_per_sample": 16,
+                    "data_size": 8000,
+                    "duration_seconds": 0.5,
+                },
+            ),
+            (
+                "stereo 44.1 kHz 16-bit",
+                lambda: parse_wav_header(make_wav(2, 44_100, 2, 44_100)),
+                {
+                    "channels": 2,
+                    "sample_rate": 44_100,
+                    "bits_per_sample": 16,
+                    "data_size": 176_400,
+                    "duration_seconds": 1.0,
+                },
+            ),
+            (
+                "8-bit",
+                lambda: parse_wav_header(make_wav(1, 22_050, 1, 11_025))["bits_per_sample"],
+                8,
+            ),
+            (
+                "not RIFF",
+                lambda: raised_message(
+                    lambda: parse_wav_header(b"RIFX" + make_wav(1, 8000, 2, 10)[4:])
+                ).split(":")[0],
+                "ValueError",
+            ),
+            (
+                "not WAVE",
+                lambda: raised_message(
+                    lambda: parse_wav_header(make_wav(1, 8000, 2, 10).replace(b"WAVE", b"AVI "))
+                ).split(":")[0],
+                "ValueError",
+            ),
+            (
+                "too short",
+                lambda: raised_message(lambda: parse_wav_header(b"RIFF")).split(":")[0],
+                "ValueError",
+            ),
+            ("uses struct", lambda: "struct" in inspect.getsource(parse_wav_header), True),
+        ]
+    )
+
+    @dataclasses.dataclass
+    class LabLine:
+        sku: str
+        price: Decimal
+
+    @dataclasses.dataclass
+    class LabOrder:
+        order_id: uuid.UUID
+        placed_at: datetime
+        lines: list[LabLine]
+
+    LAB_MOMENT = datetime(2026, 11, 7, 9, 30, tzinfo=UTC)
+    ORDER_ID = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    sample_order = LabOrder(ORDER_ID, LAB_MOMENT, [LabLine("TEA-500", Decimal("240.00"))])
+    run_checks(
+        [
+            (
+                "Decimal",
+                lambda: json.dumps({"total": Decimal("679.00")}, cls=RichJSONEncoder),
+                '{"total": "679.00"}',
+            ),
+            (
+                "datetime and date",
+                lambda: json.dumps([LAB_MOMENT, date(2026, 11, 7)], cls=RichJSONEncoder),
+                '["2026-11-07T09:30:00+00:00", "2026-11-07"]',
+            ),
+            (
+                "UUID",
+                lambda: json.dumps(ORDER_ID, cls=RichJSONEncoder),
+                '"12345678-1234-5678-1234-567812345678"',
+            ),
+            (
+                "nested dataclasses",
+                lambda: json.loads(json.dumps(sample_order, cls=RichJSONEncoder)),
+                {
+                    "order_id": str(ORDER_ID),
+                    "placed_at": "2026-11-07T09:30:00+00:00",
+                    "lines": [{"sku": "TEA-500", "price": "240.00"}],
+                },
+            ),
+            (
+                "dataclass class itself is not encoded",
+                lambda: raised_message(lambda: json.dumps(LabLine, cls=RichJSONEncoder)).split(":")[
+                    0
+                ],
+                "TypeError",
+            ),
+            (
+                "other types still fail",
+                lambda: raised_message(lambda: json.dumps({1, 2}, cls=RichJSONEncoder)).split(":")[
+                    0
+                ],
+                "TypeError",
+            ),
+        ]
+    )
+
+    def make_zip(name: str, members: dict[str, str]) -> Path:
+        path = LAB45_DIR / name
+        with zipfile.ZipFile(path, "w") as archive:
+            for member_name, text in members.items():
+                archive.writestr(member_name, text)
+        return path
+
+    def extract_into(archive: Path, folder_name: str) -> tuple[str, list[str]]:
+        destination = LAB45_DIR / folder_name
+        shutil.rmtree(destination, ignore_errors=True)
+        outcome = raised_message(lambda: safe_extract_zip(archive, destination))
+        written = (
+            sorted(
+                path.relative_to(destination).as_posix()
+                for path in destination.rglob("*")
+                if path.is_file()
+            )
+            if destination.exists()
+            else []
+        )
+        return outcome.split(":")[0], written
+
+    def read_if_exists(path: Path) -> str | None:
+        return path.read_text() if path.exists() else None
+
+    shutil.rmtree(LAB45_DIR / "extract_good", ignore_errors=True)  # start clean on every run
+    good_zip = make_zip(
+        "good.zip",
+        {"invoices/7.txt": "679.00", "invoices/8.txt": "240.00", "readme.txt": "hi", "empty/": ""},
+    )
+    run_checks(
+        [
+            (
+                "good archive",
+                lambda: safe_extract_zip(good_zip, LAB45_DIR / "extract_good"),
+                ["invoices/7.txt", "invoices/8.txt", "readme.txt"],
+            ),
+            (
+                "contents",
+                lambda: read_if_exists(LAB45_DIR / "extract_good" / "invoices" / "7.txt"),
+                "679.00",
+            ),
+            (
+                "'..' member",
+                lambda: extract_into(
+                    make_zip("dotdot.zip", {"ok.txt": "1", "../evil.txt": "x"}), "extract_dotdot"
+                ),
+                ("ValueError", []),
+            ),
+            (
+                "nested '..'",
+                lambda: extract_into(
+                    make_zip("nested.zip", {"a/../../evil.txt": "x"}), "extract_nested"
+                ),
+                ("ValueError", []),
+            ),
+            (
+                "absolute member",
+                lambda: extract_into(
+                    make_zip("absolute.zip", {"ok.txt": "1", "/tmp/evil.txt": "x"}),
+                    "extract_absolute",
+                ),
+                ("ValueError", []),
+            ),
+            ("nothing escaped", lambda: (LAB45_DIR.parent / "evil.txt").exists(), False),
+        ]
+    )
+
+
+# ===============================================================================================
+# Lab 4.6 — helpers copied from the notebook's lab setup cell
+# ===============================================================================================
+
+SHOP_API_PORT = 18046  # fixed so outputs (URLs in messages) are stable; falls back to any free port
+
+
+def demo_orders() -> list[dict[str, object]]:
+    """40 seeded orders as an API would return them, with 3 invalid records planted."""
+    generator = random.Random(46)
+    cities = ["Pune", "Mumbai", "Bengaluru", "Hubli & Dharwad"]
+    prices = {"TEA-500": "240.00", "MUG-02": "199.00", "JAR-750": "350.50", "KETTLE-9": "899.00"}
+    orders: list[dict[str, object]] = []
+    for order_id in range(1, 41):
+        sku = generator.choice(sorted(prices))
+        orders.append(
+            {
+                "order_id": order_id,
+                "customer": f"customer-{order_id:03d}",
+                "city": generator.choice(cities),
+                "sku": sku,
+                "quantity": generator.randint(1, 5),
+                "unit_price": prices[sku],
+                "placed_at": f"2026-11-{generator.randint(1, 7):02d}"
+                f"T{generator.randint(9, 20):02d}:00:00+05:30",
+            }
+        )
+    orders[6]["quantity"] = -2  # invalid: not positive
+    del orders[17]["city"]  # invalid: missing field
+    orders[29]["unit_price"] = "two hundred"  # invalid: not a number
+    return orders
+
+
+PRODUCTS_HTML = """<!doctype html>
+<html><head><title>Chai Corner - Products</title></head>
+<body>
+  <h1>Products</h1>
+  <ul id="catalogue">
+    <li class="product" data-sku="TEA-500">
+      <a href="/products/tea-500">Masala tea 500 g</a> <span class="price">₹240.00</span>
+    </li>
+    <li class="product" data-sku="MUG-02">
+      <a href="/products/mug-02">Steel mug</a> <span class="price">₹199.00</span>
+    </li>
+    <li class="product sold-out" data-sku="JAR-750">
+      <a href="/products/jar-750">Pickle jar 750 ml</a> <span class="price">₹350.50</span>
+    </li>
+  </ul>
+  <p class="note">Prices include GST &amp; free delivery above ₹500.</p>
+</body></html>
+"""
+ROBOTS_TXT = "User-agent: *\nDisallow: /admin/\nCrawl-delay: 1\n\nUser-agent: BadBot\nDisallow: /\n"
+
+
+class ShopAPIHandler(http.server.BaseHTTPRequestHandler):
+    """A tiny local HTTP API used by every HTTP demo (no external network)."""
+
+    protocol_version = "HTTP/1.1"  # keep-alive, so clients can reuse connections
+    hits: dict[str, int] = {}
+    connections = 0
+
+    def setup(self) -> None:
+        type(self).connections += 1  # one per TCP connection, not per request
+        super().setup()
+
+    def log_message(self, format: str, *args: object) -> None:  # keep the notebook quiet
+        pass
+
+    def _send(self, status: int, body: object, content_type: str = "application/json") -> None:
+        data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except BrokenPipeError, ConnectionResetError:  # the client gave up (a timeout demo)
+            self.close_connection = True
+
+    def _count(self, key: str) -> int:
+        self.hits[key] = self.hits.get(key, 0) + 1
+        return self.hits[key]
+
+    def do_GET(self) -> None:
+        url = urllib.parse.urlsplit(self.path)
+        query = dict(urllib.parse.parse_qsl(url.query))
+        parts = url.path.strip("/").split("/")
+        fail_first = int(query.get("fail", 0))
+        if url.path == "/rates":
+            base = query.get("base", "INR")
+            self._send(
+                200,
+                {
+                    "base": base,
+                    "date": "2026-11-07",
+                    "rates": {"USD": 0.012, "EUR": 0.011, "GBP": 0.0094},
+                },
+            )
+        elif url.path == "/orders":
+            if "key" in query and self._count(query["key"]) <= fail_first:
+                self._send(503, {"error": "service busy, try again"})
+            else:
+                self._send(200, demo_orders())
+        elif parts[0] == "flaky" and len(parts) == 2:
+            attempt = self._count(parts[1])
+            if attempt <= fail_first:
+                self._send(503, {"error": "busy", "attempt": attempt})
+            else:
+                self._send(200, {"ok": True, "attempt": attempt})
+        elif url.path == "/hits":
+            self._send(
+                200, {"key": query.get("key"), "hits": self.hits.get(query.get("key", ""), 0)}
+            )
+        elif url.path == "/connections":
+            self._send(200, {"connections": type(self).connections})
+        elif url.path == "/reset":
+            self.hits.clear()
+            self._send(200, {"reset": True})
+        elif url.path == "/slow":
+            time.sleep(float(query.get("seconds", "2")))
+            self._send(200, {"slow": True})
+        elif parts[0] == "status" and len(parts) == 2:
+            self._send(int(parts[1]), {"status": int(parts[1])})
+        elif url.path == "/headers":
+            self._send(
+                200,
+                {
+                    name.lower(): value
+                    for name, value in self.headers.items()
+                    if name.lower() in ("user-agent", "x-request-id", "authorization")
+                },
+            )
+        elif url.path == "/products.html":
+            self._send(200, PRODUCTS_HTML, "text/html")
+        elif url.path == "/robots.txt":
+            self._send(200, ROBOTS_TXT, "text/plain")
+        else:
+            self._send(404, {"error": f"no route {url.path}"})
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        payload = json.loads(self.rfile.read(length) or b"null")
+        self._send(201 if self.path == "/orders" else 200, {"received": payload})
+
+
+def start_shop_api() -> str:
+    """Start the local API once (in a daemon thread) and return its base URL."""
+    server = globals().get("_SHOP_API_SERVER")
+    if server is None:
+        try:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", SHOP_API_PORT), ShopAPIHandler)
+        except OSError:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ShopAPIHandler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        globals()["_SHOP_API_SERVER"] = server
+    return f"http://127.0.0.1:{server.server_address[1]}"
+
+
+LAB46_DIR = find_repo_root() / "notebooks" / "_scratch" / "unit46" / "lab"
+LAB46_DIR.mkdir(parents=True, exist_ok=True)
+LAB_API = start_shop_api()
+
+
+# Lab 4.6 solutions -------------------------------------------------------------------------
+
+# Exercise 1 ------------------------------------------------------------------------------------
+
+
+def _is_transient(error: BaseException) -> bool:
+    """Retry 5xx responses and transport errors (timeouts, refused connections); never 4xx."""
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code >= 500
+    return isinstance(error, httpx.TransportError)
+
+
+@tenacity.retry(
+    retry=tenacity.retry_if_exception(_is_transient),
+    stop=tenacity.stop_after_attempt(4),
+    wait=tenacity.wait_exponential(multiplier=0.01, max=0.05),
+    reraise=True,
+)
+def fetch_orders(client: httpx.Client, path: str = "/orders") -> list[dict[str, object]]:
+    """GET path and return the JSON list (retried by tenacity)."""
+    response = client.get(path)
+    response.raise_for_status()
+    return response.json()
+
+
+class OrderRecord(BaseModel):
+    """One validated order."""
+
+    order_id: PositiveInt
+    customer: str
+    city: str
+    sku: str
+    quantity: PositiveInt
+    unit_price: Annotated[Decimal, Field(gt=0)]
+    placed_at: AwareDatetime
+
+
+def validate_orders(raw: list[dict[str, object]]) -> tuple[list[OrderRecord], list[str]]:
+    """(valid records, one 'record {index}: ...' message per invalid record)."""
+    valid: list[OrderRecord] = []
+    problems: list[str] = []
+    for index, record in enumerate(raw):
+        try:
+            valid.append(OrderRecord.model_validate(record))
+        except ValidationError as error:
+            fields = ", ".join(".".join(map(str, issue["loc"])) for issue in error.errors())
+            problems.append(f"record {index}: invalid {fields}")
+    return valid, problems
+
+
+def summarize(records: list[OrderRecord]) -> pl.DataFrame:
+    """city, orders, units, revenue; sorted by revenue, highest first."""
+    frame = pl.DataFrame(
+        {
+            "city": [record.city for record in records],
+            "quantity": [record.quantity for record in records],
+            "revenue": [float(record.quantity * record.unit_price) for record in records],
+        }
+    )
+    return (
+        frame.group_by("city")
+        .agg(
+            pl.len().alias("orders"),
+            pl.col("quantity").sum().alias("units"),
+            pl.col("revenue").sum().round(2).alias("revenue"),
+        )
+        .sort(["revenue", "city"], descending=[True, False])
+    )
+
+
+def build_table(summary: pl.DataFrame) -> Table:
+    """A rich table titled 'Revenue by city'."""
+    table = Table(title="Revenue by city")
+    table.add_column("City")
+    for header in ("Orders", "Units", "Revenue (INR)"):
+        table.add_column(header, justify="right")
+    for row in summary.iter_rows(named=True):
+        table.add_row(row["city"], str(row["orders"]), str(row["units"]), f"{row['revenue']:,.2f}")
+    return table
+
+
+REPORT_TEMPLATE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Revenue by city</title></head>
+<body>
+<h1>Revenue by city</h1>
+<table>
+  <tr><th>City</th><th>Orders</th><th>Units</th><th>Revenue (INR)</th></tr>
+{%- for row in rows %}
+  <tr>
+    <td>{{ row.city }}</td><td>{{ row.orders }}</td><td>{{ row.units }}</td>
+    <td>{{ "{:,.2f}".format(row.revenue) }}</td>
+  </tr>
+{%- endfor %}
+</table>
+<p>Generated {{ generated_at.strftime("%Y-%m-%d %H:%M %Z") }}</p>
+</body></html>
+"""
+
+
+def render_report(summary: pl.DataFrame, generated_at: datetime) -> str:
+    """An autoescaped Jinja2 HTML report."""
+    environment = Environment(autoescape=select_autoescape(default_for_string=True, default=True))
+    template = environment.from_string(REPORT_TEMPLATE)
+    return template.render(rows=list(summary.iter_rows(named=True)), generated_at=generated_at)
+
+
+app = typer.Typer(add_completion=False)
+
+
+@app.command()
+def report(
+    base_url: Annotated[str, typer.Option(help="Base URL of the shop API.")],
+    path: Annotated[str, typer.Option(help="Orders endpoint.")] = "/orders",
+    output: Annotated[Path, typer.Option(help="Where to write the HTML report.")] = Path(
+        "report.html"
+    ),
+) -> None:
+    """Fetch orders, validate them, summarize by city, print a table and write a report."""
+    try:
+        with httpx.Client(base_url=base_url, timeout=5) as client:
+            raw = fetch_orders(client, path)
+    except httpx.HTTPError as error:
+        typer.echo(f"error: {error}")
+        raise typer.Exit(code=1) from error
+    valid, problems = validate_orders(raw)
+    summary = summarize(valid)
+    Console().print(build_table(summary))
+    output.write_text(render_report(summary, datetime.now(UTC)), encoding="utf-8")
+    typer.echo(
+        f"{len(valid)} valid orders, {len(problems)} rejected; report written to {output.name}"
+    )
+
+
+def check_lab_4_6() -> None:
+    """The notebook's Lab 4.6 check cells, verbatim."""
+    from typer.testing import CliRunner
+
+    def hits(key: str) -> int:
+        return httpx.get(f"{LAB_API}/hits", params={"key": key}, timeout=5).json()["hits"]
+
+    def fetch_story(key: str, fail: int) -> tuple[str, int]:
+        with httpx.Client(base_url=LAB_API, timeout=5) as client:
+            client.get("/reset")
+            try:
+                outcome = str(len(fetch_orders(client, f"/orders?key={key}&fail={fail}")))
+            except httpx.HTTPStatusError as error:
+                outcome = f"HTTPStatusError {error.response.status_code}"
+        return outcome, hits(key)
+
+    def not_found_story() -> str:
+        with httpx.Client(base_url=LAB_API, timeout=5) as client:
+            started = time.monotonic()
+            try:
+                fetch_orders(client, "/status/404")
+            except httpx.HTTPStatusError as error:
+                return f"{error.response.status_code} fast={time.monotonic() - started < 0.5}"
+        return "no error"
+
+    LAB_RAW = demo_orders()
+    VALID_RAW = [record for index, record in enumerate(LAB_RAW) if index not in (6, 17, 29)]
+    EXPECTED_REVENUE = {}
+    for record in VALID_RAW:
+        EXPECTED_REVENUE[record["city"]] = EXPECTED_REVENUE.get(
+            record["city"], Decimal(0)
+        ) + record["quantity"] * Decimal(record["unit_price"])
+    EXPECTED_ORDER = sorted(EXPECTED_REVENUE, key=lambda city: -EXPECTED_REVENUE[city])
+
+    def lab_summary() -> pl.DataFrame:
+        return summarize(validate_orders(LAB_RAW)[0])
+
+    def table_facts() -> tuple[object, ...]:
+        table = build_table(lab_summary())
+        return table.title, [str(column.header) for column in table.columns], table.row_count
+
+    def report_facts() -> tuple[object, ...]:
+        html = render_report(lab_summary(), datetime(2026, 11, 7, 9, 30, tzinfo=UTC))
+        return (
+            html.count("<tr"),
+            "Hubli &amp; Dharwad" in html,
+            "Hubli & Dharwad" in html,
+            "Generated 2026-11-07 09:30 UTC" in html,
+        )
+
+    def cli_story(path: str) -> tuple[int, bool, bool, bool]:
+        output = LAB46_DIR / "report.html"
+        output.unlink(missing_ok=True)
+        httpx.get(f"{LAB_API}/reset", timeout=5)
+        result = CliRunner().invoke(
+            app,
+            ["--base-url", LAB_API, "--path", path, "--output", str(output)],
+            env={"COLUMNS": "100", "NO_COLOR": "1"},
+        )
+        text = result.output
+        return (
+            result.exit_code,
+            "Revenue by city" in text,
+            "37 valid orders, 3 rejected; report written to report.html" in text,
+            output.exists(),
+        )
+
+    run_checks(
+        [
+            ("fetch: 2 failures then success", lambda: fetch_story("lab-ok", 2), ("40", 3)),
+            (
+                "fetch: gives up after 4 attempts",
+                lambda: fetch_story("lab-down", 9),
+                ("HTTPStatusError 503", 4),
+            ),
+            ("fetch: 404 is not retried", not_found_story, "404 fast=True"),
+            ("validate: 37 valid", lambda: len(validate_orders(LAB_RAW)[0]), 37),
+            (
+                "validate: problems name records 6, 17, 29",
+                lambda: [problem.split(":")[0] for problem in validate_orders(LAB_RAW)[1]],
+                ["record 6", "record 17", "record 29"],
+            ),
+            (
+                "OrderRecord types",
+                lambda: (
+                    type(validate_orders(LAB_RAW)[0][0].unit_price).__name__,
+                    validate_orders(LAB_RAW)[0][0].placed_at.utcoffset() is not None,
+                ),
+                ("Decimal", True),
+            ),
+            (
+                "summary columns",
+                lambda: lab_summary().columns,
+                ["city", "orders", "units", "revenue"],
+            ),
+            (
+                "summary order and revenue",
+                lambda: [
+                    (row["city"], row["revenue"]) for row in lab_summary().iter_rows(named=True)
+                ],
+                [(city, float(round(EXPECTED_REVENUE[city], 2))) for city in EXPECTED_ORDER],
+            ),
+            (
+                "summary counts",
+                lambda: (lab_summary()["orders"].sum(), lab_summary()["units"].sum()),
+                (37, sum(record["quantity"] for record in VALID_RAW)),
+            ),
+            (
+                "rich table",
+                table_facts,
+                (
+                    "Revenue by city",
+                    ["City", "Orders", "Units", "Revenue (INR)"],
+                    len(EXPECTED_ORDER),
+                ),
+            ),
+            (
+                "report: rows, escaping, timestamp",
+                report_facts,
+                (len(EXPECTED_ORDER) + 1, True, False, True),
+            ),
+            ("CLI success", lambda: cli_story("/orders"), (0, True, True, True)),
+            ("CLI HTTP error -> exit 1", lambda: cli_story("/status/404")[0], 1),
+        ]
+    )
+
+
 if __name__ == "__main__":
     selected = set(sys.argv[1:])
     for lab_title, check_lab in [
@@ -3859,6 +4756,8 @@ if __name__ == "__main__":
         ("Lab 4.2", check_lab_4_2),
         ("Lab 4.3", check_lab_4_3),
         ("Lab 4.4", check_lab_4_4),
+        ("Lab 4.5", check_lab_4_5),
+        ("Lab 4.6", check_lab_4_6),
     ]:
         if selected and lab_title not in selected:
             continue
