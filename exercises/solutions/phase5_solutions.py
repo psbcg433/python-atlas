@@ -12,12 +12,15 @@ like the notebook's %%writefile cells, this file writes them to notebooks/_scrat
 except the loose "the default build cannot reach 1.5x with threads" sanity check.
 Labs 5.3 and 5.4 are asyncio labs: their checks run in asyncio.run(), and their HTTP checks
 use httpx.MockTransport, so no server or network is needed.
+Lab 5.5 is a performance lab: speed checks use wide margins against much larger real gaps
+and print the measured ratios; memory checks compare tracemalloc peaks.
 """
 
 import asyncio
 import concurrent.futures
 import contextlib
 import contextvars
+import cProfile
 import functools
 import gc
 import hashlib
@@ -31,6 +34,7 @@ import logging
 import math
 import multiprocessing
 import os
+import pstats
 import queue
 import random
 import selectors
@@ -40,6 +44,8 @@ import subprocess
 import sys
 import threading
 import time
+import timeit
+import tracemalloc
 import uuid
 import warnings
 from collections import Counter, deque
@@ -2509,6 +2515,465 @@ def check_lab_5_4() -> None:
     asyncio.run(_lab_5_4_checks())
 
 
+# ----- Lab 5.5: setup and given code from the lab cells -----
+
+LAB55_DIR = PHASE5_DIR / "lab55"
+LAB55_CITIES = ("Pune", "Delhi", "Kochi", "Patna", "Surat", "Indore")
+LAB55_EVENT_TYPES = ("view", "click", "add_to_cart", "purchase")
+
+
+def make_lab_customers(count: int = 1_200, seed: int = 55) -> list[tuple[int, str, str]]:
+    """(customer_id, name, city) with shuffled, spread-out ids."""
+    rng = random.Random(seed)
+    customer_ids = rng.sample(range(10_000, 99_999), count)
+    return [(cid, f"Customer {n}", LAB55_CITIES[n % 6]) for n, cid in enumerate(customer_ids)]
+
+
+def make_lab_orders(
+    customers: list[tuple[int, str, str]], count: int, seed: int = 56
+) -> list[tuple[int, int, int]]:
+    """(order_id, customer_id, amount_paise) rows."""
+    rng = random.Random(seed)
+    return [
+        (order_id, rng.choice(customers)[0], rng.randrange(1_000, 500_000))
+        for order_id in range(count)
+    ]
+
+
+def write_events(path: Path, count: int, seed: int = 57) -> Path:
+    """Write a seeded CSV event log: timestamp,user_id,event,bytes."""
+    rng = random.Random(seed)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("timestamp,user_id,event,bytes\n")
+        for second in range(count):
+            event = rng.choice(LAB55_EVENT_TYPES)
+            user_id, size = rng.randrange(3_000), rng.randrange(200, 90_000)
+            handle.write(f"{1_767_225_600 + second},{user_id},{event},{size}\n")
+    return path
+
+
+def prepare_lab_5_5() -> tuple[list[tuple[int, str, str]], list[tuple[int, int, int]], Path]:
+    """Create the lab data: customers, orders and the event-log file."""
+    LAB55_DIR.mkdir(parents=True, exist_ok=True)
+    customers = make_lab_customers()
+    orders = make_lab_orders(customers, 4_000 * DEMO_SCALE)
+    events = write_events(LAB55_DIR / "events.csv", 60_000 * DEMO_SCALE)
+    return customers, orders, events
+
+
+def best_time_or_none(work: Callable[[], object], repeat: int = 3) -> float | None:
+    """Best of `repeat` single runs in seconds, or None if work raises (an unfinished stub)."""
+    try:
+        return min(timeit.repeat(work, number=1, repeat=repeat))
+    except Exception:
+        return None
+
+
+def lookup_customer(
+    customers: list[tuple[int, str, str]], customer_id: int
+) -> tuple[int, str, str]:
+    """Find a customer by id with a linear scan."""
+    for customer in customers:
+        if customer[0] == customer_id:
+            return customer
+    raise KeyError(customer_id)
+
+
+def city_totals_slow(
+    orders: list[tuple[int, int, int]], customers: list[tuple[int, str, str]]
+) -> dict[str, int]:
+    """Revenue (paise) per customer city, sorted by city name. Correct, but slow."""
+    totals: dict[str, int] = {}
+    for _order_id, customer_id, amount in orders:
+        city = lookup_customer(customers, customer_id)[2]
+        totals[city] = totals.get(city, 0) + amount
+    return dict(sorted(totals.items()))
+
+
+def count_pairs_quadratic(amounts: list[int], target: int) -> int:
+    """Pairs i < j with amounts[i] + amounts[j] == target, by brute force: O(n^2)."""
+    pair_count = 0
+    for first in range(len(amounts)):
+        for second in range(first + 1, len(amounts)):
+            if amounts[first] + amounts[second] == target:
+                pair_count += 1
+    return pair_count
+
+
+def growth_factor(count_pairs: Callable[[list[int], int], int], size: int) -> float | None:
+    """Best time at 4 x size divided by best time at size (about 4 for O(n), 16 for O(n^2))."""
+    rng = random.Random(58)
+    small, large = ([rng.randrange(1_000) for _ in range(n)] for n in (size, 4 * size))
+    small_time = best_time_or_none(lambda: count_pairs(small, 1_000))
+    large_time = best_time_or_none(lambda: count_pairs(large, 1_000))
+    return None if small_time is None or large_time is None else large_time / small_time
+
+
+def revenue_by_store_loop(store_ids: list[int], amounts: list[int], store_count: int) -> list[int]:
+    """Total amount per store id (0..store_count-1), with a Python loop."""
+    totals = [0] * store_count
+    for store_id, amount in zip(store_ids, amounts, strict=True):
+        totals[store_id] += amount
+    return totals
+
+
+def zscores_loop(values: list[float]) -> list[float]:
+    """Standard scores with the population standard deviation, with Python loops."""
+    mean = sum(values) / len(values)
+    spread = (sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5
+    return [(value - mean) / spread for value in values]
+
+
+def event_summary_eager(path: Path) -> dict[str, object]:
+    """Event counts, total bytes and distinct users, computed from all rows in memory."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    header = lines[0].split(",")
+    rows = [dict(zip(header, line.split(","), strict=True)) for line in lines[1:]]
+    return {
+        "events": dict(sorted(Counter(row["event"] for row in rows).items())),
+        "total_bytes": sum(int(row["bytes"]) for row in rows),
+        "unique_users": len({row["user_id"] for row in rows}),
+    }
+
+
+# ----- Lab 5.5: reference solutions -----
+
+
+def hottest_function(function: Callable[..., object], *args: object) -> str:
+    """Profile function(*args) once; return the name of the entry with the largest tottime."""
+    profiler = cProfile.Profile()
+    profiler.runcall(function, *args)
+    entries = pstats.Stats(
+        profiler
+    ).stats  # (file, line, name) -> (cc, nc, tottime, cumtime, callers)
+    (_file, _line, name), _timings = max(entries.items(), key=lambda entry: entry[1][2])
+    return name
+
+
+def city_totals_fast(
+    orders: list[tuple[int, int, int]], customers: list[tuple[int, str, str]]
+) -> dict[str, int]:
+    """Same result as city_totals_slow, without a scan per order."""
+    city_of = {
+        customer_id: city for customer_id, _name, city in customers
+    }  # built once: O(customers)
+    totals: dict[str, int] = {}
+    for _order_id, customer_id, amount in orders:
+        city = city_of[customer_id]  # O(1) instead of a linear scan
+        totals[city] = totals.get(city, 0) + amount
+    return dict(sorted(totals.items()))
+
+
+def count_pairs_linear(amounts: list[int], target: int) -> int:
+    """Same result as count_pairs_quadratic, in O(n)."""
+    seen: Counter[int] = Counter()
+    pair_count = 0
+    for amount in amounts:
+        pair_count += seen[target - amount]  # every earlier complement makes one pair
+        seen[amount] += 1
+    return pair_count
+
+
+def timing_table(
+    candidates: dict[str, Callable[[], object]], number: int = 1000, repeat: int = 5
+) -> list[tuple[str, float]]:
+    """(label, best seconds per call) for every candidate, fastest first."""
+    rows = [
+        (label, min(timeit.repeat(work, number=number, repeat=repeat)) / number)
+        for label, work in candidates.items()
+    ]
+    return sorted(rows, key=lambda row: row[1])
+
+
+def render_timing_table(rows: list[tuple[str, float]]) -> str:
+    """Markdown table: variant, time per call in µs, ratio to the fastest row."""
+    lines = ["| Variant | Time per call | Relative |", "| --- | ---: | ---: |"]
+    fastest = rows[0][1] if rows else 1.0
+    for label, seconds in rows:
+        lines.append(f"| {label} | {seconds * 1e6:,.2f} µs | {seconds / fastest:.2f}x |")
+    return "\n".join(lines)
+
+
+def revenue_by_store_numpy(
+    store_ids: np.ndarray, amounts: np.ndarray, store_count: int
+) -> np.ndarray:
+    """Vectorized revenue_by_store_loop: an int64 array of length store_count."""
+    totals = np.zeros(store_count, dtype=np.int64)
+    np.add.at(totals, store_ids, amounts)  # integer arithmetic: exact, repeated ids all added
+    return totals
+
+
+def zscores_numpy(values: np.ndarray) -> np.ndarray:
+    """Vectorized zscores_loop."""
+    return (values - values.mean()) / values.std()  # np.std is the population standard deviation
+
+
+def peak_memory(function: Callable[..., object], *args: object) -> tuple[object, int]:
+    """Call function(*args); return (result, peak traced bytes above the starting level)."""
+    started_here = not tracemalloc.is_tracing()
+    if started_here:
+        tracemalloc.start()
+    tracemalloc.reset_peak()
+    baseline = tracemalloc.get_traced_memory()[0]
+    try:
+        result = function(*args)
+        peak = tracemalloc.get_traced_memory()[1] - baseline
+    finally:
+        if started_here:
+            tracemalloc.stop()
+    return result, peak
+
+
+def event_summary_lean(path: Path) -> dict[str, object]:
+    """Same result as event_summary_eager, streaming the file."""
+    events: Counter[str] = Counter()
+    total_bytes = 0
+    users: set[str] = set()
+    with path.open(encoding="utf-8") as handle:
+        next(handle)  # header
+        for line in handle:
+            _timestamp, user_id, event, size = line.rstrip("\n").split(",")
+            events[event] += 1
+            total_bytes += int(size)
+            users.add(user_id)
+    return {
+        "events": dict(sorted(events.items())),
+        "total_bytes": total_bytes,
+        "unique_users": len(users),
+    }
+
+
+# ----- Lab 5.5: the notebook's check cells -----
+
+
+def check_lab_5_5() -> None:
+    """Run every Lab 5.5 check (the notebook's check cells; each prints PASS/FAIL)."""
+    LAB55_CUSTOMERS, LAB55_ORDERS, LAB55_EVENTS = prepare_lab_5_5()
+    print("--- Check exercise 1")
+    slow_totals = city_totals_slow(LAB55_ORDERS, LAB55_CUSTOMERS)
+    slow_seconds = best_time_or_none(lambda: city_totals_slow(LAB55_ORDERS, LAB55_CUSTOMERS))
+    fast_seconds = best_time_or_none(lambda: city_totals_fast(LAB55_ORDERS, LAB55_CUSTOMERS))
+    run_checks(
+        [
+            (
+                "profile finds the hot spot",
+                lambda: hottest_function(city_totals_slow, LAB55_ORDERS, LAB55_CUSTOMERS),
+                "lookup_customer",
+            ),
+            (
+                "built-ins are reported too",
+                lambda: "sorted" in hottest_function(sorted, list(range(200_000, 0, -1))),
+                True,
+            ),
+            (
+                "fast version: same totals",
+                lambda: city_totals_fast(LAB55_ORDERS, LAB55_CUSTOMERS),
+                slow_totals,
+            ),
+            (
+                "fast version: no longer dominated by lookup_customer",
+                lambda: (
+                    hottest_function(city_totals_fast, LAB55_ORDERS, LAB55_CUSTOMERS)
+                    != "lookup_customer"
+                ),
+                True,
+            ),
+            (
+                "fast version: at least 5x faster",
+                lambda: fast_seconds is not None and slow_seconds / fast_seconds >= 5,
+                True,
+            ),
+        ]
+    )
+    if fast_seconds:
+        print(
+            f"measured: slow {slow_seconds * 1000:.1f} ms, fast {fast_seconds * 1000:.2f} ms "
+            f"-> {slow_seconds / fast_seconds:.0f}x"
+        )
+    print("--- Check exercise 2")
+    pair_cases = [
+        ([], 10),
+        ([5], 10),
+        ([5, 5, 5], 10),
+        ([1, 9, 2, 8, 5, 5], 10),
+        ([-3, 13, 0, 10, 10], 10),
+        ([4, 4, 4, 4], 8),
+    ]
+    pair_rng = random.Random(59)
+    random_amounts = [pair_rng.randrange(-50, 150) for _ in range(1_500)]
+    linear_growth = growth_factor(count_pairs_linear, 50_000 * DEMO_SCALE)
+    run_checks(
+        [
+            *(
+                (
+                    f"pairs in {amounts} summing to {target}",
+                    lambda a=amounts, t=target: count_pairs_linear(a, t),
+                    count_pairs_quadratic(amounts, target),
+                )
+                for amounts, target in pair_cases
+            ),
+            (
+                "1 500 random amounts",
+                lambda: count_pairs_linear(random_amounts, 100),
+                count_pairs_quadratic(random_amounts, 100),
+            ),
+            (
+                "4x the input takes less than 8x the time",
+                lambda: linear_growth is not None and linear_growth < 8,
+                True,
+            ),
+        ]
+    )
+    if linear_growth:
+        print(f"measured growth for 4x the input: x{linear_growth:.1f} (O(n) ~ 4, O(n^2) ~ 16)")
+    print("--- Check exercise 3")
+    expected_table = (
+        "| Variant | Time per call | Relative |\n| --- | ---: | ---: |\n"
+        "| join | 12.34 µs | 1.00x |\n| plus | 24.68 µs | 2.00x |"
+    )
+    run_checks(
+        [
+            (
+                "render two rows",
+                lambda: render_timing_table([("join", 12.34e-6), ("plus", 24.68e-6)]),
+                expected_table,
+            ),
+            (
+                "render no rows",
+                lambda: render_timing_table([]),
+                "| Variant | Time per call | Relative |\n| --- | ---: | ---: |",
+            ),
+            (
+                "render a slow row",
+                lambda: render_timing_table([("a", 0.5e-6), ("b", 1.5e-3)]).splitlines()[-1],
+                "| b | 1,500.00 µs | 3000.00x |",
+            ),
+            (
+                "sorted fastest first",
+                lambda: [
+                    label
+                    for label, _ in timing_table(
+                        {"sleep": lambda: time.sleep(0.002), "noop": lambda: None},
+                        number=3,
+                        repeat=2,
+                    )
+                ],
+                ["noop", "sleep"],
+            ),
+            (
+                "seconds per call, not per batch",
+                lambda: (
+                    0.002
+                    <= timing_table({"sleep": lambda: time.sleep(0.002)}, number=3, repeat=2)[0][1]
+                    < 0.05
+                ),
+                True,
+            ),
+        ]
+    )
+    print("--- Check exercise 4")
+    vector_rng = random.Random(60)
+    sale_count = 200_000 * DEMO_SCALE
+    store_id_list = [
+        vector_rng.randrange(45) for _ in range(sale_count)
+    ]  # store ids 45..49 never sell
+    amount_list = [vector_rng.randrange(100, 900_000) for _ in range(sale_count)]
+    value_list = [vector_rng.gauss(500, 120) for _ in range(50_000)]
+    store_id_array, amount_array, value_array = (
+        np.array(store_id_list),
+        np.array(amount_list),
+        np.array(value_list),
+    )
+    expected_revenue = revenue_by_store_loop(store_id_list, amount_list, 50)
+    loop_seconds = best_time_or_none(lambda: revenue_by_store_loop(store_id_list, amount_list, 50))
+    numpy_seconds = best_time_or_none(
+        lambda: revenue_by_store_numpy(store_id_array, amount_array, 50)
+    )
+    run_checks(
+        [
+            (
+                "revenue matches the loop (exact)",
+                lambda: revenue_by_store_numpy(store_id_array, amount_array, 50).tolist(),
+                expected_revenue,
+            ),
+            (
+                "revenue dtype is int64",
+                lambda: revenue_by_store_numpy(store_id_array, amount_array, 50).dtype == np.int64,
+                True,
+            ),
+            (
+                "stores without sales are 0",
+                lambda: revenue_by_store_numpy(store_id_array, amount_array, 50)[45:].tolist(),
+                [0] * 5,
+            ),
+            (
+                "z-scores match the loop",
+                lambda: bool(np.allclose(zscores_numpy(value_array), zscores_loop(value_list))),
+                True,
+            ),
+            (
+                "z-scores have mean 0 and std 1",
+                lambda: [round(float(f(zscores_numpy(value_array))), 6) for f in (np.mean, np.std)],
+                [0.0, 1.0],
+            ),
+            (
+                "vectorized revenue at least 5x faster",
+                lambda: numpy_seconds is not None and loop_seconds / numpy_seconds >= 5,
+                True,
+            ),
+        ]
+    )
+    if numpy_seconds:
+        print(
+            f"measured: loop {loop_seconds * 1000:.1f} ms, NumPy {numpy_seconds * 1000:.2f} ms "
+            f"-> {loop_seconds / numpy_seconds:.0f}x"
+        )
+    print("--- Check exercise 5")
+
+    def peak_memory_keeps_outer_trace() -> bool:
+        """peak_memory inside an outer trace must leave that trace running."""
+        tracemalloc.start()
+        try:
+            _, inner_peak = peak_memory(lambda: len(bytearray(2_000_000)))
+            return tracemalloc.is_tracing() and inner_peak >= 2_000_000
+        finally:
+            tracemalloc.stop()
+
+    def peak_ratio() -> float:
+        """Peak of the eager version divided by peak of the lean version."""
+        return (
+            peak_memory(event_summary_eager, LAB55_EVENTS)[1]
+            / peak_memory(event_summary_lean, LAB55_EVENTS)[1]
+        )
+
+    run_checks(
+        [
+            ("peak_memory returns the result", lambda: peak_memory(len, "chai")[0], 4),
+            (
+                "peak_memory sees a 5 MB temporary",
+                lambda: peak_memory(lambda: len(bytearray(5_000_000)))[1] >= 5_000_000,
+                True,
+            ),
+            (
+                "peak_memory stops the trace it started",
+                lambda: (peak_memory(len, "x"), tracemalloc.is_tracing())[1],
+                False,
+            ),
+            ("peak_memory works inside an outer trace", peak_memory_keeps_outer_trace, True),
+            (
+                "lean summary: same result",
+                lambda: event_summary_lean(LAB55_EVENTS),
+                event_summary_eager(LAB55_EVENTS),
+            ),
+            ("lean summary: at least 5x lower peak", lambda: peak_ratio() >= 5, True),
+        ]
+    )
+    try:
+        print(f"measured peak ratio eager/lean: {peak_ratio():.0f}x")
+    except NotImplementedError:
+        pass
+
+
 if __name__ == "__main__":
     selected = set(sys.argv[1:])
     labs = [
@@ -2516,6 +2981,7 @@ if __name__ == "__main__":
         ("Lab 5.2", check_lab_5_2),
         ("Lab 5.3", check_lab_5_3),
         ("Lab 5.4", check_lab_5_4),
+        ("Lab 5.5", check_lab_5_5),
     ]
     for lab_title, check_lab in labs:
         if selected and lab_title not in selected:

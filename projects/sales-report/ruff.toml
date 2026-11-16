@@ -1,0 +1,3 @@
+# Extends the course configuration; the scripts in this folder are first-party imports.
+extend = "../../pyproject.toml"
+src = ["."]
