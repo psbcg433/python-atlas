@@ -3,40 +3,61 @@
 Run from the repository root:
 
     uv run python exercises/solutions/phase5_solutions.py            # every lab
-    uv run python exercises/solutions/phase5_solutions.py "Lab 5.2"  # one lab
+    uv run python exercises/solutions/phase5_solutions.py "Lab 5.3"  # one lab
 
 Each check_lab_5_N() runs the notebook's own check cells, so the notebook and this file test
 exactly the same things. Lab 5.2's worker functions must be importable by child processes, so,
 like the notebook's %%writefile cells, this file writes them to notebooks/_scratch/phase5/
 (git-ignored) and imports them from there. Timings vary by machine; no check asserts a speedup
 except the loose "the default build cannot reach 1.5x with threads" sanity check.
+Labs 5.3 and 5.4 are asyncio labs: their checks run in asyncio.run(), and their HTTP checks
+use httpx.MockTransport, so no server or network is needed.
 """
 
+import asyncio
 import concurrent.futures
+import contextlib
+import contextvars
 import functools
+import gc
 import hashlib
+import heapq
 import importlib
 import importlib.util
 import inspect
 import itertools
 import json
+import logging
 import math
 import multiprocessing
 import os
 import queue
 import random
+import selectors
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
-from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+import uuid
+import warnings
+from collections import Counter, deque
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Generator,
+    Iterable,
+    Iterator,
+)
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import httpx
 
@@ -1071,9 +1092,1432 @@ def check_lab_5_2() -> None:
     )
 
 
+# ----- Lab 5.3: unit code the lab relies on -----
+
+
+type ToyCoroutine = Generator[object, object, object]
+
+
+class RoundRobinLoop:
+    """Step 1: a ready queue of generators, resumed in turn until each finishes."""
+
+    def __init__(self) -> None:
+        self.ready: deque[tuple[ToyCoroutine, object]] = deque()
+        self.steps = 0
+
+    def spawn(self, coroutine: ToyCoroutine) -> object:
+        """Schedule a new task; it starts on the next pass."""
+        self.ready.append((coroutine, None))
+        return None
+
+    def run(self) -> None:
+        """Run until no task is left."""
+        while self.ready:
+            self.run_ready()
+
+    def run_ready(self) -> None:
+        """Resume every task that was ready when this pass started."""
+        for _ in range(len(self.ready)):
+            coroutine, value = self.ready.popleft()
+            self.steps += 1
+            try:
+                request = coroutine.send(value)
+            except StopIteration as stop:
+                self.finish(coroutine, stop.value)
+            else:
+                self.handle(coroutine, request)
+
+    def handle(self, coroutine: ToyCoroutine, request: object) -> None:
+        """Step 1 understands one request: run me again on the next pass."""
+        self.ready.append((coroutine, None))
+
+    def finish(self, coroutine: ToyCoroutine, result: object) -> None:
+        """A task returned. Step 5 stores the result."""
+
+
+class TimerLoop(RoundRobinLoop):
+    """Step 2: a task may yield ("sleep", seconds); sleepers wait in a heap."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timers: list[tuple[float, int, ToyCoroutine]] = []
+        self.tie_breaker = itertools.count()
+
+    def handle(self, coroutine: ToyCoroutine, request: object) -> None:
+        match request:
+            case ("sleep", float() | int() as seconds):
+                wake_at = time.monotonic() + seconds
+                heapq.heappush(self.timers, (wake_at, next(self.tie_breaker), coroutine))
+            case _:
+                super().handle(coroutine, request)
+
+    def run(self) -> None:
+        """Each iteration: wait, release due timers, run what is ready."""
+        while self.ready or self.timers or self.waiting_for_io():
+            self.wait_for_events(self.timeout())
+            while self.timers and self.timers[0][0] <= time.monotonic():
+                _, _, coroutine = heapq.heappop(self.timers)
+                self.ready.append((coroutine, None))
+            self.run_ready()
+
+    def timeout(self) -> float | None:
+        """0 if work is ready, else until the next timer, else forever (None)."""
+        if self.ready:
+            return 0
+        if self.timers:
+            return max(0.0, self.timers[0][0] - time.monotonic())
+        return None
+
+    def wait_for_events(self, timeout: float | None) -> None:
+        if timeout:
+            time.sleep(timeout)  # nothing else to do until the next timer
+
+    def waiting_for_io(self) -> bool:
+        return False
+
+
+class IOLoop(TimerLoop):
+    """Step 3: a task may yield ("read", sock) or ("write", sock)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.selector = selectors.DefaultSelector()
+
+    def handle(self, coroutine: ToyCoroutine, request: object) -> None:
+        match request:
+            case ("read", socket.socket() as sock):
+                self.selector.register(sock, selectors.EVENT_READ, coroutine)
+            case ("write", socket.socket() as sock):
+                self.selector.register(sock, selectors.EVENT_WRITE, coroutine)
+            case _:
+                super().handle(coroutine, request)
+
+    def waiting_for_io(self) -> bool:
+        return bool(self.selector.get_map())
+
+    def wait_for_events(self, timeout: float | None) -> None:
+        """select() instead of sleep(): wake up early when a socket is ready."""
+        if not self.waiting_for_io():
+            return super().wait_for_events(timeout)
+        for key, _ in self.selector.select(timeout):
+            self.selector.unregister(key.fileobj)  # one-shot registration
+            self.ready.append((key.data, None))
+
+
+class ToyTask:
+    """What asyncio calls a Task: a running coroutine plus its result and waiters."""
+
+    def __init__(self, coroutine: ToyCoroutine) -> None:
+        self.coroutine = coroutine
+        self.done = False
+        self.result: object = None
+        self.waiters: list[ToyCoroutine] = []
+
+
+class ToyLoop(IOLoop):
+    """Step 5: spawn() returns a ToyTask; a task may yield ("join", other_task)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tasks: dict[ToyCoroutine, ToyTask] = {}
+
+    def spawn(self, coroutine: ToyCoroutine) -> ToyTask:
+        task = self.tasks[coroutine] = ToyTask(coroutine)
+        super().spawn(coroutine)
+        return task
+
+    def handle(self, coroutine: ToyCoroutine, request: object) -> None:
+        match request:
+            case ("join", ToyTask() as other) if other.done:
+                self.ready.append((coroutine, other.result))
+            case ("join", ToyTask() as other):
+                other.waiters.append(coroutine)  # resumed by finish()
+            case _:
+                super().handle(coroutine, request)
+
+    def finish(self, coroutine: ToyCoroutine, result: object) -> None:
+        task = self.tasks.pop(coroutine)
+        task.done, task.result = True, result
+        for waiter in task.waiters:  # like a Future's done-callbacks
+            self.ready.append((waiter, result))
+
+
+class Ask:
+    """An awaitable that hands a question to the driver and returns its reply."""
+
+    def __init__(self, question: str) -> None:
+        self.question = question
+
+    def __await__(self) -> Generator[str, object, object]:
+        reply = yield self.question
+        return reply
+
+
+class Timer:
+    """Timing context manager (shared since Unit 1.14): reports on exit, keeps elapsed_seconds."""
+
+    def __init__(self, label: str, report: Callable[[str], None] | None = print) -> None:
+        self.label = label
+        self.report = report
+        self.elapsed_seconds = 0.0
+
+    def __enter__(self) -> Timer:
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.elapsed_seconds = time.perf_counter() - self._start
+        if self.report is not None:
+            self.report(f"{self.label} took {self.elapsed_seconds * 1000:.2f} ms")
+
+
+# ----- Lab 5.3: helpers and given code from the lab cells -----
+
+
+async def outcome(awaitable: Awaitable[object]) -> object:
+    """Await and return the result, or "raised ErrorName". Never raises an Exception."""
+    try:
+        return await awaitable
+    except Exception as error:
+        return f"raised {type(error).__name__}"
+
+
+@contextlib.contextmanager
+def quiet_unawaited() -> Generator[None]:
+    """Hide "coroutine ... was never awaited" warnings caused by unfinished stubs."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "coroutine .* was never awaited", RuntimeWarning)
+        yield
+        gc.collect()
+
+
+def run_toy(main: Callable[[ToyLoop], ToyCoroutine]) -> tuple[object, float]:
+    """Run main(loop) on a fresh ToyLoop; return (its result, seconds taken)."""
+    loop = ToyLoop()
+    started = time.perf_counter()
+    main_task = loop.spawn(main(loop))
+    loop.run()
+    return main_task.result, time.perf_counter() - started
+
+
+async def run_puzzle(puzzle: Callable[[list[str]], Coroutine[Any, Any, None]]) -> list[str]:
+    """Run one ordering puzzle and return its log (stragglers get 50 ms to finish)."""
+    log: list[str] = []
+    await puzzle(log)
+    await asyncio.sleep(0.05)
+    return log
+
+
+PRICE_BOOK = {"price:chai": 20, "price:vada": 15, "gst": 5}
+
+
+def book_responder(request: object) -> object:
+    """Answer a request from PRICE_BOOK (KeyError if unknown)."""
+    return PRICE_BOOK[str(request)]
+
+
+async def order_total(sku: str, quantity: int) -> int:
+    price = await Ask(f"price:{sku}")
+    gst_percent = await Ask("gst")
+    return price * quantity * (100 + gst_percent) // 100
+
+
+async def safe_price(sku: str) -> object:
+    try:
+        return await Ask(f"price:{sku}")
+    except KeyError:
+        return "unavailable"
+
+
+async def strict_price(sku: str) -> object:
+    return await Ask(f"price:{sku}")  # lets a KeyError escape
+
+
+async def no_questions() -> str:
+    return "instant"
+
+
+def toy_sleep_then(value: object, seconds: float) -> ToyCoroutine:
+    """Sleep on the toy loop, then return value."""
+    yield ("sleep", seconds)
+    return value
+
+
+def toy_instant(value: object) -> ToyCoroutine:
+    """Return value on the first step, without ever yielding."""
+    if False:
+        yield
+    return value
+
+
+WIDGETS = ["sales", "stock", "orders", "returns", "reviews"]
+
+
+async def fetch_widget(name: str, seconds: float = 1.0) -> str:
+    await asyncio.sleep(seconds)
+    return f"{name}: ok"
+
+
+async def load_dashboard_sequential() -> dict[str, str]:
+    return {name: await fetch_widget(name) for name in WIDGETS}
+
+
+RACE_LOG: list[str] = []
+
+
+async def contender(name: str, seconds: float, fail: bool = False) -> str:
+    try:
+        await asyncio.sleep(seconds)
+    except asyncio.CancelledError:
+        RACE_LOG.append(f"{name} cancelled")
+        raise
+    if fail:
+        raise ConnectionError(f"{name} failed")
+    return name
+
+
+async def puzzle_1(log: list[str]) -> None:
+    async def child() -> None:
+        log.append("child")
+
+    asyncio.create_task(child())
+    log.append("parent")
+    await asyncio.sleep(0)
+
+
+async def puzzle_2(log: list[str]) -> None:
+    async def child(name: str) -> None:
+        log.append(name)
+
+    background = asyncio.create_task(child("task"))
+    await child("direct")
+    log.append("after direct")
+    await background
+
+
+async def puzzle_3(log: list[str]) -> None:
+    loop = asyncio.get_running_loop()
+    loop.call_later(0, log.append, "later")
+    loop.call_soon(log.append, "soon")
+    log.append("now")
+    await asyncio.sleep(0.01)
+
+
+async def puzzle_4(log: list[str]) -> None:  # needs Python 3.14+ (eager_start)
+    async def child(name: str) -> None:
+        log.append(f"{name} start")
+        await asyncio.sleep(0)
+        log.append(f"{name} end")
+
+    asyncio.create_task(child("lazy"))
+    asyncio.create_task(child("eager"), eager_start=True)
+    log.append("parent")
+    await asyncio.sleep(0.01)
+
+
+async def puzzle_5(log: list[str]) -> None:
+    async def child() -> int:
+        log.append("child")
+        return 1
+
+    task = asyncio.create_task(child())
+    task.add_done_callback(lambda _: log.append("callback"))
+    await task
+    log.append("awaiter")
+
+
+async def puzzle_6(log: list[str]) -> None:
+    async def step(name: str, delay: float) -> str:
+        await asyncio.sleep(delay)
+        log.append(name)
+        return name
+
+    results = await asyncio.gather(step("a", 0.02), step("b", 0), step("c", 0.01))
+    log.append("+".join(results))
+
+
+async def puzzle_7(log: list[str]) -> None:
+    async def child() -> None:
+        try:
+            log.append("child start")
+            await asyncio.sleep(1)
+        finally:
+            log.append("child finally")
+
+    task = asyncio.create_task(child())
+    await asyncio.sleep(0)
+    task.cancel()
+    log.append("cancel requested")
+    try:
+        await task
+    except asyncio.CancelledError:
+        log.append("parent saw CancelledError")
+
+
+async def puzzle_8(log: list[str]) -> None:
+    loop = asyncio.get_running_loop()
+    signal = loop.create_future()
+
+    async def waiter(name: str) -> None:
+        await signal
+        log.append(name)
+
+    waiters = [asyncio.create_task(waiter(name)) for name in ("w1", "w2")]
+    await asyncio.sleep(0)
+    signal.add_done_callback(lambda _: log.append("callback"))
+    loop.call_soon(log.append, "call_soon")
+    signal.set_result(None)
+    log.append("set")
+    await asyncio.gather(*waiters)
+
+
+PUZZLES = {
+    1: puzzle_1,
+    2: puzzle_2,
+    3: puzzle_3,
+    4: puzzle_4,
+    5: puzzle_5,
+    6: puzzle_6,
+    7: puzzle_7,
+    8: puzzle_8,
+}
+
+
+async def chat_scenario(room_factory: Callable[[], Any]) -> dict[str, object]:
+    """Run a three-client conversation against room_factory().handle."""
+    room, errors, clients = room_factory(), [], {}
+
+    async def guarded(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await room.handle(reader, writer)
+        except Exception as error:  # keep failures out of the kernel log
+            errors.append(type(error).__name__)
+            writer.close()
+
+    async def send(nick: str, line: str) -> None:
+        clients[nick][1].write(f"{line}\n".encode())
+        with contextlib.suppress(ConnectionError):  # the server may have dropped us
+            await clients[nick][1].drain()
+        await asyncio.sleep(0.05)  # let the server deliver before the next step
+
+    async def received(nick: str) -> list[str]:
+        lines = []
+        while True:
+            try:
+                line = await asyncio.wait_for(clients[nick][0].readline(), 0.1)
+            except TimeoutError:
+                return lines
+            if not line:
+                return lines
+            lines.append(line.decode().rstrip("\n"))
+
+    server = await asyncio.start_server(guarded, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        for nick in ("asha", "ben", "chen"):
+            clients[nick] = await asyncio.open_connection("127.0.0.1", port)
+            await send(nick, nick)
+        await send("asha", "hello")
+        await send("ben", "hi asha")
+        transcripts = {"chen": await received("chen")}
+        clients["chen"][1].close()
+        await asyncio.sleep(0.05)
+        transcripts |= {nick: await received(nick) for nick in ("asha", "ben")}
+        errors_seen = list(errors)
+    finally:
+        for _, writer in clients.values():
+            writer.close()
+        server.close()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(server.wait_closed(), 1)
+    return {"transcripts": transcripts, "errors": errors_seen}
+
+
+# ----- Lab 5.3: reference solutions -----
+
+
+def drive(
+    coroutine: Coroutine[Any, Any, Any], responder: Callable[[object], object]
+) -> tuple[list[object], object]:
+    """Run coroutine to completion, answering each yielded request with responder."""
+    requests: list[object] = []
+    try:
+        request = coroutine.send(None)
+        while True:
+            requests.append(request)
+            try:
+                reply = responder(request)
+            except Exception as error:
+                request = coroutine.throw(error)
+            else:
+                request = coroutine.send(reply)
+    except StopIteration as stop:
+        return requests, stop.value
+
+
+def toy_gather(
+    loop: ToyLoop, coroutines: list[ToyCoroutine]
+) -> Generator[object, object, list[object]]:
+    """Spawn every coroutine on loop, join them all, return results in input order."""
+    tasks = [loop.spawn(coroutine) for coroutine in coroutines]  # all start before we wait
+    results: list[object] = []
+    for task in tasks:
+        results.append((yield ("join", task)))
+    return results
+
+
+async def load_dashboard_concurrent() -> dict[str, str]:
+    """The same dict as load_dashboard_sequential(), in about 1 s."""
+    contents = await asyncio.gather(*(fetch_widget(name) for name in WIDGETS))
+    return dict(zip(WIDGETS, contents, strict=True))
+
+
+async def race(coroutines: Iterable[Coroutine[Any, Any, Any]]) -> Any:
+    """Return the first result (or raise the first error); cancel and await the rest."""
+    tasks = [asyncio.ensure_future(coroutine) for coroutine in coroutines]
+    if not tasks:
+        raise ValueError("race() needs at least one coroutine")
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()  # no effect on tasks that already finished
+        await asyncio.gather(*tasks, return_exceptions=True)  # wait for the cancellations
+    winner = next(task for task in tasks if task in done)
+    return winner.result()
+
+
+def predictions() -> dict[int, list[str]]:
+    """Your predicted final log for each puzzle: {1: [...], 2: [...], ..., 8: [...]}."""
+    return {
+        1: ["parent", "child"],
+        2: ["direct", "after direct", "task"],
+        3: ["now", "soon", "later"],
+        4: ["eager start", "parent", "lazy start", "eager end", "lazy end"],
+        5: ["child", "callback", "awaiter"],
+        6: ["b", "c", "a", "a+b+c"],
+        7: ["child start", "cancel requested", "child finally", "parent saw CancelledError"],
+        8: ["set", "call_soon", "w1", "w2", "callback"],
+    }
+
+
+class ChatRoom:
+    """A chat room served with asyncio streams (protocol in the exercise text)."""
+
+    def __init__(self) -> None:
+        self.members: dict[asyncio.StreamWriter, str] = {}
+
+    async def broadcast(self, sender: asyncio.StreamWriter, line: str) -> None:
+        """Send line to every member except sender; drop members that have gone away."""
+        for writer in list(self.members):
+            if writer is sender:
+                continue
+            try:
+                writer.write(f"{line}\n".encode())
+                await writer.drain()
+            except ConnectionError:
+                self.members.pop(writer, None)
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Serve one client: nickname line first, then chat lines until EOF."""
+        nick = (await reader.readline()).decode().strip()
+        if not nick:
+            writer.close()
+            return
+        self.members[writer] = nick
+        await self.broadcast(writer, f"* {nick} joined")
+        try:
+            while line := await reader.readline():
+                await self.broadcast(writer, f"{nick}: {line.decode().rstrip()}")
+        except ConnectionError:
+            pass
+        finally:
+            self.members.pop(writer, None)
+            await self.broadcast(writer, f"* {nick} left")
+            writer.close()
+
+
+# ----- Lab 5.4: helpers and given code from the lab cells -----
+
+
+class InFlightTracker:
+    """Counts concurrent requests inside a mock transport handler."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.now, self.peak, self.calls = 0, 0, Counter()
+
+    @contextlib.contextmanager
+    def track(self, key: object) -> Generator[None]:
+        self.now += 1
+        self.peak = max(self.peak, self.now)
+        self.calls[key] += 1
+        try:
+            yield
+        finally:
+            self.now -= 1
+
+
+def mock_client(handler: Callable[[httpx.Request], Awaitable[httpx.Response]]) -> httpx.AsyncClient:
+    """An AsyncClient whose requests go to handler instead of the network."""
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.shop.test"
+    )
+
+
+async def loop_lag_during(work: Callable[[], Awaitable[object]], interval: float = 0.01) -> float:
+    """Run work() while a 10 ms heartbeat runs; return the heartbeat's worst lateness in seconds."""
+    stop, worst = asyncio.Event(), [0.0]
+
+    async def beat() -> None:
+        while not stop.is_set():
+            before = asyncio.get_running_loop().time()
+            await asyncio.sleep(interval)
+            worst[0] = max(worst[0], asyncio.get_running_loop().time() - before - interval)
+
+    monitor = asyncio.create_task(beat())
+    await asyncio.sleep(0.02)
+    try:
+        await work()
+    finally:
+        stop.set()
+        await monitor
+    return worst[0]
+
+
+def scenario_field(result: object, key: str) -> object:
+    """result[key] if result is a dict (a finished scenario), else result itself (an error)."""
+    return result[key] if isinstance(result, dict) else result
+
+
+catalog_tracker = InFlightTracker()
+
+
+async def catalog_api(request: httpx.Request) -> httpx.Response:
+    """GET /items/<n>: 10 ms each; item 13 answers 500, item 21 refuses to connect."""
+    item_id = int(request.url.path.rsplit("/", 1)[1])
+    with catalog_tracker.track(item_id):
+        await asyncio.sleep(0.01)
+        if item_id == 13:
+            return httpx.Response(500)
+        if item_id == 21:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, json={"id": item_id, "price": item_id * 10})
+
+
+RETRY_CALLS: list[str] = []
+
+
+async def flaky_inventory_call(
+    fail_times: int, error_type: type[Exception] = ConnectionError
+) -> str:
+    """Fails fail_times times with error_type, then succeeds."""
+    RETRY_CALLS.append(error_type.__name__)
+    if len(RETRY_CALLS) <= fail_times:
+        raise error_type(f"attempt {len(RETRY_CALLS)} failed")
+    return f"ok after {len(RETRY_CALLS)} calls"
+
+
+PAGED_ITEMS = [{"id": item_id, "sku": f"sku-{item_id:03d}"} for item_id in range(45)]
+
+
+page_requests: list[dict[str, str]] = []
+
+
+async def paged_api(request: httpx.Request) -> httpx.Response:
+    """Cursor pagination over PAGED_ITEMS (/products) or nothing (/empty)."""
+    query = dict(request.url.params)
+    page_requests.append(query)
+    items = PAGED_ITEMS if request.url.path == "/products" else []
+    start, limit = int(query.get("cursor", 0)), int(query.get("limit", 10))
+    next_start = start + limit
+    next_cursor = str(next_start) if next_start < len(items) else None
+    return httpx.Response(200, json={"items": items[start:next_start], "next_cursor": next_cursor})
+
+
+def _legacy_pdf(order_id: int) -> str:
+    time.sleep(0.1)  # a synchronous PDF library
+    return f"invoice-{order_id}.pdf"
+
+
+def _tax_table(region: str) -> dict[str, object]:
+    end = time.perf_counter() + 0.1
+    while time.perf_counter() < end:  # a CPU-heavy pure-Python loop
+        pass
+    return {"region": region, "gst": 18}
+
+
+async def load_profile() -> dict[str, object]:
+    await asyncio.sleep(0.15)  # slow, but it awaits: harmless
+    return {"user": "asha"}
+
+
+async def render_invoice() -> dict[str, object]:
+    await asyncio.sleep(0.01)
+    return {"file": _legacy_pdf(42)}
+
+
+async def send_sms() -> dict[str, object]:
+    await asyncio.sleep(0.02)
+    return {"sms": "sent"}
+
+
+async def lookup_tax() -> dict[str, object]:
+    await asyncio.sleep(0.01)
+    return _tax_table("KA")
+
+
+HANDLERS_A = {"load_profile": load_profile, "render_invoice": render_invoice, "send_sms": send_sms}
+
+
+HANDLERS_B = {"load_profile": load_profile, "send_sms": send_sms, "lookup_tax": lookup_tax}
+
+
+REQUEST_ID: contextvars.ContextVar[str] = contextvars.ContextVar("lab_request_id", default="-")
+
+
+request_records: list[tuple[str, str]] = []
+
+
+class CaptureRequestIds(logging.Handler):
+    """Record (current request id, message) for every log call."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        request_records.append((REQUEST_ID.get(), record.getMessage()))
+
+
+request_log = logging.getLogger("lab54.requests")
+
+
+request_log.handlers[:] = [CaptureRequestIds()]
+
+
+request_log.setLevel(logging.INFO)
+
+
+request_log.propagate = False
+
+
+def audit_trail(path: str) -> str:
+    """Runs in a worker thread; returns the request id it can see."""
+    return REQUEST_ID.get()
+
+
+async def echo_request_id_api(request: httpx.Request) -> httpx.Response:
+    await asyncio.sleep(0.005)  # let concurrent requests interleave
+    return httpx.Response(
+        200, json={"x-request-id": request.headers.get("x-request-id", "missing")}
+    )
+
+
+STORE_COUNT = 500
+
+
+store_tracker = InFlightTracker()
+
+
+async def sales_api(request: httpx.Request) -> httpx.Response:
+    """Store sales; some stores hang, some always fail, some fail once with 503."""
+    store_id = int(request.url.path.split("/")[2])
+    with store_tracker.track(store_id):
+        if store_id % 97 == 3:
+            await asyncio.sleep(1.0)  # hangs: must be cut off by the timeout
+        await asyncio.sleep(0.01)
+        if store_id % 50 == 7:
+            return httpx.Response(500)
+        if store_id % 40 == 11 and store_tracker.calls[store_id] == 1:
+            return httpx.Response(503)  # busy once, fine on retry
+        return httpx.Response(200, json={"store": store_id, "amount": store_id * 37 % 1000})
+
+
+# ----- Lab 5.4: reference solutions -----
+
+
+async def fetch_all(
+    client: httpx.AsyncClient, urls: list[str], max_concurrency: int
+) -> list[object]:
+    """GET every URL, at most max_concurrency at a time; JSON or error name, in input order."""
+    slots = asyncio.Semaphore(max_concurrency)
+
+    async def fetch_one(url: str) -> object:
+        async with slots:
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                return response.json()
+            except (httpx.HTTPError, ValueError) as error:
+                return type(error).__name__
+
+    return list(await asyncio.gather(*(fetch_one(url) for url in urls)))
+
+
+class WorkerPool:
+    """Fixed-size pool of worker tasks fed by a bounded queue."""
+
+    def __init__(
+        self, job: Callable[[Any], Awaitable[object]], worker_count: int = 3, queue_size: int = 10
+    ) -> None:
+        self.job = job
+        self.worker_count = worker_count
+        self.queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_size)
+        self.workers: list[asyncio.Task[None]] = []
+        self.results: dict[Any, object] = {}
+        self.closed = False
+
+    async def start(self) -> None:
+        self.workers = [
+            asyncio.create_task(self._work(), name=f"pool-worker-{n}")
+            for n in range(self.worker_count)
+        ]
+
+    async def _work(self) -> None:
+        while True:
+            try:
+                item = await self.queue.get()
+            except asyncio.QueueShutDown:
+                return
+            try:
+                self.results[item] = await self.job(item)
+            except Exception as error:
+                self.results[item] = type(error).__name__
+            finally:
+                self.queue.task_done()
+
+    async def submit(self, item: Any) -> None:
+        if self.closed:
+            raise RuntimeError("the pool is shutting down")
+        await self.queue.put(item)
+
+    async def shutdown(self, immediate: bool = False) -> dict[Any, object]:
+        self.closed = True
+        self.queue.shutdown(immediate=immediate)
+        if immediate:
+            for worker in self.workers:
+                worker.cancel()
+        await asyncio.gather(*self.workers, return_exceptions=True)
+        return dict(self.results)
+
+
+def retry_async[**P, R](
+    *,
+    attempts: int = 3,
+    base_delay: float = 0.1,
+    max_delay: float = 2.0,
+    retry_on: tuple[type[BaseException], ...] = (Exception,),
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+    rng: random.Random | None = None,
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+    """Retry an async function with full-jitter exponential backoff."""
+    jitter = rng if rng is not None else random.Random()
+
+    def decorate(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        @functools.wraps(func)
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            for attempt in range(1, attempts + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except retry_on:
+                    if attempt == attempts:
+                        raise
+                await sleep(jitter.uniform(0, min(max_delay, base_delay * 2 ** (attempt - 1))))
+            raise AssertionError("unreachable")
+
+        return wrapper
+
+    return decorate
+
+
+async def paginate(
+    client: httpx.AsyncClient, path: str, page_size: int = 10
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield every item of a cursor-paginated endpoint, fetching pages lazily."""
+    cursor: str | None = None
+    while True:
+        params: dict[str, str | int] = {"limit": page_size}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = await client.get(path, params=params)
+        response.raise_for_status()
+        page = response.json()
+        for item in page["items"]:
+            yield item
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return
+
+
+async def find_blocking_handler(
+    handlers: dict[str, Callable[[], Awaitable[object]]], threshold: float = 0.05
+) -> str:
+    """Name of the handler that blocks the event loop for longer than threshold seconds."""
+    lags = {name: await loop_lag_during(handler) for name, handler in handlers.items()}
+    culprit = max(lags, key=lags.__getitem__)
+    if lags[culprit] <= threshold:
+        raise LookupError(f"no handler blocked the loop for more than {threshold} s")
+    return culprit
+
+
+async def render_invoice_fixed() -> dict[str, object]:
+    """Same result as render_invoice(), without blocking the loop."""
+    await asyncio.sleep(0.01)
+    return {"file": await asyncio.to_thread(_legacy_pdf, 42)}
+
+
+def make_traced_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
+    """AsyncClient whose request hook adds X-Request-ID from REQUEST_ID."""
+
+    async def add_request_id(request: httpx.Request) -> None:
+        request.headers["X-Request-ID"] = REQUEST_ID.get()
+
+    return httpx.AsyncClient(
+        transport=transport,
+        base_url="https://api.shop.test",
+        event_hooks={"request": [add_request_id]},
+    )
+
+
+async def handle_request(
+    client: httpx.AsyncClient, path: str, request_id: str | None = None
+) -> dict[str, str]:
+    """Serve one request with REQUEST_ID set; return request_id, echoed header and audit value."""
+    token = REQUEST_ID.set(request_id or uuid.uuid4().hex[:8])
+    try:
+        request_log.info("start %s", path)
+        response = await client.get(path)
+        audit = await asyncio.to_thread(audit_trail, path)
+        request_log.info("done %s", path)
+        return {
+            "request_id": REQUEST_ID.get(),
+            "echoed": response.json()["x-request-id"],
+            "audit": audit,
+        }
+    finally:
+        REQUEST_ID.reset(token)
+
+
+async def aggregate_sales(
+    client: httpx.AsyncClient, store_ids: list[int], max_concurrency: int = 50, timeout: float = 0.2
+) -> dict[str, object]:
+    """Fetch every store's sales concurrently; return total, ok count and failed ids."""
+    slots = asyncio.Semaphore(max_concurrency)
+
+    async def store_amount(store_id: int) -> int | None:
+        async with slots:
+            for attempt in range(2):
+                try:
+                    async with asyncio.timeout(timeout):
+                        response = await client.get(f"/stores/{store_id}/sales")
+                except TimeoutError, httpx.TransportError:
+                    return None
+                if response.status_code == 503 and attempt == 0:
+                    continue
+                return response.json()["amount"] if response.is_success else None
+            return None
+
+    amounts = await asyncio.gather(*(store_amount(store_id) for store_id in store_ids))
+    failed = sorted(
+        store_id for store_id, amount in zip(store_ids, amounts, strict=True) if amount is None
+    )
+    return {
+        "total": sum(amount for amount in amounts if amount is not None),
+        "ok": len(store_ids) - len(failed),
+        "failed": failed,
+    }
+
+
+# ----- Lab 5.3 and Lab 5.4: the notebook's check cells -----
+
+
+async def _lab_5_3_checks() -> None:
+    """The notebook's Lab 5.3 check cells, in order."""
+    with quiet_unawaited():
+        run_checks(
+            [
+                (
+                    "two requests answered",
+                    lambda: drive(order_total("chai", 2), book_responder),
+                    (["price:chai", "gst"], 42),
+                ),
+                (
+                    "responder error thrown in and handled",
+                    lambda: drive(safe_price("dosa"), book_responder),
+                    (["price:dosa"], "unavailable"),
+                ),
+                (
+                    "unhandled error propagates",
+                    lambda: raised_error_name(lambda: drive(strict_price("dosa"), book_responder)),
+                    "KeyError",
+                ),
+                (
+                    "no requests at all",
+                    lambda: drive(no_questions(), book_responder),
+                    ([], "instant"),
+                ),
+            ]
+        )
+
+    def gather_three(loop: ToyLoop) -> ToyCoroutine:
+        specs = [("a", 0.2), ("b", 0.1), ("c", 0.15)]
+        return (
+            yield from toy_gather(
+                loop, [toy_sleep_then(value, seconds) for value, seconds in specs]
+            )
+        )
+
+    def gather_mixed(loop: ToyLoop) -> ToyCoroutine:
+        return (yield from toy_gather(loop, [toy_sleep_then("later", 0.05), toy_instant("now")]))
+
+    def gather_nothing(loop: ToyLoop) -> ToyCoroutine:
+        return (yield from toy_gather(loop, []))
+
+    three_run = functools.cache(lambda: run_toy(gather_three))
+    run_checks(
+        [
+            ("results in input order", lambda: three_run()[0], ["a", "b", "c"]),
+            ("sleeps overlap (< 0.35 s, not 0.45 s)", lambda: three_run()[1] < 0.35, True),
+            (
+                "joining a task that already finished",
+                lambda: run_toy(gather_mixed)[0],
+                ["later", "now"],
+            ),
+            ("empty list", lambda: run_toy(gather_nothing)[0], []),
+        ]
+    )
+
+    with Timer("load_dashboard_concurrent", report=None) as dashboard_timer:
+        dashboard = await outcome(load_dashboard_concurrent())
+    finished = isinstance(dashboard, dict)
+    run_checks(
+        [
+            (
+                "same widgets as the sequential version",
+                lambda: dashboard,
+                {name: f"{name}: ok" for name in WIDGETS},
+            ),
+            ("keys in WIDGETS order", lambda: list(dashboard) if finished else dashboard, WIDGETS),
+            (
+                "about 1 s (< 1.5 s)",
+                lambda: finished and dashboard_timer.elapsed_seconds < 1.5,
+                True,
+            ),
+        ]
+    )
+
+    with quiet_unawaited():
+        RACE_LOG.clear()
+        race_winner = await outcome(
+            race([contender("slow", 0.2), contender("fast", 0.01), contender("mid", 0.1)])
+        )
+        losers_cancelled = sorted(RACE_LOG)
+        RACE_LOG.clear()
+        race_failure = await outcome(
+            race([contender("broken", 0.01, fail=True), contender("steady", 0.2)])
+        )
+        failure_cancelled = sorted(RACE_LOG)
+        race_single = await outcome(race([contender("solo", 0)]))
+        race_empty = await outcome(race([]))
+    run_checks(
+        [
+            ("fastest result wins", lambda: race_winner, "fast"),
+            (
+                "losers cancelled before race returns",
+                lambda: losers_cancelled,
+                ["mid cancelled", "slow cancelled"],
+            ),
+            ("the winner's exception propagates", lambda: race_failure, "raised ConnectionError"),
+            (
+                "losers cancelled after a failure too",
+                lambda: failure_cancelled,
+                ["steady cancelled"],
+            ),
+            ("one contender", lambda: race_single, "solo"),
+            ("no contenders -> ValueError", lambda: race_empty, "raised ValueError"),
+        ]
+    )
+
+    puzzle_logs = {}
+    for number, puzzle in PUZZLES.items():
+        puzzle_logs[number] = await run_puzzle(puzzle)
+    run_checks(
+        [
+            (f"puzzle {number}", lambda number=number: predictions()[number], log)
+            for number, log in puzzle_logs.items()
+        ]
+    )
+
+    chat_result = await outcome(chat_scenario(ChatRoom))
+    chat_transcripts = chat_result["transcripts"] if isinstance(chat_result, dict) else {}
+    run_checks(
+        [
+            (
+                "asha's screen",
+                lambda: chat_transcripts.get("asha"),
+                ["* ben joined", "* chen joined", "ben: hi asha", "* chen left"],
+            ),
+            (
+                "ben's screen",
+                lambda: chat_transcripts.get("ben"),
+                ["* chen joined", "asha: hello", "* chen left"],
+            ),
+            (
+                "chen's screen",
+                lambda: chat_transcripts.get("chen"),
+                ["asha: hello", "ben: hi asha"],
+            ),
+            (
+                "no handler errors",
+                lambda: chat_result["errors"] if isinstance(chat_result, dict) else chat_result,
+                [],
+            ),
+        ]
+    )
+
+
+def check_lab_5_3() -> None:
+    """Run every Lab 5.3 check (each check prints PASS/FAIL)."""
+    asyncio.run(_lab_5_3_checks())
+
+
+async def _lab_5_4_checks() -> None:
+    """The notebook's Lab 5.4 check cells, in order."""
+    catalog_urls = [f"/items/{item_id}" for item_id in range(30)]
+    expected_catalog = [
+        "HTTPStatusError"
+        if item_id == 13
+        else "ConnectError"
+        if item_id == 21
+        else {"id": item_id, "price": item_id * 10}
+        for item_id in range(30)
+    ]
+    catalog_tracker.reset()
+    async with mock_client(catalog_api) as catalog_client:
+        with Timer("fetch_all", report=None) as fetch_timer:
+            fetched = await outcome(fetch_all(catalog_client, catalog_urls, max_concurrency=5))
+        fetched_nothing = await outcome(fetch_all(catalog_client, [], max_concurrency=5))
+    run_checks(
+        [
+            ("results in input order, errors as names", lambda: fetched, expected_catalog),
+            ("never more than 5 requests in flight", lambda: 0 < catalog_tracker.peak <= 5, True),
+            ("actually concurrent (peak == 5)", lambda: catalog_tracker.peak, 5),
+            (
+                "faster than sequential 30 x 10 ms",
+                lambda: isinstance(fetched, list) and fetch_timer.elapsed_seconds < 0.2,
+                True,
+            ),
+            ("empty URL list", lambda: fetched_nothing, []),
+        ]
+    )
+
+    async def double_later(item: int) -> int:
+        await asyncio.sleep(0.01)
+        if item == 7:
+            raise ValueError("unlucky item")
+        return item * 2
+
+    async def slow_job(item: int) -> int:
+        await asyncio.sleep(0.05)
+        return item
+
+    async def graceful_scenario() -> dict[str, object]:
+        pool = WorkerPool(double_later, worker_count=3, queue_size=4)
+        await pool.start()
+        with Timer("12 jobs", report=None) as pool_timer:
+            for item in range(12):
+                await pool.submit(item)
+            results = await pool.shutdown()
+        return {
+            "results": results,
+            "seconds": pool_timer.elapsed_seconds,
+            "workers": len(pool.workers),
+            "all_exited": all(worker.done() for worker in pool.workers),
+            "late_submit": await outcome(pool.submit(99)),
+        }
+
+    async def immediate_scenario() -> dict[str, object]:
+        pool = WorkerPool(slow_job, worker_count=2, queue_size=50)
+        await pool.start()
+        for item in range(20):
+            await pool.submit(item)
+        await asyncio.sleep(0.01)
+        results = await pool.shutdown(immediate=True)
+        return {
+            "finished": len(results),
+            "all_exited": all(worker.done() for worker in pool.workers),
+        }
+
+    graceful, immediate = await outcome(graceful_scenario()), await outcome(immediate_scenario())
+    run_checks(
+        [
+            (
+                "every queued item processed, errors as names",
+                lambda: scenario_field(graceful, "results"),
+                {item: "ValueError" if item == 7 else item * 2 for item in range(12)},
+            ),
+            (
+                "3 workers, all exited after shutdown",
+                lambda: (
+                    scenario_field(graceful, "workers"),
+                    scenario_field(graceful, "all_exited"),
+                ),
+                (3, True),
+            ),
+            (
+                "workers ran concurrently (< 0.1 s, not 0.12 s)",
+                lambda: scenario_field(graceful, "seconds") < 0.1,
+                True,
+            ),
+            (
+                "submit after shutdown -> RuntimeError",
+                lambda: scenario_field(graceful, "late_submit"),
+                "raised RuntimeError",
+            ),
+            (
+                "immediate shutdown drops queued items",
+                lambda: scenario_field(immediate, "finished") < 20,
+                True,
+            ),
+            (
+                "immediate shutdown: workers exited",
+                lambda: scenario_field(immediate, "all_exited"),
+                True,
+            ),
+        ]
+    )
+
+    recorded_sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        recorded_sleeps.append(round(seconds, 6))
+
+    async def retry_case(
+        fail_times: int, error_type: type[Exception] = ConnectionError
+    ) -> dict[str, object]:
+        RETRY_CALLS.clear()
+        recorded_sleeps.clear()
+        decorator = retry_async(
+            attempts=4,
+            base_delay=0.1,
+            max_delay=0.25,
+            retry_on=(ConnectionError,),
+            sleep=record_sleep,
+            rng=random.Random(7),
+        )
+        result = await outcome(decorator(flaky_inventory_call)(fail_times, error_type))
+        return {"result": result, "calls": len(RETRY_CALLS), "sleeps": list(recorded_sleeps)}
+
+    expected_rng = random.Random(7)
+    expected_delays = [
+        round(expected_rng.uniform(0, min(0.25, 0.1 * 2**retry)), 6) for retry in range(3)
+    ]
+    recovers, gives_up, not_retried = (
+        await outcome(retry_case(2)),
+        await outcome(retry_case(10)),
+        await outcome(retry_case(5, KeyError)),
+    )
+    run_checks(
+        [
+            (
+                "recovers after 2 failures",
+                lambda: (scenario_field(recovers, "result"), scenario_field(recovers, "calls")),
+                ("ok after 3 calls", 3),
+            ),
+            (
+                "full-jitter delays from rng",
+                lambda: scenario_field(recovers, "sleeps"),
+                expected_delays[:2],
+            ),
+            (
+                "gives up after 4 calls, re-raises",
+                lambda: (scenario_field(gives_up, "result"), scenario_field(gives_up, "calls")),
+                ("raised ConnectionError", 4),
+            ),
+            (
+                "capped delays (3 sleeps)",
+                lambda: scenario_field(gives_up, "sleeps"),
+                expected_delays,
+            ),
+            (
+                "other errors are not retried",
+                lambda: (
+                    scenario_field(not_retried, "result"),
+                    scenario_field(not_retried, "calls"),
+                ),
+                ("raised KeyError", 1),
+            ),
+            (
+                "keeps the name",
+                lambda: retry_async()(flaky_inventory_call).__name__,
+                "flaky_inventory_call",
+            ),
+        ]
+    )
+
+    async def paging_case(
+        path: str, page_size: int = 10, stop_after: int | None = None
+    ) -> dict[str, object]:
+        page_requests.clear()
+        collected: list[int] = []
+        async with mock_client(paged_api) as paging_client:
+            async with contextlib.aclosing(paginate(paging_client, path, page_size)) as items:
+                async for item in items:
+                    collected.append(item["id"])
+                    if stop_after is not None and len(collected) == stop_after:
+                        break
+        return {
+            "ids": collected,
+            "requests": len(page_requests),
+            "first": page_requests[0] if page_requests else None,
+        }
+
+    every_page = await outcome(paging_case("/products"))
+    stopped_early = await outcome(paging_case("/products", stop_after=12))
+    bigger_pages = await outcome(paging_case("/products", page_size=20))
+    empty_listing = await outcome(paging_case("/empty"))
+    run_checks(
+        [
+            ("all 45 items in order", lambda: scenario_field(every_page, "ids"), list(range(45))),
+            ("5 requests for 45 items", lambda: scenario_field(every_page, "requests"), 5),
+            (
+                "first request: limit only, no cursor",
+                lambda: scenario_field(every_page, "first"),
+                {"limit": "10"},
+            ),
+            (
+                "lazy: stopping after 12 items costs 2 requests",
+                lambda: (
+                    scenario_field(stopped_early, "ids"),
+                    scenario_field(stopped_early, "requests"),
+                ),
+                (list(range(12)), 2),
+            ),
+            ("page_size=20 -> 3 requests", lambda: scenario_field(bigger_pages, "requests"), 3),
+            (
+                "empty endpoint",
+                lambda: (
+                    scenario_field(empty_listing, "ids"),
+                    scenario_field(empty_listing, "requests"),
+                ),
+                ([], 1),
+            ),
+        ]
+    )
+
+    culprit_a = await outcome(find_blocking_handler(HANDLERS_A))
+    culprit_b = await outcome(find_blocking_handler(HANDLERS_B))
+    fixed_result = await outcome(render_invoice_fixed())
+    fixed_lag = await outcome(loop_lag_during(render_invoice_fixed))
+    run_checks(
+        [
+            ("set A: the blocking handler", lambda: culprit_a, "render_invoice"),
+            ("set B: the blocking handler", lambda: culprit_b, "lookup_tax"),
+            ("fixed version: same result", lambda: fixed_result, {"file": "invoice-42.pdf"}),
+            (
+                "fixed version: loop lag under 50 ms",
+                lambda: isinstance(fixed_lag, float) and fixed_lag < 0.05,
+                True,
+            ),
+        ]
+    )
+
+    async def request_id_scenario() -> dict[str, object]:
+        request_records.clear()
+        async with make_traced_client(httpx.MockTransport(echo_request_id_api)) as traced_client:
+            many = await asyncio.gather(
+                *(handle_request(traced_client, f"/orders/{n}", f"req-{n:02d}") for n in range(20))
+            )
+            generated = await handle_request(traced_client, "/orders/new")
+        return {
+            "many": many,
+            "generated": generated,
+            "caller_sees": REQUEST_ID.get(),
+            "records": list(request_records),
+        }
+
+    def records_match(scenario: object) -> bool:
+        records = scenario_field(scenario, "records")
+        tagged = [(rid, message) for rid, message in records if "/orders/new" not in message]
+        return len(records) == 42 and all(
+            rid == f"req-{message.rsplit('/', 1)[1]:0>2}" for rid, message in tagged
+        )
+
+    traced = await outcome(request_id_scenario())
+    run_checks(
+        [
+            (
+                "header carries each request's id",
+                lambda: [reply["echoed"] for reply in scenario_field(traced, "many")],
+                [f"req-{n:02d}" for n in range(20)],
+            ),
+            (
+                "worker thread sees the id",
+                lambda: all(
+                    reply["audit"] == reply["request_id"]
+                    for reply in scenario_field(traced, "many")
+                ),
+                True,
+            ),
+            ("40 + 2 log lines, each tagged with its own id", lambda: records_match(traced), True),
+            (
+                "generated id: 8 hex chars, echoed",
+                lambda: (
+                    len(scenario_field(traced, "generated")["request_id"]),
+                    scenario_field(traced, "generated")["echoed"]
+                    == scenario_field(traced, "generated")["request_id"],
+                ),
+                (8, True),
+            ),
+            ("caller's context restored", lambda: scenario_field(traced, "caller_sees"), "-"),
+        ]
+    )
+
+    store_ids = list(range(STORE_COUNT))
+    failing_stores = sorted(store for store in store_ids if store % 50 == 7 or store % 97 == 3)
+    expected_sales = {
+        "total": sum(store * 37 % 1000 for store in store_ids if store not in failing_stores),
+        "ok": STORE_COUNT - len(failing_stores),
+        "failed": failing_stores,
+    }
+    store_tracker.reset()
+    async with mock_client(sales_api) as sales_client:
+        with Timer("aggregate_sales", report=None) as aggregate_timer:
+            aggregated = await outcome(aggregate_sales(sales_client, store_ids))
+    run_checks(
+        [
+            ("totals, ok count and failed ids", lambda: aggregated, expected_sales),
+            ("at most 50 in flight, and concurrent", lambda: 1 < store_tracker.peak <= 50, True),
+            (
+                "each 503 store retried exactly once",
+                lambda: {store_tracker.calls[store] for store in store_ids if store % 40 == 11},
+                {2},
+            ),
+            (
+                "hung stores cut off (< 1 s overall)",
+                lambda: isinstance(aggregated, dict) and aggregate_timer.elapsed_seconds < 1.0,
+                True,
+            ),
+        ]
+    )
+    if isinstance(aggregated, dict):
+        seconds_taken = aggregate_timer.elapsed_seconds
+        print(f"aggregate_sales took {seconds_taken:.2f} s for {STORE_COUNT} endpoints")
+
+
+def check_lab_5_4() -> None:
+    """Run every Lab 5.4 check (each check prints PASS/FAIL)."""
+    asyncio.run(_lab_5_4_checks())
+
+
 if __name__ == "__main__":
     selected = set(sys.argv[1:])
-    for lab_title, check_lab in [("Lab 5.1", check_lab_5_1), ("Lab 5.2", check_lab_5_2)]:
+    labs = [
+        ("Lab 5.1", check_lab_5_1),
+        ("Lab 5.2", check_lab_5_2),
+        ("Lab 5.3", check_lab_5_3),
+        ("Lab 5.4", check_lab_5_4),
+    ]
+    for lab_title, check_lab in labs:
         if selected and lab_title not in selected:
             continue
         print(f"===== {lab_title} =====")
