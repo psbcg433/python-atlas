@@ -387,13 +387,14 @@ def _gradual_cells() -> list[NotebookNode]:
             lists. mypy would report both calls (`[arg-type]`); at run time you only find out
             when the wrong result causes trouble somewhere else.
             """,
-            """
+            '''
             def double(value: int) -> int:
+                """Twice the value (annotated for int, but nothing enforces it at run time)."""
                 return value * 2
 
 
             print(double("ab"), double([0]))
-            """,
+            ''',
         ),
     ]
 
@@ -422,11 +423,14 @@ def _annotation_syntax_cells() -> list[NotebookNode]:
 
 
             class CheckoutSettings:
+                """Settings with one defaulted and one annotation-only attribute."""
+
                 currency: str = "INR"
                 customer_name: str  # annotation only: recorded, but no attribute is created
 
 
             def running_total() -> int:
+                """Read a local that was annotated but never assigned."""
                 total: int  # annotation only: no local variable yet
                 return total  # noqa: F821  (deliberate: no value was assigned)
 
@@ -451,7 +455,7 @@ def _annotation_syntax_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             from typing import ClassVar, Final
 
             MAX_RETRIES: Final = 3
@@ -459,16 +463,21 @@ def _annotation_syntax_cells() -> list[NotebookNode]:
 
             @dataclass
             class InvoiceLine:
+                """One invoice line; TAX_RATE is a ClassVar, so it is not a field."""
+
                 TAX_RATE: ClassVar[Decimal] = Decimal("0.18")  # class-level, not a field
                 description: str
                 amount: Decimal
 
 
             line = InvoiceLine("Tea", Decimal("100"))
-            print(f"{[f.name for f in fields(InvoiceLine)]=}  (TAX_RATE is not a field)")
+            print(f"{[line_field.name for line_field in fields(InvoiceLine)]=}  (TAX_RATE is not a field)")
             MAX_RETRIES = 5  # the interpreter allows it; the checker below does not
             print(f"{MAX_RETRIES=}")
-            """
+            '''
+        ),
+        md(
+            "mypy flags both run-time escapes from the cell above: the `Final` re-binding and the `ClassVar` set through an instance."
         ),
         code(
             r'''
@@ -507,16 +516,19 @@ def _annotation_syntax_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             class Order:
+                """An order whose annotations name classes defined later."""
+
                 customer: Customer  # defined further down: fine in 3.14+
 
-                def ship_to(self) -> Address: ...
+                def ship_to(self) -> Address:
+                    """Where the order goes (a stub: only the annotation matters here)."""
 
 
             print(f"{Order.__annotate__=}")
             print(f"{raised_message(lambda: Order.__annotations__)=}  (Customer does not exist yet)")
-            """
+            '''
         ),
         md(
             """
@@ -531,7 +543,7 @@ def _annotation_syntax_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             from annotationlib import Format, get_annotations
 
             print(f"{get_annotations(Order, format=Format.FORWARDREF)=}")
@@ -540,11 +552,13 @@ def _annotation_syntax_cells() -> list[NotebookNode]:
 
 
             class Customer:
+                """Defined after Order, to show deferred annotation evaluation."""
+
                 name: str
 
 
             print(f"{get_annotations(Order, format=Format.VALUE)=}  (now it resolves)")
-            """
+            '''
         ),
         md(
             """
@@ -581,9 +595,11 @@ def _collection_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             @dataclass
             class User:
+                """A team member, used inside nested collection types."""
+
                 name: str
 
 
@@ -592,7 +608,7 @@ def _collection_cells() -> list[NotebookNode]:
             print(f"{type(alias).__name__=}  {typing.get_origin(alias)=}  {typing.get_args(alias)=}")
             print(f"{raised_message(lambda: isinstance(team_members, dict[str, list[User]]))=}")
             print(f"{typing.get_args(tuple[int, str])=}  {typing.get_args(tuple[int, ...])=}")
-            """
+            '''
         ),
         md("The checker does track element types and tuple lengths:"),
         code(
@@ -666,7 +682,12 @@ def _collection_cells() -> list[NotebookNode]:
                 return sum(prices)
 
 
-            print(total([10.0, 20.0]), total((10.0, 20.0)), total({10.0, 20.0}), total(p for p in [10.0, 20.0]))
+            print(
+                total([10.0, 20.0]),
+                total((10.0, 20.0)),
+                total({10.0, 20.0}),
+                total(price for price in [10.0, 20.0]),
+            )
             print(total({"tea": 120.5, "rice": 80.0}.values()))
             '''
         ),
@@ -1019,34 +1040,50 @@ def _precise_type_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r'''
+            r"""
             from typing import NewType, Self
 
             UserId = NewType("UserId", int)
             OrderId = NewType("OrderId", int)
             user_id = UserId(42)
             print(f"{user_id=}  {type(user_id).__name__=}  {user_id == 42=}  {UserId=}")
-
-
+            """
+        ),
+        md(
+            """
+            **`Self`** in a fluent API: `where()` is defined on the base class, yet
+            called on an `OrderQuery` it returns an `OrderQuery`.
+            """
+        ),
+        code(
+            r'''
             class QueryBuilder:
                 """Fluent builder: every method returns the builder itself."""
 
                 def __init__(self) -> None:
+                    """Start with no conditions."""
                     self.conditions: list[str] = []
 
                 def where(self, condition: str) -> Self:
+                    """Add one SQL condition and return self for chaining."""
                     self.conditions.append(condition)
                     return self
 
 
             class OrderQuery(QueryBuilder):
+                """A QueryBuilder subclass whose methods still return OrderQuery."""
+
                 def unpaid(self) -> Self:
+                    """Shortcut for the unpaid-orders condition."""
                     return self.where("paid = false")
 
 
             query = OrderQuery().where("city = 'Pune'").unpaid()  # where() returned OrderQuery
             print(f"{type(query).__name__=}  {query.conditions=}")
             '''
+        ),
+        md(
+            "mypy rejects a `UserId` and a plain `int` where an `OrderId` is required, and `reveal_type` shows `where()` returning `OrderQuery`."
         ),
         code(
             r'''
@@ -1101,11 +1138,15 @@ def _precise_type_cells() -> list[NotebookNode]:
 
 
             class Address(TypedDict):
+                """A postal address; the PIN code may be missing."""
+
                 city: str
                 pin: NotRequired[str]
 
 
             class ProductPatch(TypedDict, total=False):
+                """Partial product update: sku is required and read-only."""
+
                 sku: Required[ReadOnly[str]]
                 name: str
                 price: Decimal
@@ -1190,9 +1231,11 @@ def _generic_cells() -> list[NotebookNode]:
                 """A last-in, first-out stack of T."""
 
                 def __init__(self) -> None:
+                    """Start with an empty stack."""
                     self._items: list[T] = []
 
                 def push(self, item: T) -> None:
+                    """Put one item on top."""
                     self._items.append(item)
 
 
@@ -1269,6 +1312,9 @@ def _generic_cells() -> list[NotebookNode]:
             )
             '''
         ),
+        md(
+            "The same bound and default at run time: `__bound__`, `has_default()` and `__default__`."
+        ),
         code(
             r'''
             class Page[T = dict[str, object]]:
@@ -1309,7 +1355,6 @@ def _generic_cells() -> list[NotebookNode]:
             check(
                 """
                 from collections.abc import Sequence
-                from dataclasses import dataclass
 
                 def average(values: list[float]) -> float:
                     return sum(values) / len(values)
@@ -1321,6 +1366,24 @@ def _generic_cells() -> list[NotebookNode]:
                 ints: list[int] = [1, 2, 3]
                 average(ints)          # list is invariant
                 average_ro(ints)       # Sequence is covariant
+                """,
+                name="variance_builtin",
+                checkers=("mypy",),
+            )
+            '''
+        ),
+        md(
+            """
+            Your own generic classes follow the same rule, inferred from how they use `T`: the
+            frozen `ReadOnlyBox` only gives `T` out (covariant, accepted), while the mutable
+            `Box` also takes `T` in (invariant, rejected):
+            """
+        ),
+        code(
+            r'''
+            check(
+                """
+                from dataclasses import dataclass
 
                 @dataclass(frozen=True)
                 class ReadOnlyBox[T]:  # only reads T: inferred covariant
@@ -1347,6 +1410,38 @@ def _generic_cells() -> list[NotebookNode]:
         ),
         md(
             """
+            **Contravariance.** A class that only *takes* `T` in (a sink, a handler, a writer)
+            is inferred **contravariant**: the subtype arrow flips. A `Sink[int]` can stand in
+            for a `Sink[bool]`, because anything that accepts every `int` accepts a `bool`; the
+            reverse is an error. Expect exactly one mypy error, on the last line:
+            """
+        ),
+        code(
+            r'''
+            check(
+                """
+                class Sink[T]:  # T appears only as a parameter: inferred contravariant
+                    def send(self, item: T) -> None:
+                        print(item)
+
+                def feed_bools(sink: Sink[bool]) -> None:
+                    sink.send(True)
+
+                def feed_ints(sink: Sink[int]) -> None:
+                    sink.send(42)
+
+                int_sink: Sink[int] = Sink()
+                bool_sink: Sink[bool] = Sink()
+                feed_bools(int_sink)   # fine: a Sink[int] accepts any bool
+                feed_ints(bool_sink)   # error: a Sink[bool] cannot take 42
+                """,
+                name="contravariance",
+                checkers=("mypy",),
+            )
+            '''
+        ),
+        md(
+            """
             **The old `TypeVar` syntax** is what you will read in most existing code (and still
             write when supporting Python ≤ 3.11). Same meaning, more ceremony: the type variable
             is a module-level object, classes inherit from `Generic[T]`, and variance must be
@@ -1365,7 +1460,10 @@ def _generic_cells() -> list[NotebookNode]:
 
 
             class OldBox(Generic[T]):  # noqa: UP046
+                """A one-item generic box written with the pre-3.12 TypeVar syntax."""
+
                 def __init__(self, item: T) -> None:
+                    """Store the item."""
                     self.item = item
 
 
@@ -1405,7 +1503,6 @@ def _callable_cells() -> list[NotebookNode]:
             r'''
             check(
                 """
-                from collections.abc import Callable
                 from decimal import Decimal
                 from typing import Protocol
 
@@ -1424,16 +1521,38 @@ def _callable_cells() -> list[NotebookNode]:
                 def apply(rule: PriceRule, amount: Decimal) -> Decimal:
                     return rule(amount, tier="gold")
 
-                def apply_simple(rule: Callable[[Decimal], Decimal], amount: Decimal) -> Decimal:
-                    return rule(amount)
-
                 apply(ten_percent_off, Decimal("100"))
                 apply(wrong_keyword, Decimal("100"))
                 apply(simple, Decimal("100"))
+                """,
+                name="callables",
+                checkers=("mypy",),
+            )
+            '''
+        ),
+        md(
+            """
+            A plain `Callable[[Decimal], Decimal]` is enough when only the positional shape
+            matters: `simple` fits, `len` (which takes a sized object and returns `int`) does not.
+            """
+        ),
+        code(
+            r'''
+            check(
+                """
+                from collections.abc import Callable
+                from decimal import Decimal
+
+                def simple(amount: Decimal) -> Decimal:
+                    return amount
+
+                def apply_simple(rule: Callable[[Decimal], Decimal], amount: Decimal) -> Decimal:
+                    return rule(amount)
+
                 apply_simple(simple, Decimal("100"))
                 apply_simple(len, Decimal("100"))
                 """,
-                name="callables",
+                name="callables_plain",
                 checkers=("mypy",),
             )
             '''
@@ -1451,7 +1570,6 @@ def _callable_cells() -> list[NotebookNode]:
             r'''
             check(
                 """
-                import functools
                 from collections.abc import Callable
                 from typing import Any
 
@@ -1460,6 +1578,31 @@ def _callable_cells() -> list[NotebookNode]:
                         return func(*args, **kwargs)
                     return wrapper
 
+                @logged_loose
+                def price_loose(sku: str, quantity: int = 1) -> float:
+                    return 10.0 * quantity
+
+                price_loose(42)            # not caught
+                reveal_type(price_loose("TEA"))
+                """,
+                name="paramspec_loose",
+                checkers=("mypy",),
+            )
+            '''
+        ),
+        md(
+            """
+            The same function behind the `[**P, R]` decorator: the bad call is caught and the
+            decorated function keeps its full signature.
+            """
+        ),
+        code(
+            r'''
+            check(
+                """
+                import functools
+                from collections.abc import Callable
+
                 def logged[**P, R](func: Callable[P, R]) -> Callable[P, R]:
                     @functools.wraps(func)
                     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -1467,18 +1610,12 @@ def _callable_cells() -> list[NotebookNode]:
                         return func(*args, **kwargs)
                     return wrapper
 
-                @logged_loose
-                def price_loose(sku: str, quantity: int = 1) -> float:
-                    return 10.0 * quantity
-
                 @logged
                 def price(sku: str, quantity: int = 1) -> float:
                     return 10.0 * quantity
 
-                price_loose(42)            # not caught
                 price(42)                  # caught
                 reveal_type(price)
-                reveal_type(price_loose("TEA"))
                 """,
                 name="paramspec",
                 checkers=("mypy",),
@@ -1501,7 +1638,10 @@ def _callable_cells() -> list[NotebookNode]:
 
 
             class Connection:
+                """A fake database connection for the Concatenate demo."""
+
                 def execute(self, sql: str) -> list[tuple[object, ...]]:
+                    """Pretend to run sql; return one fake row."""
                     return [(sql.split()[-1], 1)]
 
 
@@ -1510,6 +1650,7 @@ def _callable_cells() -> list[NotebookNode]:
 
                 @functools.wraps(func)
                 def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+                    """Call func with a new Connection in front of the caller's arguments."""
                     return func(Connection(), *args, **kwargs)
 
                 return wrapper
@@ -1517,6 +1658,7 @@ def _callable_cells() -> list[NotebookNode]:
 
             @with_connection
             def count_orders(connection: Connection, city: str) -> int:
+                """Count orders in a city (the decorator supplies the connection)."""
                 return len(connection.execute(f"SELECT 1 FROM orders WHERE city = {city}"))
 
 
@@ -1583,6 +1725,16 @@ def _callable_cells() -> list[NotebookNode]:
 
             print(f"{parse_amount('1,234.50')=}  {parse_amount(None)=}")
             print(f"{len(get_overloads(parse_amount))=}")
+            '''
+        ),
+        md(
+            """
+            The checker's view of the same overloads: each call gets the return type of
+            the matching signature, and an `int` matches none.
+            """
+        ),
+        code(
+            r'''
             check(
                 """
                 from decimal import Decimal
@@ -1632,23 +1784,38 @@ def _class_typing_cells() -> list[NotebookNode]:
 
 
             class Model:
+                """Base model with a describe() method subclasses override."""
+
                 def describe(self) -> str:
+                    """Where instances of this model are stored."""
                     return f"{type(self).__name__} stored in {type(self).__name__.lower()}s"
 
 
             class Product(Model):
+                """A Model whose describe() is marked @override."""
+
                 @override
                 def describe(self) -> str:
+                    """Where products are stored."""
                     return "Product stored in the catalogue"
-
-
+            '''
+        ),
+        md(
+            """
+            `type[M]` with a bound: `create` accepts any `Model` subclass and returns an
+            instance of that subclass. `@final` closes `Money` to subclassing.
+            """
+        ),
+        code(
+            r'''
             def create[M: Model](model_class: type[M]) -> M:
                 """Instantiate any Model subclass; the result has that subclass's type."""
                 return model_class()
 
 
             @final
-            class Money: ...
+            class Money:
+                """A class nothing may subclass."""
 
 
             print(f"{create(Product).describe()=}  {create(Model).describe()=}")
@@ -1660,7 +1827,7 @@ def _class_typing_cells() -> list[NotebookNode]:
             r'''
             check(
                 """
-                from typing import Protocol, final, override
+                from typing import Protocol
 
                 class Repository[T](Protocol):
                     def get(self, key: str) -> T | None: ...
@@ -1679,6 +1846,23 @@ def _class_typing_cells() -> list[NotebookNode]:
 
                 restock(InMemoryRepository[int](), "TEA-500")
                 restock(InMemoryRepository[str](), "TEA-500")
+                """,
+                name="generic_protocol",
+                checkers=("mypy",),
+            )
+            '''
+        ),
+        md(
+            """
+            `@override` and `@final` on methods: a misspelt override (`costs`) and an override
+            of a final method are both reported.
+            """
+        ),
+        code(
+            r'''
+            check(
+                """
+                from typing import final, override
 
                 class Shipment:
                     def cost(self) -> int:
@@ -1693,6 +1877,27 @@ def _class_typing_cells() -> list[NotebookNode]:
                         return 120
                     def tracking_id(self) -> str:  # overrides a final method
                         return "EXP-1"
+                """,
+                name="override_final",
+                checkers=("mypy",),
+            )
+            '''
+        ),
+        md(
+            """
+            A `@final` class cannot be subclassed, and it is not a `type[Shipment]`, so passing
+            it to `build` is an error while `Express` is fine:
+            """
+        ),
+        code(
+            r'''
+            check(
+                """
+                from typing import final
+
+                class Shipment: ...
+
+                class Express(Shipment): ...
 
                 @final
                 class Money: ...
@@ -1750,6 +1955,16 @@ def _custom_narrowing_cells() -> list[NotebookNode]:
 
 
             print(f"{is_str_list(['a', 'b'])=}  {is_str_list(['a', 1])=}  {is_decimal(Decimal('1'))=}")
+            '''
+        ),
+        md(
+            """
+            What the checker infers in each branch (note that `TypeIs` also narrows the
+            `else` branch):
+            """
+        ),
+        code(
+            r'''
             check(
                 """
                 from decimal import Decimal
@@ -1787,6 +2002,8 @@ def _custom_narrowing_cells() -> list[NotebookNode]:
             r'''
             @dataclass(frozen=True)
             class Paid:
+                """A paid order event (kind is the discriminant)."""
+
                 order_id: int
                 amount: Decimal
                 kind: Literal["paid"] = "paid"
@@ -1794,14 +2011,23 @@ def _custom_narrowing_cells() -> list[NotebookNode]:
 
             @dataclass(frozen=True)
             class Refunded:
+                """A refunded order event (kind is the discriminant)."""
+
                 order_id: int
                 reason: str
                 kind: Literal["refunded"] = "refunded"
 
 
             type PaymentEvent = Paid | Refunded
-
-
+            '''
+        ),
+        md(
+            """
+            `match` on the tag narrows `event` to one member in each `case`:
+            """
+        ),
+        code(
+            r'''
             def describe_event(event: PaymentEvent) -> str:
                 """One line per event; exhaustive over the tag."""
                 match event.kind:
@@ -1814,6 +2040,9 @@ def _custom_narrowing_cells() -> list[NotebookNode]:
             for event in (Paid(7, Decimal("499")), Refunded(8, "damaged")):
                 print(describe_event(event))
             '''
+        ),
+        md(
+            "The same pattern with `TypedDict`s: each `method` check narrows `payment`, so after the card and UPI checks only `CashPayment` is left, and reading its missing `vpa` key is an error."
         ),
         code(
             r'''
@@ -1876,18 +2105,22 @@ def _annotated_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             from typing import Annotated, get_args, get_origin, get_type_hints
 
 
             @dataclass(frozen=True)
             class Range:
+                """Inclusive numeric bounds, used as Annotated metadata."""
+
                 minimum: int
                 maximum: int
 
 
             @dataclass
             class Signup:
+                """A sign-up form whose fields carry Annotated metadata."""
+
                 name: Annotated[str, "display name"]
                 age: Annotated[int, Range(18, 120)]
                 referral: str | None = None
@@ -1899,7 +2132,7 @@ def _annotated_cells() -> list[NotebookNode]:
             print(f"{get_origin(hints['age']) is Annotated=}  {get_args(hints['age'])=}")
             print(f"{hints['age'].__metadata__=}")
             print(f"{get_origin(hints['referral'])=}  {get_args(hints['referral'])=}")
-            """
+            '''
         ),
         md(
             """
@@ -1935,7 +2168,7 @@ def _annotated_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             if importlib.util.find_spec("pydantic") is None:
                 print("SKIP: pydantic is not installed (uv add pydantic)")
             else:
@@ -1943,6 +2176,8 @@ def _annotated_cells() -> list[NotebookNode]:
                 from pydantic import BaseModel, Field, ValidationError
 
                 class SignupModel(BaseModel):
+                    """The same sign-up form, validated by Pydantic."""
+
                     name: Annotated[str, Len(1, 40)]
                     age: Annotated[int, Field(ge=18, le=120)]
                     referral: str | None = None
@@ -1953,7 +2188,7 @@ def _annotated_cells() -> list[NotebookNode]:
                 except ValidationError as error:
                     for problem in error.errors():
                         print(f"  {problem['loc'][0]}: {problem['msg']}")
-            """
+            '''
         ),
         md(
             """
@@ -1988,16 +2223,17 @@ def _annotated_cells() -> list[NotebookNode]:
             turns the `None` return annotation into `NoneType`. `__annotations__` holds the raw
             objects, and `Annotated` aliases compare equal when their type and metadata match.
             """,
-            """
+            '''
             from typing import Annotated, get_type_hints
 
 
-            def ship(weight: Annotated[float, "kg"]) -> None: ...
+            def ship(weight: Annotated[float, "kg"]) -> None:
+                """Ship a parcel (only the annotation matters here)."""
 
 
             print(get_type_hints(ship))
             print(ship.__annotations__["weight"] == Annotated[float, "kg"])
-            """,
+            ''',
         ),
     ]
 
@@ -2041,25 +2277,36 @@ def _running_checker_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            TYPED_SHOP_PYPROJECT = """
+                [tool.mypy]
+                strict = true
+                files = ["src"]
+                mypy_path = "src"
+                warn_unreachable = true
+
+                [[tool.mypy.overrides]]
+                module = ["legacy", "legacy.*"]
+                ignore_errors = true                  # gradual adoption: not checked yet
+
+                [tool.pyright]
+                include = ["src"]
+                exclude = ["src/legacy"]
+                typeCheckingMode = "strict"
+                pythonVersion = "3.15"
+            """
+            '''
+        ),
+        md(
+            """
+            The project itself: a typed `shop` package with one deliberately untyped function,
+            and a `legacy` package with a real bug that the configuration leaves unchecked.
+            """
+        ),
+        code(
+            r'''
             typed_shop = UNIT42_DIR / "typed-shop"
             files = {
-                "pyproject.toml": """
-                    [tool.mypy]
-                    strict = true
-                    files = ["src"]
-                    mypy_path = "src"
-                    warn_unreachable = true
-
-                    [[tool.mypy.overrides]]
-                    module = ["legacy", "legacy.*"]
-                    ignore_errors = true                  # gradual adoption: not checked yet
-
-                    [tool.pyright]
-                    include = ["src"]
-                    exclude = ["src/legacy"]
-                    typeCheckingMode = "strict"
-                    pythonVersion = "3.15"
-                """,
+                "pyproject.toml": TYPED_SHOP_PYPROJECT,
                 "src/shop/__init__.py": "",
                 "src/shop/pricing.py": """
                     from decimal import Decimal
@@ -2079,6 +2326,17 @@ def _running_checker_cells() -> list[NotebookNode]:
             for relative_path, text in files.items():
                 (typed_shop / relative_path).parent.mkdir(parents=True, exist_ok=True)
                 (typed_shop / relative_path).write_text(textwrap.dedent(text).lstrip("\n"))
+            print(sorted(str(path.relative_to(typed_shop)) for path in typed_shop.rglob("*.py")))
+            '''
+        ),
+        md(
+            """
+            Run both checkers from the project folder: each reports `bad_total` in `shop` and
+            nothing from `legacy`.
+            """
+        ),
+        code(
+            r"""
             for command in (["mypy", "--cache-dir", "../.mypy_cache"], ["pyright"]):
                 result = subprocess.run(
                     [str(VENV_BIN / command[0]), *command[1:]],
@@ -2093,7 +2351,7 @@ def _running_checker_cells() -> list[NotebookNode]:
                         ANSI_ESCAPE.sub("", result.stdout).replace(str(typed_shop), "<project>").strip(), "  "
                     )
                 )
-            '''
+            """
         ),
         md(
             """
@@ -2337,7 +2595,13 @@ def _lab_hint_cells() -> list[NotebookNode]:
                 return "unknown"
             """
         ),
-        md("Run the checks."),
+        md(
+            """
+            Run the checks. They compare your hints as written in the source, read with
+            `annotationlib.get_annotations(..., format=Format.STRING)` (*New in 3.14*; on 3.12
+            and 3.13 the closest is `inspect.get_annotations`, which evaluates them).
+            """
+        ),
         code(
             r'''
             HINT_FUNCTIONS = [
@@ -2404,7 +2668,7 @@ def _lab_hint_cells() -> list[NotebookNode]:
                             chunk([1, 2, 3], 2),
                             status_text(404),
                             first_or_default([], 7),
-                            apply_twice(lambda n: n * 3, 2),
+                            apply_twice(lambda number: number * 3, 2),
                         ),
                         ({"a": 2, "b": 1}, [[1, 2], [3]], "client error", 7, 18),
                     ),
@@ -2424,7 +2688,7 @@ def _lab_hint_cells() -> list[NotebookNode]:
               `is_ok()` and `unwrap()`. `Err.unwrap()` raises
               `ValueError(f"unwrap on Err: {self.error!r}")`. `Result[T, E]` is their union
               (given).
-            - `safe_divide(a, b)` returns `Ok(a / b)` or `Err("division by zero")`.
+            - `safe_divide(dividend, divisor)` returns `Ok(dividend / divisor)` or `Err("division by zero")`.
 
             The checks also ask mypy what `Stack[int]().pop()` and `safe_divide(1, 2)` are, and
             expect an error for `Stack[int]().push("tea")`.
@@ -2436,50 +2700,64 @@ def _lab_hint_cells() -> list[NotebookNode]:
                 """A last-in, first-out stack."""
 
                 def __init__(self) -> None:
+                    """Start with an empty stack."""
                     self._items: list[T] = []
 
                 def push(self, item: T) -> None:
+                    """Put one item on top."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Stack.push")
 
                 def pop(self) -> T:
+                    """Remove and return the top item (IndexError if empty)."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Stack.pop")
 
                 def peek(self) -> T | None:
+                    """The top item without removing it, or None if empty."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Stack.peek")
 
                 def __len__(self) -> int:
+                    """Number of items on the stack."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Stack.__len__")
 
                 def is_empty(self) -> bool:
+                    """True when the stack has no items."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Stack.is_empty")
 
 
             @dataclass(frozen=True)
             class Ok[T]:
+                """A successful result holding a value."""
+
                 value: T
 
                 def is_ok(self) -> bool:
+                    """Always True for Ok."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Ok.is_ok")
 
                 def unwrap(self) -> T:
+                    """The stored value."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Ok.unwrap")
 
 
             @dataclass(frozen=True)
             class Err[E]:
+                """A failed result holding an error."""
+
                 error: E
 
                 def is_ok(self) -> bool:
+                    """Always False for Err."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Err.is_ok")
 
                 def unwrap(self) -> typing.Never:
+                    """Always raises: an Err has no value."""
                     raise NotImplementedError("Lab 4.2 exercise 2: Err.unwrap")
 
 
             type Result[T, E] = Ok[T] | Err[E]
 
 
-            def safe_divide(a: float, b: float) -> Result[float, str]:
+            def safe_divide(dividend: float, divisor: float) -> Result[float, str]:
                 """Ok(a / b), or Err("division by zero")."""
                 raise NotImplementedError("Lab 4.2 exercise 2: safe_divide")
             '''
@@ -2497,6 +2775,7 @@ def _lab_hint_cells() -> list[NotebookNode]:
 
 
             def stack_trace() -> list[object]:
+                """Push two items, then record every Stack method's answer."""
                 stack = Stack[str]()
                 stack.push("tea")
                 stack.push("rice")
@@ -2504,6 +2783,7 @@ def _lab_hint_cells() -> list[NotebookNode]:
 
 
             def generic_errors() -> list[str]:
+                """mypy error codes for code that misuses the generic types."""
                 errors = mypy_errors(Stack, Ok, Err, safe_divide, extra=GENERIC_USAGE)
                 return [error.split("  [")[-1] for error in errors]
 
@@ -2530,8 +2810,8 @@ def _lab_hint_cells() -> list[NotebookNode]:
                     (
                         "PEP 695 parameters",
                         lambda: (
-                            [p.__name__ for p in Stack.__type_params__],
-                            [p.__name__ for p in Result.__type_params__],
+                            [parameter.__name__ for parameter in Stack.__type_params__],
+                            [parameter.__name__ for parameter in Result.__type_params__],
                         ),
                         (["T"], ["T", "E"]),
                     ),
@@ -2585,6 +2865,7 @@ def _lab_hint_cells() -> list[NotebookNode]:
                 calls = {"count": 0}
 
                 def fetch(sku: str) -> str:
+                    """Fail the first `failures` calls, then succeed."""
                     calls["count"] += 1
                     if calls["count"] <= failures:
                         raise error
@@ -2630,7 +2911,7 @@ def _lab_hint_cells() -> list[NotebookNode]:
                     ),
                     (
                         "mypy: bad call rejected, nothing else",
-                        lambda: [e.split("  [")[-1] for e in mypy_errors(retry, extra=RETRY_USAGE)],
+                        lambda: [error.split("  [")[-1] for error in mypy_errors(retry, extra=RETRY_USAGE)],
                         ["arg-type]"],
                     ),
                 ]
@@ -2678,7 +2959,7 @@ def _lab_hint_cells() -> list[NotebookNode]:
             def overload_source() -> str:
                 """The overloads and the implementation: source of the whole cell block."""
                 return (
-                    "\n".join(source_of(f) for f in typing.get_overloads(parse_value))
+                    "\n".join(source_of(overload_stub) for overload_stub in typing.get_overloads(parse_value))
                     + "\n"
                     + source_of(parse_value)
                 )
@@ -2690,7 +2971,9 @@ def _lab_hint_cells() -> list[NotebookNode]:
                     ("float", lambda: parse_value("2.5", "float"), 2.5),
                     (
                         "bool",
-                        lambda: [parse_value(t, "bool") for t in ("Yes", "TRUE", "1", "no", "False", "0")],
+                        lambda: [
+                            parse_value(text, "bool") for text in ("Yes", "TRUE", "1", "no", "False", "0")
+                        ],
                         [True, True, True, False, False, False],
                     ),
                     ("bad bool", lambda: raised_error_name(lambda: parse_value("maybe", "bool")), "ValueError"),
@@ -2950,11 +3233,12 @@ def _lab_fix_cells() -> list[NotebookNode]:
         ),
         md("Run the checks."),
         code(
-            r"""
+            r'''
             INVENTORY_MODEL = [CurrencyMismatchError, Money, InsufficientStockError, Product, Warehouse]
 
 
             def warehouse_story() -> tuple[object, ...]:
+                """Exercise the typed warehouse model and collect the results."""
                 pune = Warehouse("PNQ")
                 pune.add_product(Product("TEA-500", "Assam tea", Money("120.50")))
                 pune.add_product(Product("RICE-1K", "Basmati", Money(80)))
@@ -2992,7 +3276,7 @@ def _lab_fix_cells() -> list[NotebookNode]:
                     ),
                 ]
             )
-            """
+            '''
         ),
         md(
             """
@@ -3017,17 +3301,23 @@ def _lab_fix_cells() -> list[NotebookNode]:
             r'''
             @dataclass(frozen=True)
             class Range:
+                """Inclusive numeric bounds for an int field."""
+
                 minimum: int
                 maximum: int
 
 
             @dataclass(frozen=True)
             class MaxLength:
+                """Maximum length for a str field."""
+
                 limit: int
 
 
             @dataclass(frozen=True)
             class Pattern:
+                """A regular expression a str field must fully match."""
+
                 regex: str
 
 
@@ -3038,9 +3328,11 @@ def _lab_fix_cells() -> list[NotebookNode]:
         ),
         md("Run the checks."),
         code(
-            r"""
+            r'''
             @dataclass
             class CustomerForm:
+                """A form whose Annotated fields the validator checks."""
+
                 name: Annotated[str, MaxLength(20)]
                 age: Annotated[int, Range(0, 150)]
                 email: Annotated[str, Pattern(r"[^@]+@[^@]+"), MaxLength(40)]
@@ -3083,7 +3375,7 @@ def _lab_fix_cells() -> list[NotebookNode]:
                     ),
                 ]
             )
-            """
+            '''
         ),
     ]
 

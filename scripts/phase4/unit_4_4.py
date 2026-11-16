@@ -1252,12 +1252,13 @@ def _regex_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             print(f"{re.sub(r'(\d{4})-(\d{2})-(\d{2})', r'\3/\2/\1', 'due 2026-11-07')=}")
             print(f"{re.sub(r'(?P<sku>[A-Z]{3})-(?P<n>\d+)', r'\g<sku>#\g<n>', 'TEA-500 MUG-02')=}")
 
 
             def mask_card(card_match: re.Match[str]) -> str:
+                """Replace a matched card number with its last four digits."""
                 digits = re.sub(r"\D", "", card_match.group())
                 return "**** **** **** " + digits[-4:]
 
@@ -1265,7 +1266,7 @@ def _regex_cells() -> list[NotebookNode]:
             print(f"{re.sub(r'\b(?:\d{4}[ -]?){3}\d{4}\b', mask_card, 'card 4111 1111 1111 1234 ok')=}")
             print(f"{re.subn(r'\s+', ' ', 'too    many   spaces')=}")
             print(f"{re.split(r'[;,]\s*', 'tea, mug;jar,  spoon')=}")
-            """
+            '''
         ),
         md(
             """
@@ -1396,21 +1397,36 @@ def _format_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             class OrderStatus(enum.StrEnum):
+                """Order states, stored as their string values."""
+
                 PAID = "paid"
                 SHIPPED = "shipped"
 
 
             @dataclasses.dataclass
             class OrderLine:
+                """One order line with a Decimal price."""
+
                 sku: str
                 quantity: int
                 unit_price: Decimal
-
-
+            '''
+        ),
+        md(
+            """
+            The encoder: `default()` is called only for objects `json` cannot encode
+            itself, and must return something it can.
+            """
+        ),
+        code(
+            r'''
             class ShopEncoder(json.JSONEncoder):
+                """A JSONEncoder for Decimal, dates, enums and dataclasses."""
+
                 def default(self, value: object) -> object:
+                    """Convert a value json cannot encode into one it can."""
                     if isinstance(value, Decimal):
                         return str(value)
                     if isinstance(value, datetime | date):
@@ -1420,8 +1436,16 @@ def _format_cells() -> list[NotebookNode]:
                     if dataclasses.is_dataclass(value) and not isinstance(value, type):
                         return dataclasses.asdict(value)
                     return super().default(value)  # raises TypeError for anything else
-
-
+            '''
+        ),
+        md(
+            """
+            Plain `json.dumps` fails on the first unknown type; with `cls=ShopEncoder`
+            everything is converted, and truly unknown objects still raise `TypeError`.
+            """
+        ),
+        code(
+            r"""
             shipment = {
                 "placed_at": FIXED_MOMENT,
                 "status": OrderStatus.SHIPPED,
@@ -1459,6 +1483,7 @@ def _format_cells() -> list[NotebookNode]:
 
 
             def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                """object_pairs_hook that raises on duplicate keys."""
                 keys = [key for key, _ in pairs]
                 if len(keys) != len(set(keys)):
                     raise ValueError(f"duplicate keys in {keys}")
@@ -1877,7 +1902,7 @@ def _random_security_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             webhook_secret = b"whsec_demo_only_not_a_real_secret"
             body = b'{"event": "payment.captured", "order_id": 7, "amount": 67900}'
             timestamp = int(FIXED_MOMENT.timestamp())
@@ -1886,6 +1911,7 @@ def _random_security_cells() -> list[NotebookNode]:
 
 
             def signature_is_valid(received_body: bytes, received_signature: str) -> bool:
+                """Recompute the HMAC and compare it in constant time."""
                 expected = hmac.new(
                     webhook_secret, f"{timestamp}.".encode() + received_body, hashlib.sha256
                 ).hexdigest()
@@ -1894,7 +1920,7 @@ def _random_security_cells() -> list[NotebookNode]:
 
             print(f"{signature_is_valid(body, signature)=}")
             print(f"{signature_is_valid(body.replace(b'67900', b'100'), signature)=}  (tampered amount)")
-            """
+            '''
         ),
         md(
             """
@@ -1992,20 +2018,31 @@ def _cli_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             os.environ["PYTHON_COLORS"] = "0"  # plain argparse output in this notebook (3.14+ colours it)
 
 
             def report_command(arguments: argparse.Namespace) -> str:
+                """Handler for `shopctl report`."""
                 return f"report for {arguments.month} as {arguments.format}"
 
 
             def restock_command(arguments: argparse.Namespace) -> str:
+                """Handler for `shopctl restock`."""
                 verb = "would add" if arguments.dry_run else "added"
                 return f"{verb} {arguments.quantity} x {arguments.sku}"
-
-
+            '''
+        ),
+        md(
+            """
+            The parser: global flags, then one subparser per command, each pointing at
+            its handler with `set_defaults`:
+            """
+        ),
+        code(
+            r'''
             def build_shopctl() -> argparse.ArgumentParser:
+                """The shopctl parser: global flags plus report and restock subcommands."""
                 parser = argparse.ArgumentParser(prog="shopctl", description="Shop admin tool.")
                 verbosity = parser.add_mutually_exclusive_group()
                 verbosity.add_argument("-v", "--verbose", action="count", default=0, help="more output")
@@ -2030,7 +2067,7 @@ def _cli_cells() -> list[NotebookNode]:
                 arguments = shopctl.parse_args(argv)
                 print(f"{argv} -> {vars(arguments) | {'handler': arguments.handler.__name__}}")
                 print(f"   {arguments.handler(arguments)}")
-            """
+            '''
         ),
         md(
             """
@@ -2168,13 +2205,16 @@ def _text_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             @dataclasses.dataclass
             class Customer:
+                """A customer whose repr must not leak the API secret."""
+
                 name: str
                 city: str
 
                 def __post_init__(self) -> None:
+                    """Attach a secret that is not a dataclass field."""
                     self.api_secret = "sk_live_demo_secret"
 
 
@@ -2189,7 +2229,7 @@ def _text_cells() -> list[NotebookNode]:
                 f"{string.Template('$customer.api_secret').safe_substitute(customer=asha)=}"
                 "  (no attribute access)"
             )
-            """
+            '''
         ),
         md(
             """
@@ -2639,7 +2679,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
             """
             #### Exercise 5 — top-K with `heapq`
 
-            `top_k(scores, k)` takes any iterable of `(name, score)` pairs (possibly a
+            `top_k(scores, count)` takes any iterable of `(name, score)` pairs (possibly a
             generator too large to sort in memory) and returns the `k` highest as a list,
             highest score first, ties by name (alphabetical). `k <= 0` returns `[]`. Use
             `heapq` (`nlargest`, or a bounded heap of size `k`).
@@ -2647,8 +2687,8 @@ def _lab_cells_part_2() -> list[NotebookNode]:
         ),
         code(
             r'''
-            def top_k(scores: Iterable[tuple[str, int]], k: int) -> list[tuple[str, int]]:
-                """The k highest (name, score) pairs, highest first, ties by name."""
+            def top_k(scores: Iterable[tuple[str, int]], count: int) -> list[tuple[str, int]]:
+                """The count highest (name, score) pairs, highest first, ties by name."""
                 raise NotImplementedError
             '''
         ),
@@ -2665,8 +2705,9 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     yield f"customer-{number:06d}", generator.randint(0, 1_000_000)
 
 
-            def expected_top(pairs: list[tuple[str, int]], k: int) -> list[tuple[str, int]]:
-                return sorted(pairs, key=lambda pair: (-pair[1], pair[0]))[:k]
+            def expected_top(pairs: list[tuple[str, int]], count: int) -> list[tuple[str, int]]:
+                """Reference answer: the top_count pairs by count, ties by name."""
+                return sorted(pairs, key=lambda pair: (-pair[1], pair[0]))[:count]
 
 
             run_checks(
@@ -2676,9 +2717,13 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                         lambda: top_k(LEADERBOARD, 3),
                         [("asha", 90), ("meera", 90), ("fatima", 82)],
                     ),
-                    ("k = 1", lambda: top_k(LEADERBOARD, 1), [("asha", 90)]),
-                    ("k larger than the input", lambda: top_k(LEADERBOARD, 10), expected_top(LEADERBOARD, 10)),
-                    ("k = 0", lambda: top_k(LEADERBOARD, 0), []),
+                    ("count = 1", lambda: top_k(LEADERBOARD, 1), [("asha", 90)]),
+                    (
+                        "count larger than the input",
+                        lambda: top_k(LEADERBOARD, 10),
+                        expected_top(LEADERBOARD, 10),
+                    ),
+                    ("count = 0", lambda: top_k(LEADERBOARD, 0), []),
                     ("generator input", lambda: top_k(iter(LEADERBOARD), 2), [("asha", 90), ("meera", 90)]),
                     (
                         "100,000-item stream",
@@ -2838,6 +2883,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
 
 
             def folder_listing() -> list[str]:
+                """Every file under the messy folder, as sorted relative paths."""
                 folder = LAB44_DIR / "messy"
                 return sorted(
                     path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file()
@@ -2845,11 +2891,13 @@ def _lab_cells_part_2() -> list[NotebookNode]:
 
 
             def dry_run_then_listing() -> tuple[tuple[int, list[str], str], list[str]]:
+                """Run a dry run, then list the (unchanged) folder."""
                 make_messy_folder()
                 return run_organizer("organize", "messy", "--dry-run"), folder_listing()
 
 
             def organize_then_listing(*options: str) -> tuple[list[str], list[str]]:
+                """Organize the folder for real, then list it."""
                 make_messy_folder()
                 return run_organizer("organize", "messy", *options)[1], folder_listing()
 

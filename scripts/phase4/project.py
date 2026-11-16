@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -49,12 +50,34 @@ SKIPPED_NAMES = {".venv", "__pycache__", "dist", ".pytest_cache", ".mypy_cache",
 
 
 def package_env() -> dict[str, str]:
-    """Child environment: not the course venv, no colours, unbuffered, reproducible Hypothesis."""
+    """Child environment: offline uv, not the course venv, no colours, reproducible Hypothesis."""
     dropped = ("UV_", "VIRTUAL_ENV", "PYTHONPATH", "PYTEST_", "COV", "HYPOTHESIS")
     inherited = {key: value for key, value in os.environ.items() if not key.startswith(dropped)}
     return {**inherited, "NO_COLOR": "1", "PY_COLORS": "0", "TERM": "dumb", "COLUMNS": "100",
-            "UV_NO_PROGRESS": "1", "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
+            "UV_NO_PROGRESS": "1", "UV_OFFLINE": "1", "UV_PYTHON_DOWNLOADS": "never",
+            "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
             "HYPOTHESIS_PROFILE": "ci"}  # fmt: skip
+
+
+def network_available(host: str = "pypi.org", port: int = 443, timeout: float = 3.0) -> bool:
+    """Can we open a TCP connection to host? (Same helper as Unit 4.1.)"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def offline_skip(step: str, exit_code: int, output: str) -> bool:
+    """Print a skip message and return True if an offline uv step failed; else return False."""
+    if exit_code == 0:
+        return False
+    hint = ("the network is reachable: run the cell again with UV_OFFLINE removed from "
+            "package_env() to fill the uv cache" if network_available()
+            else "there is no network, so the packages cannot be downloaded here")  # fmt: skip
+    print(f"SKIP: {step} could not run offline (UV_OFFLINE=1, exit code {exit_code}); {hint}.")
+    print(textwrap.indent("\n".join(output.splitlines()[-5:]), "  "))
+    return True
 
 
 def tidy(text: str) -> str:
@@ -140,22 +163,23 @@ def _overview_cells() -> list[NotebookNode]:
 
             ```mermaid
             graph LR
-                A[push or pull request] --> T[test: ruff, mypy --strict, pytest on 3.12-3.15]
+                A[push, pull request or manual run] --> T[test: ruff, mypy --strict, pytest: Linux 3.12-3.15, Windows + macOS 3.15]
                 G[push tag log-analyzer-v0.1.0] --> T
-                T --> B[build: tag = version?, uv build, smoke test]
-                B -->|tag or manual run only| P[publish: OIDC token, upload to TestPyPI]
+                T --> B[build: tag = version?, uv build, smoke test, tests from the sdist]
+                B -->|release tag only| P[publish: OIDC token, upload to TestPyPI]
             ```
 
             <details><summary>ASCII fallback</summary>
 
             ```text
-            push / pull request ----+
-                                    +--> test (ruff, mypy --strict, pytest x 4 Pythons)
-            push tag log-analyzer-v* +          |
-                                               v
-                                    build (tag = version?, uv build, smoke test)
-                                               |  only for a tag or a manual run
-                                               v
+            push / pull request / manual run --+
+                                               +--> test (ruff, mypy --strict, pytest:
+            push tag log-analyzer-v* ----------+         Linux x 4 Pythons, Windows, macOS)
+                                                          |
+                                                          v
+                                    build (tag = version?, uv build, smoke test, sdist tests)
+                                                          |  only for a release tag
+                                                          v
                                     publish (OIDC token -> TestPyPI)
             ```
 
@@ -169,6 +193,10 @@ def _overview_cells() -> list[NotebookNode]:
             - CLI demos write their files to `notebooks/_scratch/phase4_project/`. Paths are shown
               as `<scratch>`, `<package>` (`projects/log-analyzer`), `<repo>` or `~`, timings as
               `<time>`.
+            - Every `uv` command runs **offline**: `package_env()` sets `UV_OFFLINE=1` and
+              `UV_PYTHON_DOWNLOADS=never`, so uv uses only its cache and the installed Pythons.
+              A step that would need a download prints a `SKIP` message (saying whether the
+              network is reachable) instead of failing.
             - **Nothing is published from this notebook.** Publishing happens on GitHub when you
               push a tag; *How to publish* at the end lists the steps you do yourself.
             """
@@ -324,9 +352,10 @@ def _environment_cells() -> list[NotebookNode]:
         ),
         code(
             """
-            sync_exit_code, _ = run("uv", "sync", "--locked", cwd=PACKAGE_DIR)
+            sync_exit_code, sync_output = run("uv", "sync", "--locked", cwd=PACKAGE_DIR)
             print(f"uv sync --locked -> exit code {sync_exit_code}")
-            shell("uv", "tree", "--locked", "--depth", "1", cwd=PACKAGE_DIR)
+            if not offline_skip("uv sync --locked", sync_exit_code, sync_output):
+                shell("uv", "tree", "--locked", "--depth", "1", cwd=PACKAGE_DIR)
             """
         ),
         md(
@@ -811,7 +840,9 @@ def _build_cells() -> list[NotebookNode]:
         code(
             """
             shutil.rmtree(PACKAGE_DIR / "dist", ignore_errors=True)
-            shell("uv", "build", cwd=PACKAGE_DIR)
+            build_exit_code, build_output = run("uv", "build", cwd=PACKAGE_DIR)
+            if not offline_skip("uv build", build_exit_code, build_output):
+                print(f"[<package>]$ uv build\\n{textwrap.indent(build_output, '  ')}")
             wheel_path = next((PACKAGE_DIR / "dist").glob("*.whl"))
             sdist_path = next((PACKAGE_DIR / "dist").glob("*.tar.gz"))
             print(f"{wheel_path.name=}\\n{sdist_path.name=}")
@@ -887,9 +918,9 @@ def _workflow_cells() -> list[NotebookNode]:
 
             | Event | test | build | publish |
             | --- | --- | --- | --- |
-            | push or pull request touching `projects/log-analyzer/**` or the workflow | ✓ (3.12–3.15) | ✓ | — |
+            | push or pull request touching `projects/log-analyzer/**` or the workflow | ✓ (Linux 3.12–3.15, Windows and macOS 3.15) | ✓ | — |
             | push of a tag `log-analyzer-v*` (path filters do not apply to tags) | ✓ | ✓ + tag = version check | ✓ |
-            | manual *Run workflow* (`workflow_dispatch`) | ✓ | ✓ | ✓ |
+            | manual *Run workflow* (`workflow_dispatch`) | ✓ | ✓ | — (publishing needs a release tag) |
             | push of any other tag (for example `phase-4`) | — | — | — |
 
             **Trusted publishing** replaces the API token. TestPyPI is told in advance: "trust
@@ -923,7 +954,11 @@ def _workflow_cells() -> list[NotebookNode]:
             Nothing secret is stored in the repository, and a token leaked from a log expires
             within minutes. Other design points: the publish job gets `id-token: write` and
             nothing else; it downloads the artifact the build job made, so what was tested is
-            what is uploaded; `--locked` everywhere means CI installs exactly `uv.lock`.
+            what is uploaded; `--locked` everywhere means CI installs exactly `uv.lock`; the
+            build job runs the test suite again from the **unpacked sdist**, proving the source
+            release is complete; and every action is **pinned to a full commit SHA** with a
+            `# vX.Y.Z` comment, so a moved or hijacked tag cannot change the code that runs with
+            the publish job's OIDC permission.
             """
         ),
         code(
@@ -952,6 +987,7 @@ def _workflow_cells() -> list[NotebookNode]:
             print(f"publish: environment={publish_job['environment']['name']!r}")
             print(f"publish: if={publish_job['if']!r}")
             print(f"publish steps: {[step['uses'] for step in publish_job['steps']]}")
+            print(f"test matrix: {workflow['jobs']['test']['strategy']['matrix']}")
             """
         ),
         md(
@@ -1004,9 +1040,12 @@ def _self_check_cells() -> list[NotebookNode]:
                 ["report", "missing.log"],
             )
             pytest_addopts = config["tool"]["pytest"]["ini_options"]["addopts"]
-            publish_condition = (
-                "startsWith(github.ref, 'refs/tags/log-analyzer-v') || github.event_name == 'workflow_dispatch'"
-            )
+            publish_condition = "startsWith(github.ref, 'refs/tags/log-analyzer-v')"
+            action_refs = [
+                step["uses"] for job in workflow["jobs"].values() for step in job["steps"] if "uses" in step
+            ]
+            test_matrix = workflow["jobs"]["test"]["strategy"]["matrix"]
+            build_commands = " ".join(step.get("run", "") for step in workflow["jobs"]["build"]["steps"])
             print(f"{total_coverage=}, {csv_row_count=}, {sqlite_row_count=}")
             """
         ),
@@ -1065,10 +1104,21 @@ def _self_check_cells() -> list[NotebookNode]:
                     ("publish environment", lambda: publish_job["environment"]["name"], "testpypi"),
                     (
                         "trusted-publishing action",
-                        lambda: publish_job["steps"][-1]["uses"],
-                        "pypa/gh-action-pypi-publish@release/v1",
+                        lambda: publish_job["steps"][-1]["uses"].split("@")[0],
+                        "pypa/gh-action-pypi-publish",
                     ),
-                    ("publish only on tags or manual runs", lambda: publish_job["if"], publish_condition),
+                    ("publish only on release tags", lambda: publish_job["if"], publish_condition),
+                    (
+                        "every action pinned to a commit SHA",
+                        lambda: all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", ref) for ref in action_refs),
+                        True,
+                    ),
+                    (
+                        "Windows and macOS in the test matrix",
+                        lambda: sorted(entry["os"] for entry in test_matrix["include"]),
+                        ["macos-latest", "windows-latest"],
+                    ),
+                    ("tests run from the unpacked sdist", lambda: "tar -xzf dist/" in build_commands, True),
                 ]
             )
             """
@@ -1136,16 +1186,17 @@ def _publish_cells() -> list[NotebookNode]:
 QUESTIONS: list[tuple[str, str, str, str]] = [
     (
         "4.1",
-        """
+        '''
         import re
 
 
         def normalize(name: str) -> str:
+            """PEP 503 normalized project name."""
             return re.sub(r"[-_.]+", "-", name).lower()
 
 
         print(normalize("Log_Analyzer.psbcg433"), normalize("log--analyzer__PSBCG433"))
-        """,
+        ''',
         """
         `log-analyzer-psbcg433 log-analyzer-psbcg433`. This is the PEP 503 normalization the
         index applies: runs of `-`, `_` and `.` become one `-`, and case is ignored. Both
@@ -1335,7 +1386,7 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "4.3",
-        """
+        '''
         from hypothesis import given, settings
         from hypothesis import strategies as st
 
@@ -1345,12 +1396,13 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
         @settings(max_examples=100, database=None)
         @given(st.booleans())
         def test_flag(flag: bool) -> None:
+            """Record each flag value it is called with."""
             calls.append(flag)
 
 
         test_flag()
         print(len(calls), sorted(set(calls)))
-        """,
+        ''',
         """
         `2 [False, True]`, not 100. `max_examples` is an upper bound: Hypothesis notices that
         `st.booleans()` has only two possible values, tries both, and stops because the search
@@ -1487,18 +1539,20 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "4.6",
-        """
+        '''
         from pydantic import BaseModel
 
 
         class Hit(BaseModel):
+            """One log hit, in Pydantic's default lax mode."""
+
             status: int
             latency_ms: int
 
 
         hit = Hit(status="200", latency_ms=23.0)
         print(repr(hit.status), repr(hit.latency_ms))
-        """,
+        ''',
         """
         `200 23`. Unlike `NamedTuple` (question 5), Pydantic **validates and converts** at
         runtime. In its default *lax* mode, the string `"200"` and the float `23.0` (no
@@ -1509,11 +1563,13 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "4.6",
-        """
+        '''
         from pydantic import BaseModel, ConfigDict, ValidationError
 
 
         class StrictHit(BaseModel):
+            """One log hit, in strict mode: no type coercion."""
+
             model_config = ConfigDict(strict=True)
             status: int
             latency_ms: int
@@ -1523,7 +1579,7 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
             StrictHit(status="200", latency_ms=23.0)
         except ValidationError as error:
             print(error.error_count(), [detail["type"] for detail in error.errors()])
-        """,
+        ''',
         """
         `2 ['int_type', 'int_type']`. Strict mode turns the conversions off: only real `int`
         values pass. Pydantic reports **every** failing field in one `ValidationError`, not

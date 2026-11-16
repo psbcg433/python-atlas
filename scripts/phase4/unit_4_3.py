@@ -179,10 +179,12 @@ class FrozenClock(logging.Filter):
     """Demo-only filter: stamp every record with one fixed UTC time so outputs never change."""
 
     def __init__(self, moment: datetime = datetime(2026, 11, 7, 9, 30, tzinfo=UTC)) -> None:
+        """Freeze every record's time at moment."""
         super().__init__()
         self.timestamp = moment.timestamp()
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """Overwrite the record's timestamp; keep every record."""
         record.created, record.msecs = self.timestamp, 0.0
         return True
 
@@ -894,6 +896,16 @@ def _fundamentals_cells() -> list[NotebookNode]:
             ]
             with contextlib.redirect_stdout(io.StringIO()):
                 first_exit = pytest.main(arguments)
+            """
+        ),
+        md(
+            """
+            Now introduce a bug in `pricing.py` and call `pytest.main` again in the same
+            kernel:
+            """
+        ),
+        code(
+            r"""
             (in_kernel / "pricing.py").write_text(
                 "def with_gst(amount):\n    return amount * 112 // 100  # bug\n"
             )
@@ -939,38 +951,48 @@ def _fixture_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            BASKET_TESTS = """
+                import pytest
+
+                from shop.money import Money
+
+
+                @pytest.fixture
+                def basket():
+                    return [Money("240"), Money("199"), Money("49.50")]
+
+
+                @pytest.fixture
+                def basket_total(basket):  # a fixture using another fixture
+                    return sum(basket)
+
+
+                def test_total(basket_total):
+                    assert basket_total == Money("488.50")
+
+
+                def test_each_test_gets_a_fresh_basket(basket):
+                    basket.append(Money(1))
+                    assert len(basket) == 4
+            """
+            '''
+        ),
+        md(
+            """
+            Build the project around those tests and run pytest:
+            """
+        ),
+        code(
+            r"""
             fixture_basics = project(
                 "fixture_basics",
                 {
                     **shop_files("money"),
-                    "tests/test_basket.py": """
-                        import pytest
-
-                        from shop.money import Money
-
-
-                        @pytest.fixture
-                        def basket():
-                            return [Money("240"), Money("199"), Money("49.50")]
-
-
-                        @pytest.fixture
-                        def basket_total(basket):  # a fixture using another fixture
-                            return sum(basket)
-
-
-                        def test_total(basket_total):
-                            assert basket_total == Money("488.50")
-
-
-                        def test_each_test_gets_a_fresh_basket(basket):
-                            basket.append(Money(1))
-                            assert len(basket) == 4
-                    """,
+                    "tests/test_basket.py": BASKET_TESTS,
                 },
             )
             run_pytest(fixture_basics, "-v", "--no-header")
-            '''
+            """
         ),
         md(
             """
@@ -984,44 +1006,64 @@ def _fixture_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            SCOPE_FIXTURES = """
+                import pytest
+
+
+                @pytest.fixture(scope="session")
+                def catalogue():
+                    return {"TEA-500": 240, "MUG-02": 199}
+
+
+                @pytest.fixture(scope="module")
+                def price_list(catalogue):
+                    return sorted(catalogue.values())
+
+
+                @pytest.fixture
+                def cart():
+                    return []
+            """
+            '''
+        ),
+        md("The tests use the three fixtures in different combinations:"),
+        code(
+            r'''
+            SCOPE_TESTS = (
+                SCOPE_FIXTURES
+                + """
+
+                def test_cheapest(price_list):
+                    assert price_list[0] == 199
+
+
+                def test_add(cart, catalogue):
+                    cart.append(catalogue["TEA-500"])
+                    assert cart == [240]
+
+
+                def test_cart_starts_empty(cart):
+                    assert cart == []
+            """
+            )
+            '''
+        ),
+        md(
+            """
+            Run them with `--setup-show` to see when each fixture is set up and torn
+            down:
+            """
+        ),
+        code(
+            r"""
             scopes = project(
                 "scopes",
                 {
-                    "tests/test_scopes.py": """
-                        import pytest
-
-
-                        @pytest.fixture(scope="session")
-                        def catalogue():
-                            return {"TEA-500": 240, "MUG-02": 199}
-
-
-                        @pytest.fixture(scope="module")
-                        def price_list(catalogue):
-                            return sorted(catalogue.values())
-
-
-                        @pytest.fixture
-                        def cart():
-                            return []
-
-
-                        def test_cheapest(price_list):
-                            assert price_list[0] == 199
-
-
-                        def test_add(cart, catalogue):
-                            cart.append(catalogue["TEA-500"])
-                            assert cart == [240]
-
-
-                        def test_cart_starts_empty(cart):
-                            assert cart == []
-                    """,
+                    "tests/test_scopes.py": SCOPE_TESTS,
                 },
             )
             run_pytest(scopes, "--setup-show", "-q", "--no-header")
-            '''
+            """
         ),
         md(
             """
@@ -1077,37 +1119,59 @@ def _fixture_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            API_CONFTEST = """
+                import pytest
+
+
+                @pytest.fixture
+                def currency():
+                    \"\"\"The public API reports prices in USD.\"\"\"
+                    return "USD"
+            """
+            '''
+        ),
+        md(
+            """
+            Assemble the project (two test files use the fixtures) and run it, then list
+            the fixtures pytest sees from `tests/api`:
+            """
+        ),
+        code(
+            r'''
+            ROOT_CONFTEST = """
+                import pytest
+
+
+                @pytest.fixture
+                def currency():
+                    \"\"\"Default currency for tests.\"\"\"
+                    return "INR"
+
+
+                @pytest.fixture
+                def customer():
+                    \"\"\"A sample customer record.\"\"\"
+                    return {"name": "Asha", "city": "Pune"}
+            """
+            '''
+        ),
+        md(
+            """
+            The `tests/api/conftest.py` below overrides `currency` for the tests in that
+            folder only:
+            """
+        ),
+        code(
+            r'''
             conftest_demo = project(
                 "conftest_demo",
                 {
-                    "tests/conftest.py": """
-                        import pytest
-
-
-                        @pytest.fixture
-                        def currency():
-                            \"\"\"Default currency for tests.\"\"\"
-                            return "INR"
-
-
-                        @pytest.fixture
-                        def customer():
-                            \"\"\"A sample customer record.\"\"\"
-                            return {"name": "Asha", "city": "Pune"}
-                    """,
+                    "tests/conftest.py": ROOT_CONFTEST,
                     "tests/test_shop.py": """
                         def test_default_currency(currency, customer):
                             assert (currency, customer["city"]) == ("INR", "Pune")
                     """,
-                    "tests/api/conftest.py": """
-                        import pytest
-
-
-                        @pytest.fixture
-                        def currency():
-                            \"\"\"The public API reports prices in USD.\"\"\"
-                            return "USD"
-                    """,
+                    "tests/api/conftest.py": API_CONFTEST,
                     "tests/api/test_api.py": """
                         def test_api_currency(currency, customer):
                             assert (currency, customer["name"]) == ("USD", "Asha")
@@ -1178,40 +1242,50 @@ def _fixture_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            FACTORY_TESTS = """
+                import pytest
+
+                from shop.money import Money
+
+
+                @pytest.fixture
+                def make_order():
+                    created = []
+
+                    def build(*prices, customer="Asha"):
+                        order = {"id": len(created) + 1, "customer": customer,
+                                 "lines": [Money(price) for price in prices]}
+                        created.append(order)
+                        return order
+
+                    yield build
+                    print(f"\\nteardown: {len(created)} orders cleaned up")
+
+
+                def test_two_orders(make_order):
+                    first = make_order("240", "199")
+                    second = make_order("49.50", customer="Ravi")
+                    assert (first["id"], second["id"]) == (1, 2)
+                    assert sum(first["lines"]) == Money("439")
+            """
+            '''
+        ),
+        md(
+            """
+            Run it with `-s` so the teardown message after `yield` is shown:
+            """
+        ),
+        code(
+            r"""
             factory_demo = project(
                 "factory_demo",
                 {
                     **shop_files("money"),
-                    "tests/test_factory.py": """
-                        import pytest
-
-                        from shop.money import Money
-
-
-                        @pytest.fixture
-                        def make_order():
-                            created = []
-
-                            def build(*prices, customer="Asha"):
-                                order = {"id": len(created) + 1, "customer": customer,
-                                         "lines": [Money(price) for price in prices]}
-                                created.append(order)
-                                return order
-
-                            yield build
-                            print(f"\\nteardown: {len(created)} orders cleaned up")
-
-
-                        def test_two_orders(make_order):
-                            first = make_order("240", "199")
-                            second = make_order("49.50", customer="Ravi")
-                            assert (first["id"], second["id"]) == (1, 2)
-                            assert sum(first["lines"]) == Money("439")
-                    """,
+                    "tests/test_factory.py": FACTORY_TESTS,
                 },
             )
             run_pytest(factory_demo, "-q", "--no-header", "-s")
-            '''
+            """
         ),
         md(
             """
@@ -1269,51 +1343,72 @@ def _fixture_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            SLOW_PRICING_MODULE = """
+                import os
+                import time
+
+
+                def fetch_rate(currency: str) -> float:
+                    time.sleep(5)  # pretend this calls a slow web service
+                    raise ConnectionError("no network in tests")
+
+
+                def price_in(amount_in_inr: float) -> str:
+                    currency = os.environ.get("SHOP_CURRENCY", "INR")
+                    if currency == "INR":
+                        return f"INR {amount_in_inr:.2f}"
+                    return f"{currency} {amount_in_inr * fetch_rate(currency):.2f}"
+            """
+            '''
+        ),
+        md(
+            """
+            The tests patch the environment variable and the slow function; the last
+            test shows both patches were undone:
+            """
+        ),
+        code(
+            r'''
+            MONKEYPATCH_TESTS = """
+                import os
+
+                from shop import pricing
+
+
+                def test_default_currency(monkeypatch):
+                    monkeypatch.delenv("SHOP_CURRENCY", raising=False)
+                    assert pricing.price_in(100) == "INR 100.00"
+
+
+                def test_usd_with_fake_rate(monkeypatch):
+                    monkeypatch.setenv("SHOP_CURRENCY", "USD")
+                    monkeypatch.setattr(pricing, "fetch_rate", lambda currency: 0.012)
+                    assert pricing.price_in(100) == "USD 1.20"
+
+
+                def test_patches_were_undone():
+                    assert "SHOP_CURRENCY" not in os.environ
+                    assert pricing.fetch_rate.__name__ == "fetch_rate"
+            """
+            '''
+        ),
+        md(
+            """
+            Run the suite:
+            """
+        ),
+        code(
+            r"""
             monkeypatch_demo = project(
                 "monkeypatch_demo",
                 {
                     "shop/__init__.py": "",
-                    "shop/pricing.py": """
-                        import os
-                        import time
-
-
-                        def fetch_rate(currency: str) -> float:
-                            time.sleep(5)  # pretend this calls a slow web service
-                            raise ConnectionError("no network in tests")
-
-
-                        def price_in(amount_in_inr: float) -> str:
-                            currency = os.environ.get("SHOP_CURRENCY", "INR")
-                            if currency == "INR":
-                                return f"INR {amount_in_inr:.2f}"
-                            return f"{currency} {amount_in_inr * fetch_rate(currency):.2f}"
-                    """,
-                    "tests/test_pricing.py": """
-                        import os
-
-                        from shop import pricing
-
-
-                        def test_default_currency(monkeypatch):
-                            monkeypatch.delenv("SHOP_CURRENCY", raising=False)
-                            assert pricing.price_in(100) == "INR 100.00"
-
-
-                        def test_usd_with_fake_rate(monkeypatch):
-                            monkeypatch.setenv("SHOP_CURRENCY", "USD")
-                            monkeypatch.setattr(pricing, "fetch_rate", lambda currency: 0.012)
-                            assert pricing.price_in(100) == "USD 1.20"
-
-
-                        def test_patches_were_undone():
-                            assert "SHOP_CURRENCY" not in os.environ
-                            assert pricing.fetch_rate.__name__ == "fetch_rate"
-                    """,
+                    "shop/pricing.py": SLOW_PRICING_MODULE,
+                    "tests/test_pricing.py": MONKEYPATCH_TESTS,
                 },
             )
             run_pytest(monkeypatch_demo, "-v", "--no-header")
-            '''
+            """
         ),
         md(
             """
@@ -1424,42 +1519,52 @@ def _parametrize_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            ROUNDING_TESTS = """
+                from decimal import Decimal
+
+                import pytest
+
+                from shop.money import Money
+
+
+                @pytest.mark.parametrize(
+                    ("raw_amount", "expected"),
+                    [("0.125", "0.13"), ("0.124", "0.12"), ("-0.125", "-0.13"), ("7", "7.00")],
+                    ids=["half-up", "below-half", "negative", "whole-rupees"],
+                )
+                def test_rounds_half_up_to_paise(raw_amount, expected):
+                    assert Money(raw_amount).amount == Decimal(expected)
+
+
+                @pytest.mark.parametrize(
+                    ("left", "right", "expected"),
+                    [
+                        pytest.param(Money("240"), Money("199"), Money("439"), id="rupees"),
+                        pytest.param(Money("0.10"), Money("0.20"), Money("0.30"), id="paise-exact"),
+                        (Money("1"), Money("-1"), Money("0")),
+                    ],
+                )
+                def test_addition(left, right, expected):
+                    assert left + right == expected
+            """
+            '''
+        ),
+        md(
+            """
+            Run them with `-v`: each case is its own test, named by its id:
+            """
+        ),
+        code(
+            r"""
             parametrize_demo = project(
                 "parametrize_demo",
                 {
                     **shop_files("money"),
-                    "tests/test_money_rounding.py": """
-                        from decimal import Decimal
-
-                        import pytest
-
-                        from shop.money import Money
-
-
-                        @pytest.mark.parametrize(
-                            ("raw_amount", "expected"),
-                            [("0.125", "0.13"), ("0.124", "0.12"), ("-0.125", "-0.13"), ("7", "7.00")],
-                            ids=["half-up", "below-half", "negative", "whole-rupees"],
-                        )
-                        def test_rounds_half_up_to_paise(raw_amount, expected):
-                            assert Money(raw_amount).amount == Decimal(expected)
-
-
-                        @pytest.mark.parametrize(
-                            ("left", "right", "expected"),
-                            [
-                                pytest.param(Money("240"), Money("199"), Money("439"), id="rupees"),
-                                pytest.param(Money("0.10"), Money("0.20"), Money("0.30"), id="paise-exact"),
-                                (Money("1"), Money("-1"), Money("0")),
-                            ],
-                        )
-                        def test_addition(left, right, expected):
-                            assert left + right == expected
-                    """,
+                    "tests/test_money_rounding.py": ROUNDING_TESTS,
                 },
             )
             run_pytest(parametrize_demo, "-v", "--no-header")
-            '''
+            """
         ),
         md(
             """
@@ -1510,48 +1615,70 @@ def _parametrize_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            SKIP_TESTS = """
+                import sys
+
+                import pytest
+
+
+                @pytest.mark.skip(reason="payment sandbox not set up yet")
+                def test_card_payment():
+                    ...
+
+
+                @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file permissions")
+                def test_report_is_private():
+                    assert True
+
+
+                @pytest.mark.skipif(sys.version_info < (3, 14), reason="needs uuid7 (3.14+)")
+                def test_order_ids_are_time_ordered():
+                    import uuid
+                    assert uuid.uuid7().version == 7
+
+
+                def test_needs_optional_package():
+                    pytest.importorskip("shop_pdf_export", reason="optional PDF plug-in not installed")
+            """
+            '''
+        ),
+        md(
+            "Two expected failures: one that really fails, and a `strict` one that unexpectedly passes:"
+        ),
+        code(
+            r'''
+            MARKER_TESTS = (
+                SKIP_TESTS
+                + """
+
+                @pytest.mark.xfail(reason="BUG-142: float rounding", raises=AssertionError)
+                def test_known_bug():
+                    assert round(2.675, 2) == 2.68
+
+
+                @pytest.mark.xfail(reason="fixed already?", strict=True)
+                def test_fixed_bug():
+                    assert round(2.5) == 2
+            """
+            )
+            '''
+        ),
+        md(
+            """
+            Run with `-ra` for a summary of skips, expected failures and the strict
+            xfail that passed:
+            """
+        ),
+        code(
+            r"""
             markers_demo = project(
                 "markers_demo",
                 {
-                    "tests/test_markers.py": """
-                        import sys
-
-                        import pytest
-
-
-                        @pytest.mark.skip(reason="payment sandbox not set up yet")
-                        def test_card_payment():
-                            ...
-
-
-                        @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file permissions")
-                        def test_report_is_private():
-                            assert True
-
-
-                        @pytest.mark.skipif(sys.version_info < (3, 14), reason="needs uuid7 (3.14+)")
-                        def test_order_ids_are_time_ordered():
-                            import uuid
-                            assert uuid.uuid7().version == 7
-
-
-                        def test_needs_optional_package():
-                            pytest.importorskip("shop_pdf_export", reason="optional PDF plug-in not installed")
-
-
-                        @pytest.mark.xfail(reason="BUG-142: float rounding", raises=AssertionError)
-                        def test_known_bug():
-                            assert round(2.675, 2) == 2.68
-
-
-                        @pytest.mark.xfail(reason="fixed already?", strict=True)
-                        def test_fixed_bug():
-                            assert round(2.5) == 2
-                    """,
+                    "tests/test_markers.py": MARKER_TESTS,
                 },
             )
             run_pytest(markers_demo, "-ra", "-q", "--no-header")
-            '''
+            """
         ),
         md(
             """
@@ -1563,6 +1690,34 @@ def _parametrize_cells() -> list[NotebookNode]:
             **Custom markers** label tests so you can select them with `-m`, like tags.
             Register them in the config (`markers = [...]`) and run with `--strict-markers`, so
             a typo such as `@pytest.mark.solw` is an error instead of a silently ignored label.
+            """
+        ),
+        code(
+            r'''
+            MARKED_SUITE = """
+                import pytest
+
+
+                def test_fast_rule():
+                    assert 1 + 1 == 2
+
+
+                @pytest.mark.slow
+                def test_full_catalogue_import():
+                    assert sum(range(10_000)) == 49_995_000
+
+
+                @pytest.mark.integration
+                @pytest.mark.slow
+                def test_orders_table():
+                    assert True
+            """
+            '''
+        ),
+        md(
+            """
+            Register the markers in `pyproject.toml` (with `--strict-markers` a typo
+            fails), then select tests with `-m`:
             """
         ),
         code(
@@ -1580,24 +1735,7 @@ def _parametrize_cells() -> list[NotebookNode]:
                             "integration: needs a real database",
                         ]
                     """,
-                    "tests/test_suite.py": """
-                        import pytest
-
-
-                        def test_fast_rule():
-                            assert 1 + 1 == 2
-
-
-                        @pytest.mark.slow
-                        def test_full_catalogue_import():
-                            assert sum(range(10_000)) == 49_995_000
-
-
-                        @pytest.mark.integration
-                        @pytest.mark.slow
-                        def test_orders_table():
-                            assert True
-                    """,
+                    "tests/test_suite.py": MARKED_SUITE,
                 },
             )
             run_pytest(custom_markers, "-m", "not slow", "-q", "--no-header")
@@ -1730,7 +1868,17 @@ def _double_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            async def notify_customer(client, order_id: int) -> str:
+            from typing import Any, Protocol
+
+
+            class NotificationClient(Protocol):
+                """The one method of an async HTTP client that notify_customer uses."""
+
+                async def post(self, url: str, *, json: dict[str, Any]) -> dict[str, str]:
+                    """POST json to url and return the decoded response body."""
+
+
+            async def notify_customer(client: NotificationClient, order_id: int) -> str:
                 """Post a notification and return its status."""
                 response = await client.post("/notifications", json={"order_id": order_id})
                 return response["status"]
@@ -1883,10 +2031,11 @@ def _double_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            class Mailer:
+            class SmtpMailer:
                 """The real collaborator."""
 
                 def send(self, to: str, subject: str, *, body: str = "") -> str:
+                    """Send an e-mail (always fails here: no SMTP server in tests)."""
                     raise ConnectionError("SMTP server not available in tests")
 
 
@@ -1894,7 +2043,7 @@ def _double_cells() -> list[NotebookNode]:
             loose.send("asha@example.com")  # missing subject: accepted
             loose.sendd("typo")  # misspelt method: accepted
 
-            strict = mock.create_autospec(Mailer, instance=True)
+            strict = mock.create_autospec(SmtpMailer, instance=True)
             print(raised_message(lambda: strict.send("asha@example.com")))
             print(raised_message(lambda: strict.sendd("typo")))
             strict.send("asha@example.com", "Order shipped")
@@ -1919,32 +2068,79 @@ def _double_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            from typing import Protocol
+
+
+            class PriceStore(Protocol):
+                """Anything that reports a product's latest price."""
+
+                def latest(self, sku: str) -> int:
+                    """The latest price for sku."""
+
+
+            class Mailer(Protocol):
+                """Anything that sends an e-mail; SmtpMailer above matches it."""
+
+                def send(self, to: str, subject: str, *, body: str = "") -> str:
+                    """Send one e-mail and return the server's reply."""
+            '''
+        ),
+        md(
+            """
+            The fake implements `PriceStore` for real, with a dict:
+            """
+        ),
+        code(
+            r'''
             class InMemoryPriceStore:
                 """A fake: a real, simple implementation of the price-store interface."""
 
                 def __init__(self) -> None:
+                    """Start with no prices."""
                     self._prices: dict[str, int] = {}
 
                 def save(self, sku: str, price: int) -> None:
+                    """Store the latest price for sku."""
                     self._prices[sku] = price
 
                 def latest(self, sku: str) -> int:
+                    """The latest stored price for sku."""
                     return self._prices[sku]
-
-
+            '''
+        ),
+        md(
+            """
+            `PriceAlerter` depends only on the two Protocols, so a stub, a fake, a mock or the
+            real `SmtpMailer` can be passed in, and mypy checks each one structurally:
+            """
+        ),
+        code(
+            r'''
             class PriceAlerter:
-                def __init__(self, store, mailer) -> None:
+                """E-mail subscribers when a product's latest price drops."""
+
+                def __init__(self, store: PriceStore, mailer: Mailer) -> None:
+                    """Keep the price store and the mailer."""
                     self.store, self.mailer = store, mailer
 
                 def check(self, sku: str, old_price: int, subscribers: list[str]) -> bool:
+                    """Mail every subscriber if the price fell; return True if it did."""
                     new_price = self.store.latest(sku)
                     if new_price >= old_price:
                         return False
                     for address in subscribers:
                         self.mailer.send(address, f"{sku} is now {new_price}")
                     return True
-
-
+            '''
+        ),
+        md(
+            """
+            The three doubles, one per line: the stub answers 199, the fake stores 259 (no
+            drop), and the autospecced mock records the e-mail so the test can assert on it.
+            """
+        ),
+        code(
+            r"""
             stub_store = mock.Mock(latest=mock.Mock(return_value=199))  # stub
             print(f"stub:  {PriceAlerter(stub_store, mock.Mock()).check('MUG-02', 249, [])=}")
 
@@ -1952,11 +2148,11 @@ def _double_cells() -> list[NotebookNode]:
             fake_store.save("MUG-02", 259)
             print(f"fake:  {PriceAlerter(fake_store, mock.Mock()).check('MUG-02', 249, [])=}")
 
-            mock_mailer = mock.create_autospec(Mailer, instance=True)  # mock
+            mock_mailer = mock.create_autospec(SmtpMailer, instance=True)  # mock
             PriceAlerter(stub_store, mock_mailer).check("MUG-02", 249, ["asha@example.com"])
             mock_mailer.send.assert_called_once_with("asha@example.com", "MUG-02 is now 199")
             print(f"mock:  {mock_mailer.send.call_args=}")
-            '''
+            """
         ),
         md(
             """
@@ -1998,6 +2194,32 @@ def _double_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            HOURS_TESTS = """
+                from datetime import UTC, datetime
+
+                from shop import hours
+
+
+                class MorningClock(datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return datetime(2026, 11, 7, 9, 30, tzinfo=tz or UTC)
+
+
+                def test_morning_greeting(monkeypatch):
+                    monkeypatch.setattr(hours, "datetime", MorningClock)
+                    assert hours.greeting() == "Good morning"
+            """
+            '''
+        ),
+        md(
+            """
+            Run it: the test replaces `shop.hours.datetime`, so `greeting()` sees 9:30
+            in the morning:
+            """
+        ),
+        code(
+            r'''
             frozen_time = project(
                 "frozen_time",
                 {
@@ -2010,22 +2232,7 @@ def _double_cells() -> list[NotebookNode]:
                             hour = datetime.now(UTC).hour
                             return "Good morning" if hour < 12 else "Good afternoon"
                     """,
-                    "tests/test_hours.py": """
-                        from datetime import UTC, datetime
-
-                        from shop import hours
-
-
-                        class MorningClock(datetime):
-                            @classmethod
-                            def now(cls, tz=None):
-                                return datetime(2026, 11, 7, 9, 30, tzinfo=tz or UTC)
-
-
-                        def test_morning_greeting(monkeypatch):
-                            monkeypatch.setattr(hours, "datetime", MorningClock)
-                            assert hours.greeting() == "Good morning"
-                    """,
+                    "tests/test_hours.py": HOURS_TESTS,
                 },
             )
             run_pytest(frozen_time, "-q", "--no-header")
@@ -2057,6 +2264,22 @@ def _coverage_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            DISCOUNTS_MODULE = """
+                def member_price(total_in_paise: int, is_member: bool) -> int:
+                    if is_member:
+                        total_in_paise = total_in_paise * 90 // 100
+                    return total_in_paise
+            """
+            '''
+        ),
+        md(
+            """
+            Run the single test with line coverage, then with `--cov-branch`: line
+            coverage says 100%, branch coverage finds the missed path:
+            """
+        ),
+        code(
+            r'''
             if importlib.util.find_spec("pytest_cov") is None:
                 print("SKIP: pytest-cov is not installed (uv add --dev pytest-cov)")
             else:
@@ -2064,12 +2287,7 @@ def _coverage_cells() -> list[NotebookNode]:
                     "coverage_demo",
                     {
                         "shop/__init__.py": "",
-                        "shop/discounts.py": """
-                            def member_price(total_in_paise: int, is_member: bool) -> int:
-                                if is_member:
-                                    total_in_paise = total_in_paise * 90 // 100
-                                return total_in_paise
-                        """,
+                        "shop/discounts.py": DISCOUNTS_MODULE,
                         "tests/test_discounts.py": """
                             from shop.discounts import member_price
 
@@ -2167,8 +2385,9 @@ def _coverage_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             def shipping_fee(total_in_paise: int, express: bool) -> int:
+                """Shipping fee in paise: express, free over 500 rupees, or standard."""
                 if express:
                     return 9_900
                 if total_in_paise >= 50_000:
@@ -2189,13 +2408,13 @@ def _coverage_cells() -> list[NotebookNode]:
             monitoring.free_tool_id(TOOL)
 
             first_line = shipping_fee.__code__.co_firstlineno
-            body_lines = range(first_line + 1, first_line + 6)
+            body_lines = range(first_line + 2, first_line + 7)  # line 1 is the docstring
             print(f"executed body lines: {sorted(line - first_line for line in executed_lines)}")
             print(
                 f"never executed:      "
                 f"{[line - first_line for line in body_lines if line not in executed_lines]}"
             )
-            """
+            '''
         ),
         md("coverage.py reports which measurement core it uses with `--debug=sys`:"),
         code(
@@ -2252,7 +2471,7 @@ def _hypothesis_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             if importlib.util.find_spec("hypothesis") is None:
                 print("SKIP: hypothesis is not installed (uv add --dev hypothesis)")
             else:
@@ -2264,11 +2483,12 @@ def _hypothesis_cells() -> list[NotebookNode]:
                 @settings(derandomize=True, max_examples=8, database=None)
                 @given(st.lists(st.integers(min_value=-5, max_value=5), max_size=4))
                 def record_examples(values: list[int]) -> None:
+                    """Keep each list Hypothesis generates."""
                     generated.append(values)
 
                 record_examples()
                 print(*generated, sep="\n")
-            """
+            '''
         ),
         md(
             """
@@ -2279,12 +2499,13 @@ def _hypothesis_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             if importlib.util.find_spec("hypothesis") is not None:
                 skus = st.from_regex(r"[A-Z]{3}-[0-9]{3}", fullmatch=True)
 
                 @st.composite
                 def order_lines(draw: st.DrawFn) -> tuple[str, int, Decimal]:
+                    """Draw one (sku, quantity, price) order line."""
                     sku = draw(skus)
                     quantity = draw(st.integers(min_value=1, max_value=10))
                     price = draw(
@@ -2297,11 +2518,12 @@ def _hypothesis_cells() -> list[NotebookNode]:
                 @settings(derandomize=True, max_examples=5, database=None)
                 @given(order_lines())
                 def record_lines(line: tuple[str, int, Decimal]) -> None:
+                    """Keep each order line the composite strategy draws."""
                     drawn_lines.append(line)
 
                 record_lines()
                 print(*drawn_lines, sep="\n")
-            """
+            '''
         ),
         md(
             """
@@ -2343,6 +2565,16 @@ def _hypothesis_cells() -> list[NotebookNode]:
                     assert len(shares) == people_count
                     assert max(shares) - min(shares) <= Decimal("0.01")
             """
+            '''
+        ),
+        md(
+            """
+            Run the properties with statistics (the profile derandomizes them, so the
+            numbers are the same each run):
+            """
+        ),
+        code(
+            r"""
             if importlib.util.find_spec("hypothesis") is not None:
                 properties = project(
                     "properties",
@@ -2359,7 +2591,7 @@ def _hypothesis_cells() -> list[NotebookNode]:
                     "--hypothesis-show-statistics",
                     keep=r"passed|test_|examples|Stopped",
                 )
-            '''
+            """
         ),
         md(
             """
@@ -2401,7 +2633,7 @@ def _hypothesis_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             if importlib.util.find_spec("hypothesis") is not None:
                 quiet = settings(derandomize=True, database=None)
                 print(f"{find(st.lists(st.integers()), lambda values: sum(values) > 100, settings=quiet)=}")
@@ -2412,13 +2644,14 @@ def _hypothesis_cells() -> list[NotebookNode]:
                 @example(total_amount="0.01", people_count=3)  # always tried first
                 @given(st.decimals(min_value=0, max_value=1_000, places=2).map(str), st.integers(1, 9))
                 def property_shares_are_never_negative(total_amount: str, people_count: int) -> None:
+                    """Splitting a bill never gives a negative share."""
                     total_in_paise = int(Decimal(total_amount) * 100)
                     base, leftover = divmod(total_in_paise, people_count)
                     assert base >= 0 and 0 <= leftover < people_count
 
                 property_shares_are_never_negative()
                 print("property held for the pinned example and 50 generated ones")
-            """
+            '''
         ),
     ]
 
@@ -2471,8 +2704,15 @@ def _debugging_cells() -> list[NotebookNode]:
                         transcript.append(piece.rstrip())
                 print(f"[{tidy(str(cwd))}]$ {shlex.join(command)}   # stdin: {commands}")
                 print(textwrap.indent("\n".join(transcript), "  ", lambda line: True))
-
-
+            '''
+        ),
+        md(
+            """
+            A buggy script for the debugger: line 14 passes one quantity as a string.
+            """
+        ),
+        code(
+            r'''
             debug_demo = write_files(
                 fresh_dir("debug_demo"),
                 {
@@ -2570,20 +2810,21 @@ def _debugging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             print(f"{sys.breakpointhook is sys.__breakpointhook__=}, {sys.__breakpointhook__!r}")
             calls: list[str] = []
             sys.breakpointhook = lambda *args, **kwargs: calls.append(sys._getframe(1).f_code.co_name)
             try:
 
                 def checkout() -> None:
+                    """Stop in the debugger as soon as it is called."""
                     breakpoint()
 
                 checkout()
             finally:
                 sys.breakpointhook = sys.__breakpointhook__
             print(f"{calls=}")
-            """
+            '''
         ),
         md(
             """
@@ -2611,7 +2852,7 @@ def _debugging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            write_files(
+            invoice_demo = write_files(
                 debug_demo,
                 {
                     "invoice.py": """
@@ -2630,6 +2871,17 @@ def _debugging_cells() -> list[NotebookNode]:
                 """,
                 },
             )
+            print(f"{(invoice_demo / 'invoice.py').name} written; line 8 adds each line's GST")
+            '''
+        ),
+        md(
+            """
+            Drive pdb with a conditional breakpoint, `display`, stepping, moving up the
+            stack, and clearing the breakpoint:
+            """
+        ),
+        code(
+            r"""
             pdb_session(
                 "python",
                 "-m",
@@ -2652,7 +2904,7 @@ def _debugging_cells() -> list[NotebookNode]:
                     "c",
                 ],
             )
-            '''
+            """
         ),
         md(
             """
@@ -3187,7 +3439,7 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             reset_loggers(*DEMO_LOGGERS)
             timestamped = logging.StreamHandler(sys.stdout)
             utc_formatter = logging.Formatter(
@@ -3207,11 +3459,12 @@ def _logging_cells() -> list[NotebookNode]:
 
 
             def ship_order(order_id: int) -> None:
+                """Log a late shipment (before logging is configured)."""
                 orders_logger.warning("order %s shipped late", order_id)
 
 
             ship_order(7)
-            """
+            '''
         ),
         md(
             """
@@ -3224,22 +3477,34 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             import contextvars
 
             request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
 
             class RequestIdFilter(logging.Filter):
+                """Copy the current request id onto every record."""
+
                 def filter(self, record: logging.LogRecord) -> bool:
+                    """Attach request_id from the context variable; keep the record."""
                     record.request_id = request_id.get()
                     return True
 
 
             def drop_health_checks(record: logging.LogRecord) -> bool:
+                """Reject records about /health requests."""
                 return "/health" not in record.getMessage()
-
-
+            '''
+        ),
+        md(
+            """
+            Wire both into one handler: the class filter adds the field the format
+            string needs, and the function filter drops health checks.
+            """
+        ),
+        code(
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             request_handler = logging.StreamHandler(sys.stdout)
             request_handler.setFormatter(logging.Formatter("[%(request_id)s] %(levelname)s %(message)s"))
@@ -3294,11 +3559,21 @@ def _logging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             class UtcFormatter(logging.Formatter):
+                """A Formatter that writes timestamps in UTC."""
+
                 converter = time.gmtime  # timestamps in UTC, whatever the server's time zone
-
-
+            '''
+        ),
+        md(
+            """
+            The whole configuration as one dictionary, the form `dictConfig` (and a YAML
+            or TOML file) uses:
+            """
+        ),
+        code(
+            r"""
             reset_loggers(*DEMO_LOGGERS)
             LOGGING_CONFIG = {
                 "version": 1,
@@ -3328,6 +3603,16 @@ def _logging_cells() -> list[NotebookNode]:
                     "shop.payments": {"level": "WARNING"},
                 },
             }
+            """
+        ),
+        md(
+            """
+            Apply it and log through the tree: `shop.payments` only lets warnings
+            through, and `getHandlerByName` finds the handler by its config name.
+            """
+        ),
+        code(
+            r"""
             logging.config.dictConfig(LOGGING_CONFIG)
             logging.getLogger("shop.orders").info("order 7 placed")
             logging.getLogger("shop.payments").info("payment authorised (below WARNING: dropped)")
@@ -3392,20 +3677,54 @@ def _logging_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            NOISY_LIBRARY = """
+                import logging
+
+                logger = logging.getLogger(__name__)
+
+
+                def parse_amount(text):
+                    if "," in text:
+                        logger.warning("ignoring thousands separators in %r", text)
+                    return int(text.replace(",", ""))
+            """
+            '''
+        ),
+        md(
+            """
+            The same library following the convention: a `NullHandler` on its logger, so
+            nothing is printed until the application configures logging.
+            """
+        ),
+        code(
+            r'''
+            LIBRARY_APP = """
+                import logging
+                import sys
+
+                import rupee_tools
+                import rupee_tools_quiet
+
+                print("app has not configured logging:")
+                rupee_tools.parse_amount("1,200")        # lastResort prints to stderr
+                rupee_tools_quiet.parse_amount("1,200")  # silent
+                logging.basicConfig(stream=sys.stdout, format="  app handler: %(name)s %(message)s")
+                print("app configured logging:")
+                rupee_tools_quiet.parse_amount("2,400")  # now reaches the app's handler
+            """
+            '''
+        ),
+        md(
+            """
+            Write both libraries next to the app and run it:
+            """
+        ),
+        code(
+            r'''
             write_files(
                 fresh_dir("library_rules"),
                 {
-                    "rupee_tools/__init__.py": """
-                    import logging
-
-                    logger = logging.getLogger(__name__)
-
-
-                    def parse_amount(text):
-                        if "," in text:
-                            logger.warning("ignoring thousands separators in %r", text)
-                        return int(text.replace(",", ""))
-                """,
+                    "rupee_tools/__init__.py": NOISY_LIBRARY,
                     "rupee_tools_quiet/__init__.py": """
                     import logging
 
@@ -3418,20 +3737,7 @@ def _logging_cells() -> list[NotebookNode]:
                             logger.warning("ignoring thousands separators in %r", text)
                         return int(text.replace(",", ""))
                 """,
-                    "app.py": """
-                    import logging
-                    import sys
-
-                    import rupee_tools
-                    import rupee_tools_quiet
-
-                    print("app has not configured logging:")
-                    rupee_tools.parse_amount("1,200")        # lastResort prints to stderr
-                    rupee_tools_quiet.parse_amount("1,200")  # silent
-                    logging.basicConfig(stream=sys.stdout, format="  app handler: %(name)s %(message)s")
-                    print("app configured logging:")
-                    rupee_tools_quiet.parse_amount("2,400")  # now reaches the app's handler
-                """,
+                    "app.py": LIBRARY_APP,
                 },
             )
             shell("python", "app.py", cwd=UNIT43_DIR / "library_rules", merged=True)
@@ -3498,6 +3804,7 @@ def _logging_cells() -> list[NotebookNode]:
                 renders = 0
 
                 def __str__(self) -> str:
+                    """Render the report (counted, to show when logging formats it)."""
                     ExpensiveReport.renders += 1
                     return "<1 MB of stock data>"
 
@@ -3562,6 +3869,7 @@ def _logging_cells() -> list[NotebookNode]:
                 EXTRA_KEYS = ("order_id", "request_id")
 
                 def format(self, record: logging.LogRecord) -> str:
+                    """One JSON object per record."""
                     payload = {
                         "time": datetime.fromtimestamp(record.created, UTC).isoformat(),
                         "level": record.levelname,
@@ -3619,6 +3927,37 @@ def _quality_gate_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
+            LINT_TARGET = """
+                import sys, os
+                import logging
+                import subprocess
+                from typing import List, Optional
+
+                logger = logging.getLogger(__name__)
+
+
+                def add_line(sku: str, lines: List[str] = []) -> Optional[List[str]]:
+                    lines.append(sku)
+                    logger.info(f"added {sku}")
+                    return lines
+
+
+                def archive(name: str) -> None:
+                    try:
+                        subprocess.run(f"tar czf {name}.tgz orders/", shell=True)
+                    except:
+                        pass
+            """
+            '''
+        ),
+        md(
+            """
+            Lint it with the rule sets enabled in `pyproject.toml` (`S` = bandit
+            security rules, `G` = logging format):
+            """
+        ),
+        code(
+            r'''
             lint_demo = write_files(
                 fresh_dir("lint_demo"),
                 {
@@ -3630,27 +3969,7 @@ def _quality_gate_cells() -> list[NotebookNode]:
                     [tool.ruff.lint]
                     select = ["E", "W", "F", "I", "UP", "B", "S", "G"]
                 """,
-                    "orders.py": """
-                    import sys, os
-                    import logging
-                    import subprocess
-                    from typing import List, Optional
-
-                    logger = logging.getLogger(__name__)
-
-
-                    def add_line(sku: str, lines: List[str] = []) -> Optional[List[str]]:
-                        lines.append(sku)
-                        logger.info(f"added {sku}")
-                        return lines
-
-
-                    def archive(name: str) -> None:
-                        try:
-                            subprocess.run(f"tar czf {name}.tgz orders/", shell=True)
-                        except:
-                            pass
-                """,
+                    "orders.py": LINT_TARGET,
                 },
             )
             shell("ruff", "check", "--output-format=concise", ".", cwd=lint_demo)
@@ -3806,6 +4125,16 @@ def _quality_gate_cells() -> list[NotebookNode]:
                       - run: uv run mypy src
                       - run: uv run pytest --cov=shop --cov-branch --cov-fail-under=90
             """
+            '''
+        ),
+        md(
+            """
+            Write it into a scratch project and parse it back (the same YAML 1.1 `on`
+            trap as in 4.1.8):
+            """
+        ),
+        code(
+            r"""
             ci_project = write_files(fresh_dir("ci_demo"), {".github/workflows/ci.yml": CI_WORKFLOW})
             if importlib.util.find_spec("yaml") is None:
                 print("SKIP: PyYAML is not installed, so the workflow is not parsed")
@@ -3818,7 +4147,7 @@ def _quality_gate_cells() -> list[NotebookNode]:
                 print(f"matrix:   {quality_job['strategy']['matrix']}")
                 for step in quality_job["steps"]:
                     print(f"  step: {step.get('uses') or step.get('run')}")
-            '''
+            """
         ),
         md(
             """
@@ -4694,20 +5023,24 @@ def _lab_exercise_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             def test_rate_is_parsed_exactly() -> None:
+                """The rate comes back as an exact Decimal."""
                 raise NotImplementedError
 
 
             def test_rate_request_is_well_formed() -> None:
+                """The client asks for the right URL with the right parameters."""
                 raise NotImplementedError
 
 
             def test_http_error_is_rejected_before_reading_the_body() -> None:
+                """An HTTP error raises before the body is parsed."""
                 raise NotImplementedError
 
 
             def test_same_currency_conversion_skips_the_service() -> None:
+                """Converting INR to INR never calls the service."""
                 raise NotImplementedError
 
 
@@ -4717,7 +5050,7 @@ def _lab_exercise_cells() -> list[NotebookNode]:
                 test_http_error_is_rejected_before_reading_the_body,
                 test_same_currency_conversion_skips_the_service,
             ]
-            """
+            '''
         ),
         md("Check exercise 3:"),
         code(
@@ -4772,24 +5105,29 @@ def _lab_exercise_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             def test_share_count() -> None:
+                """There is one share per person."""
                 raise NotImplementedError
 
 
             def test_shares_add_up_exactly() -> None:
+                """The shares add up to the total exactly."""
                 raise NotImplementedError
 
 
             def test_shares_differ_by_at_most_one_paisa() -> None:
+                """No two shares differ by more than one paisa."""
                 raise NotImplementedError
 
 
             def test_shares_never_increase() -> None:
+                """Shares are in non-increasing order."""
                 raise NotImplementedError
 
 
             def test_invalid_people_count_is_rejected() -> None:
+                """A people count below 1 raises ValueError."""
                 raise NotImplementedError
 
 
@@ -4800,7 +5138,7 @@ def _lab_exercise_cells() -> list[NotebookNode]:
                 test_shares_never_increase,
                 test_invalid_people_count_is_rejected,
             ]
-            """
+            '''
         ),
         md("Check exercise 4:"),
         code(
@@ -4876,6 +5214,7 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
                 """Format each record as one line of JSON."""
 
                 def format(self, record: logging.LogRecord) -> str:
+                    """One JSON object per record (exercise 5 stub)."""
                     raise NotImplementedError
 
 
@@ -5127,19 +5466,20 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             def test_inventory_placeholder() -> None:
+                """Replace with real tests for the inventory module."""
                 raise NotImplementedError
 
 
             INVENTORY_TESTS = [test_inventory_placeholder]
-            """
+            '''
         ),
         md(
             "Check exercise 7 (this runs pytest with `--cov-branch` a few times; allow some seconds):"
         ),
         code(
-            r"""
+            r'''
             INVENTORY_MUTANTS = {
                 "alert on every low sale": (
                     "shop/inventory.py",
@@ -5157,6 +5497,7 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
 
 
             def inventory_coverage_run() -> LabRun:
+                """Run the learner's tests with coverage on shop.inventory."""
                 return run_lab_tests(inventory_source, coverage_target="shop.inventory")
 
 
@@ -5196,7 +5537,7 @@ def _lab_logging_debugging_cells() -> list[NotebookNode]:
                 print(f"branch coverage of shop/inventory.py: {inventory_coverage_run().coverage_percent}%")
             except Exception as error:  # never stop Run All
                 print(f"coverage not measured: {type(error).__name__}")
-            """
+            '''
         ),
     ]
 

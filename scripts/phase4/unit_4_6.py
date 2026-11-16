@@ -70,13 +70,16 @@ class ShopAPIHandler(http.server.BaseHTTPRequestHandler):
     connections = 0
 
     def setup(self) -> None:
+        """Count each new TCP connection."""
         type(self).connections += 1  # one per TCP connection, not per request
         super().setup()
 
     def log_message(self, format: str, *args: object) -> None:  # keep the notebook quiet
+        """Silence the default request log."""
         pass
 
     def _send(self, status: int, body: object, content_type: str = "application/json") -> None:
+        """Send status and a JSON or text body."""
         data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
         try:
             self.send_response(status)
@@ -88,10 +91,12 @@ class ShopAPIHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _count(self, key: str) -> int:
+        """Increment and return the hit counter for key."""
         self.hits[key] = self.hits.get(key, 0) + 1
         return self.hits[key]
 
     def do_GET(self) -> None:
+        """Route GET requests to the demo endpoints."""
         url = urllib.parse.urlsplit(self.path)
         query = dict(urllib.parse.parse_qsl(url.query))
         parts = url.path.strip("/").split("/")
@@ -148,6 +153,7 @@ class ShopAPIHandler(http.server.BaseHTTPRequestHandler):
             self._send(404, {"error": f"no route {url.path}"})
 
     def do_POST(self) -> None:
+        """Echo the posted JSON back."""
         length = int(self.headers.get("Content-Length", 0))
         payload = json.loads(self.rfile.read(length) or b"null")
         self._send(201 if self.path == "/orders" else 200, {"received": payload})
@@ -357,8 +363,16 @@ def _choosing_cells() -> list[NotebookNode]:
                         with contextlib.suppress(importlib.metadata.PackageNotFoundError):
                             dependency_tree(name, seen)
                 return seen
-
-
+            '''
+        ),
+        md(
+            """
+            One row per library: version, licence, whether it ships `py.typed`, direct
+            and total runtime dependencies, and the Python versions it supports.
+            """
+        ),
+        code(
+            r"""
             print(
                 f"{'package':<12}{'version':<10}{'licence':<26}"
                 f"{'typed':<7}{'deps':>5}{'all':>5}  requires-python"
@@ -380,7 +394,7 @@ def _choosing_cells() -> list[NotebookNode]:
                     f"{package:<12}{metadata['Version']:<10}{licence[:24]:<26}{str(typed):<7}{len(direct):>5}"
                     f"{len(dependency_tree(package)):>5}  {metadata.get('Requires-Python')}"
                 )
-            '''
+            """
         ),
         md(
             """
@@ -454,6 +468,7 @@ def _http_cells() -> list[NotebookNode]:
 
 
             def twenty_with_session() -> None:
+                """Twenty requests over one pooled Session."""
                 with requests.Session() as session:
                     session.headers.update(
                         {"User-Agent": "chai-corner-reports/1.0", "Authorization": "Bearer demo-token"}
@@ -508,8 +523,9 @@ def _http_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             async def fetch_all(paths: list[str]) -> list[dict[str, object]]:
+                """Fetch every path concurrently; return the JSON bodies."""
                 async with httpx.AsyncClient(base_url=SHOP_API, timeout=5) as client:
                     responses = await asyncio.gather(*(client.get(path) for path in paths))
                     return [response.raise_for_status().json() for response in responses]
@@ -519,7 +535,7 @@ def _http_cells() -> list[NotebookNode]:
             results = await fetch_all(["/slow?seconds=0.3"] * 5)
             elapsed = time.perf_counter() - started
             print(f"{len(results)} responses in {elapsed:.1f} s (concurrent; sequential would be ~1.5 s)")
-            """
+            '''
         ),
         md(
             """
@@ -529,8 +545,9 @@ def _http_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             def fake_rates_service(request: httpx.Request) -> httpx.Response:
+                """MockTransport handler that imitates the rates API."""
                 if request.url.path != "/rates":
                     return httpx.Response(404, json={"error": "not found"})
                 return httpx.Response(
@@ -543,7 +560,7 @@ def _http_cells() -> list[NotebookNode]:
             ) as fake_client:
                 print(f"{fake_client.get('/rates', params={'base': 'INR'}).json()=}")
                 print(f"{fake_client.get('/nope').status_code=}")
-            """
+            '''
         ),
         md(
             """
@@ -579,8 +596,16 @@ def _http_cells() -> list[NotebookNode]:
                 if isinstance(error, httpx.HTTPStatusError):
                     return error.response.status_code >= 500
                 return isinstance(error, httpx.TransportError)
-
-
+            '''
+        ),
+        md(
+            """
+            The policy as a decorator: up to 4 attempts with a short exponential wait,
+            only for transient errors, re-raising the last one:
+            """
+        ),
+        code(
+            r'''
             attempts_log: list[str] = []
 
 
@@ -594,6 +619,7 @@ def _http_cells() -> list[NotebookNode]:
                 reraise=True,
             )
             def get_json(client: httpx.Client, path: str) -> dict[str, object]:
+                """GET path, raise on an HTTP error, return the JSON body."""
                 return client.get(path).raise_for_status().json()
 
 
@@ -668,9 +694,20 @@ def _validation_cells() -> list[NotebookNode]:
                 ValidationError,
                 field_validator,
             )
-
-
+            """
+        ),
+        md(
+            """
+            The model: constrained types (`PositiveInt`, a SKU pattern, a decimal with 2
+            places, an aware datetime), a field validator, and `frozen`/`extra`
+            settings.
+            """
+        ),
+        code(
+            r'''
             class ApiOrder(BaseModel):
+                """An order from the API, validated and frozen."""
+
                 model_config = ConfigDict(frozen=True, extra="ignore")
 
                 order_id: PositiveInt
@@ -684,6 +721,7 @@ def _validation_cells() -> list[NotebookNode]:
                 @field_validator("city")
                 @classmethod
                 def city_is_title_case(cls, value: str) -> str:
+                    """Strip spaces around the city name."""
                     return value.strip()
 
 
@@ -691,7 +729,7 @@ def _validation_cells() -> list[NotebookNode]:
             first = ApiOrder.model_validate(raw_orders[0])
             print(repr(first))
             print(f"{first.unit_price * first.quantity=}, {first.placed_at.utcoffset()=}")
-            """
+            '''
         ),
         md(
             """
@@ -729,16 +767,20 @@ def _validation_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             import tomllib
 
 
             class WarehouseConfig(BaseModel):
+                """One warehouse in the shop's config file."""
+
                 code: Annotated[str, Field(min_length=4, max_length=4)]
                 capacity: PositiveInt
 
 
             class ShopConfig(BaseModel):
+                """The whole config file; unknown keys are rejected."""
+
                 model_config = ConfigDict(extra="forbid")
 
                 store_name: str
@@ -746,8 +788,16 @@ def _validation_cells() -> list[NotebookNode]:
                 currency: str = "INR"
                 warehouses: list[WarehouseConfig]
                 debug: Annotated[bool, Field(strict=True)] = False
-
-
+            '''
+        ),
+        md(
+            """
+            Validate a good and a bad TOML file; the error lists every problem with its
+            location, not just the first.
+            """
+        ),
+        code(
+            r"""
             good_toml = (
                 'store_name = "Pune Central"\ngst_percent = 18\n'
                 '[[warehouses]]\ncode = "PNQ1"\ncapacity = 5000\n'
@@ -774,12 +824,14 @@ def _validation_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             from pydantic import SecretStr
             from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
             class AppSettings(BaseSettings):
+                """Settings read from SHOP_* environment variables."""
+
                 model_config = SettingsConfigDict(env_prefix="SHOP_", env_file=None)
 
                 api_base_url: str = "http://127.0.0.1:8000"
@@ -802,7 +854,7 @@ def _validation_cells() -> list[NotebookNode]:
             with mock.patch.dict(os.environ, {"SHOP_MAX_RETRIES": "50"}, clear=False):
                 error_lines = raised_message(lambda: AppSettings()).splitlines()
             print("\n".join(line for line in error_lines if "further information" not in line))
-            """
+            '''
         ),
         md(
             """
@@ -847,14 +899,16 @@ def _validation_cells() -> list[NotebookNode]:
             `ConfigDict(strict=True)` or `Field(strict=True)` to reject anything that is not
             already an `int`.
             """,
-            """
+            '''
             class Line(BaseModel):
+                """An order line with an int quantity (lax mode coerces)."""
+
                 quantity: int
 
 
             print(Line(quantity="3").quantity + 1, Line.model_validate({"quantity": 3.0}).quantity)
             print(raised_message(lambda: Line(quantity=3.5)).splitlines()[2].strip())
-            """,
+            ''',
         ),
     ]
 
@@ -896,8 +950,16 @@ def _cli_cells() -> list[NotebookNode]:
                     httpx.get(f"{SHOP_API}/rates", params={"base": base}, timeout=5).json()["rates"].items()
                 ):
                     typer.echo(f"1 {base} = {rate} {currency}")
-
-
+            '''
+        ),
+        md(
+            """
+            Invoke the app in-process with typer's `CliRunner`: a dry run, a command
+            that calls the API, and a bad option value.
+            """
+        ),
+        code(
+            r"""
             runner = CliRunner()
             plain = {"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "80"}
             for arguments in (
@@ -908,7 +970,7 @@ def _cli_cells() -> list[NotebookNode]:
                 result = runner.invoke(shopctl, arguments, env=plain, prog_name="shopctl")
                 print(f"$ shopctl {' '.join(arguments)}   (exit {result.exit_code})")
                 print(textwrap.indent(result.output.rstrip(), "  "))
-            '''
+            """
         ),
         md("The generated help for one command (rich draws the boxes):"),
         code(
@@ -938,7 +1000,7 @@ def _cli_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             print(f"typer's bundled click: {importlib.util.find_spec('typer._click') is not None}")
             if installed("click", "click (not an Appendix A package; typer bundles its own copy)"):
                 import click
@@ -947,10 +1009,11 @@ def _cli_cells() -> list[NotebookNode]:
                 @click.argument("sku")
                 @click.option("--quantity", default=1, type=int)
                 def click_restock(sku: str, quantity: int) -> None:
+                    """Add stock (click version)."""
                     click.echo(f"added {quantity} x {sku}")
 
                 print(click.testing.CliRunner().invoke(click_restock, ["TEA-500", "--quantity", "3"]).output)
-            """
+            '''
         ),
         md(
             """
@@ -1035,7 +1098,7 @@ def _cli_cells() -> list[NotebookNode]:
         code(
             r'''
             trace_script = UNIT46_DIR / "rich_traceback_demo.py"
-            trace_script.write_text(
+            written_characters = trace_script.write_text(
                 textwrap.dedent("""
                 from decimal import Decimal
 
@@ -1054,6 +1117,17 @@ def _cli_cells() -> list[NotebookNode]:
             """),
                 encoding="utf-8",
             )
+            print(f"rich_traceback_demo.py: {written_characters} characters written")
+            '''
+        ),
+        md(
+            """
+            Run it in a child process and print rich's traceback with each frame's local
+            variables:
+            """
+        ),
+        code(
+            r"""
             completed = subprocess.run(
                 [sys.executable, str(trace_script)],
                 capture_output=True,
@@ -1070,7 +1144,7 @@ def _cli_cells() -> list[NotebookNode]:
                     completed.stdout,
                 ).rstrip()
             )
-            '''
+            """
         ),
     ]
 
@@ -1165,7 +1239,7 @@ def _date_json_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             import dataclasses
             import uuid
 
@@ -1174,6 +1248,8 @@ def _date_json_cells() -> list[NotebookNode]:
 
             @dataclasses.dataclass
             class Shipment:
+                """A shipment with types that plain json cannot encode."""
+
                 shipment_id: uuid.UUID
                 dispatched_at: datetime
                 weights_kg: list[float]
@@ -1191,7 +1267,7 @@ def _date_json_cells() -> list[NotebookNode]:
                 ).decode()
             )
             print(f"{orjson.loads(encoded)['dispatched_at']=}")
-            """
+            '''
         ),
         md(
             """
@@ -1202,7 +1278,7 @@ def _date_json_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             import json
             import timeit
 
@@ -1219,11 +1295,13 @@ def _date_json_cells() -> list[NotebookNode]:
                 import msgspec
 
                 class Rate(msgspec.Struct):
+                    """Exchange rates as a msgspec Struct."""
+
                     base: str
                     rates: dict[str, float]
 
                 print(msgspec.json.decode(b'{"base": "INR", "rates": {"USD": 0.012}}', type=Rate))
-            """
+            '''
         ),
     ]
 
@@ -1526,10 +1604,12 @@ def _scraping_cells() -> list[NotebookNode]:
                 """Allow at most one call per min_interval seconds."""
 
                 def __init__(self, min_interval: float) -> None:
+                    """Allow one call every min_interval seconds."""
                     self.min_interval = min_interval
                     self.last_call = -float("inf")
 
                 def wait(self) -> None:
+                    """Sleep until the next call is allowed."""
                     pause = self.last_call + self.min_interval - time.monotonic()
                     if pause > 0:
                         time.sleep(pause)
@@ -1574,8 +1654,16 @@ def _template_cells() -> list[NotebookNode]:
             def inr(amount: object) -> str:
                 """Custom filter: 1234.5 -> '₹1,234.50'."""
                 return f"₹{Decimal(str(amount)):,.2f}"
-
-
+            '''
+        ),
+        md(
+            """
+            Templates live in a `DictLoader` here (a `FileSystemLoader` in real code);
+            `base.html` defines blocks that `orders.html` fills.
+            """
+        ),
+        code(
+            r"""
             TEMPLATES = {
                 "base.html": (
                     "<html><head><title>{% block title %}Chai Corner{% endblock %}</title></head>\n"
@@ -1603,7 +1691,7 @@ def _template_cells() -> list[NotebookNode]:
             )
             template_env.filters["inr"] = inr
             print(f"{sorted(template_env.list_templates())=}")
-            '''
+            """
         ),
         md(
             """
@@ -1782,44 +1870,48 @@ def _image_cloud_cells() -> list[NotebookNode]:
             """
         ),
         md(
-            "Upload, list and download against the stub; `assert_no_pending_responses` proves every expected call happened:"
+            "Queue the three responses the report upload expects: each `add_response` gives the reply and the exact parameters the call must use."
         ),
         code(
-            r"""
+            r'''
             from botocore.response import StreamingBody
             from botocore.stub import ANY, Stubber
 
+            REPORT_KEY = "2026/11/report.html"
             report_bytes = b"<html>November report</html>"
-            with Stubber(s3) as stubber:
+
+
+            def expect_report_calls(stubber: Stubber) -> None:
+                """Queue the put, list and get responses for one report, in call order."""
+                upload_params = {"Bucket": "chai-reports", "Key": REPORT_KEY, "Body": ANY}
                 stubber.add_response(
-                    "put_object",
-                    {"ETag": '"abc123"'},
-                    {
-                        "Bucket": "chai-reports",
-                        "Key": "2026/11/report.html",
-                        "Body": ANY,
-                        "ContentType": "text/html",
-                    },
+                    "put_object", {"ETag": '"abc123"'}, upload_params | {"ContentType": "text/html"}
                 )
                 stubber.add_response(
                     "list_objects_v2",
-                    {"KeyCount": 1, "Contents": [{"Key": "2026/11/report.html", "Size": len(report_bytes)}]},
+                    {"KeyCount": 1, "Contents": [{"Key": REPORT_KEY, "Size": len(report_bytes)}]},
                     {"Bucket": "chai-reports", "Prefix": "2026/11/"},
                 )
+                body = StreamingBody(io.BytesIO(report_bytes), len(report_bytes))
                 stubber.add_response(
                     "get_object",
-                    {
-                        "Body": StreamingBody(io.BytesIO(report_bytes), len(report_bytes)),
-                        "ContentLength": len(report_bytes),
-                    },
-                    {"Bucket": "chai-reports", "Key": "2026/11/report.html"},
+                    {"Body": body, "ContentLength": len(report_bytes)},
+                    {"Bucket": "chai-reports", "Key": REPORT_KEY},
                 )
-
+            '''
+        ),
+        md(
+            "Upload, list and download against the stub; `assert_no_pending_responses` proves every expected call happened, and `add_client_error` fakes a missing key:"
+        ),
+        code(
+            r"""
+            with Stubber(s3) as stubber:
+                expect_report_calls(stubber)
                 upload = s3.put_object(
-                    Bucket="chai-reports", Key="2026/11/report.html", Body=report_bytes, ContentType="text/html"
+                    Bucket="chai-reports", Key=REPORT_KEY, Body=report_bytes, ContentType="text/html"
                 )
                 listing = s3.list_objects_v2(Bucket="chai-reports", Prefix="2026/11/")
-                downloaded = s3.get_object(Bucket="chai-reports", Key="2026/11/report.html")["Body"].read()
+                downloaded = s3.get_object(Bucket="chai-reports", Key=REPORT_KEY)["Body"].read()
                 stubber.assert_no_pending_responses()
             print(f"{upload['ETag']=}, {[item['Key'] for item in listing['Contents']]=}, {downloaded=}")
             with Stubber(s3) as stubber:
@@ -1852,7 +1944,7 @@ def _utility_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             from loguru import logger as loguru_logger
 
             loguru_logger.remove()  # drop the default stderr sink
@@ -1866,6 +1958,7 @@ def _utility_cells() -> list[NotebookNode]:
 
 
             def ship(order_id: int) -> None:
+                """Log the shipping steps with the order id bound."""
                 log = loguru_logger.bind(order_id=order_id)
                 log.info("packing {} items", 3)
                 log.warning("courier slot missing")
@@ -1877,7 +1970,7 @@ def _utility_cells() -> list[NotebookNode]:
             except ArithmeticError:
                 loguru_logger.opt(exception=False).error("charging failed")
             loguru_logger.remove(sink_id)
-            """
+            '''
         ),
         md(
             """
@@ -1889,18 +1982,21 @@ def _utility_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             import attrs
 
 
             @attrs.define(frozen=True)
             class StockLevel:
+                """A stock level validated and converted by attrs."""
+
                 sku: str = attrs.field(validator=attrs.validators.matches_re(r"[A-Z]{2,6}-\d{1,4}"))
                 quantity: int = attrs.field(converter=int, validator=attrs.validators.ge(0))
                 reorder_level: int = 5
 
                 @property
                 def is_low(self) -> bool:
+                    """True when stock is at or below the reorder level."""
                     return self.quantity <= self.reorder_level
 
 
@@ -1913,7 +2009,7 @@ def _utility_cells() -> list[NotebookNode]:
                 print(f"ValueError: {error.args[0]}")  # attrs adds the attribute and validator as extra args
             print(raised_message(lambda: StockLevel("TEA-500", -1)))
             print(f"{hasattr(level, '__dict__')=}  (slotted)")
-            """
+            '''
         ),
         md(
             """
@@ -1934,7 +2030,9 @@ def _utility_cells() -> list[NotebookNode]:
             print(f"{list(cheap)=}, {list(expensive)=}")
             print(f"{mit.first([], default='none')=}, {mit.one(['only'])=}")
             print(raised_message(lambda: mit.one(["a", "b"])))
-            print(f"{list(mit.pairwise('ABC'))=}, {mit.ilen(x for x in range(10) if x % 3 == 0)=}")
+            print(
+                f"{list(mit.pairwise('ABC'))=}, {mit.ilen(number for number in range(10) if number % 3 == 0)=}"
+            )
             """
         ),
         md(
@@ -1947,7 +2045,7 @@ def _utility_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             from cachetools import LRUCache, TTLCache, cached
 
             fake_now = [0.0]
@@ -1956,6 +2054,7 @@ def _utility_cells() -> list[NotebookNode]:
 
             @cached(cache=TTLCache(maxsize=100, ttl=60, timer=lambda: fake_now[0]))
             def exchange_rate(currency: str) -> float:
+                """Look up a rate from the API (the cache decides if it is called)."""
                 rate_lookups.append(currency)
                 return httpx.get(f"{SHOP_API}/rates", timeout=5).json()["rates"][currency]
 
@@ -1969,7 +2068,7 @@ def _utility_cells() -> list[NotebookNode]:
             recent["TEA-500"]  # touch: now most recent
             recent["JAR-750"] = 350  # evicts the least recently used
             print(f"{sorted(recent)=}")
-            """
+            '''
         ),
     ]
 
@@ -2071,15 +2170,17 @@ def _lab_cells() -> list[NotebookNode]:
         ),
         md("Check exercise 1 (it calls your code against the local API several times):"),
         code(
-            r"""
+            r'''
             from typer.testing import CliRunner
 
 
             def hits(key: str) -> int:
+                """How many times the lab API has served key."""
                 return httpx.get(f"{LAB_API}/hits", params={"key": key}, timeout=5).json()["hits"]
 
 
             def fetch_story(key: str, fail: int) -> tuple[str, int]:
+                """Fetch orders with `fail` failures first; return outcome and hits."""
                 with httpx.Client(base_url=LAB_API, timeout=5) as client:
                     client.get("/reset")
                     try:
@@ -2090,6 +2191,7 @@ def _lab_cells() -> list[NotebookNode]:
 
 
             def not_found_story() -> str:
+                """A 404 must fail at once, without retries."""
                 with httpx.Client(base_url=LAB_API, timeout=5) as client:
                     started = time.monotonic()
                     try:
@@ -2110,15 +2212,18 @@ def _lab_cells() -> list[NotebookNode]:
 
 
             def lab_summary() -> pl.DataFrame:
+                """The summary table for the lab's sample orders."""
                 return summarize(validate_orders(LAB_RAW)[0])
 
 
             def table_facts() -> tuple[object, ...]:
+                """Title, headers and row count of the rich table."""
                 table = build_table(lab_summary())
                 return table.title, [str(column.header) for column in table.columns], table.row_count
 
 
             def report_facts() -> tuple[object, ...]:
+                """Facts about the rendered HTML report."""
                 html = render_report(lab_summary(), datetime(2026, 11, 7, 9, 30, tzinfo=UTC))
                 return (
                     html.count("<tr"),
@@ -2129,6 +2234,7 @@ def _lab_cells() -> list[NotebookNode]:
 
 
             def cli_story(path: str) -> tuple[int, bool, bool, bool]:
+                """Run the CLI end to end; check its exit code and output file."""
                 output = LAB46_DIR / "report.html"
                 output.unlink(missing_ok=True)
                 httpx.get(f"{LAB_API}/reset", timeout=5)
@@ -2194,7 +2300,7 @@ def _lab_cells() -> list[NotebookNode]:
                     ("CLI HTTP error -> exit 1", lambda: cli_story("/status/404")[0], 1),
                 ]
             )
-            """
+            '''
         ),
     ]
 

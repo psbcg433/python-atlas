@@ -117,7 +117,7 @@ def shell(
     env: dict[str, str] | None = None,
     keep: str | None = None,
     max_lines: int | None = None,
-) -> int:
+) -> None:
     """Print `[folder]$ command` and the tool's real output (only lines matching keep, if given)."""
     exit_code, output = run_tool(*command, cwd=cwd, env=env)
     shown = [Path(command[0]).name if "/" in command[0] else command[0], *command[1:]]
@@ -131,7 +131,6 @@ def shell(
         print(textwrap.indent("\n".join(lines), "  "))
     if exit_code:
         print(f"  (exit code {exit_code})")
-    return exit_code
 
 
 def fresh_dir(name: str) -> Path:
@@ -183,6 +182,7 @@ class DemoPackage:
 
     @property
     def module(self) -> str:
+        """Import name: the distribution name with dashes as underscores."""
         return self.name.replace("-", "_")
 
     def files(self) -> dict[str, str]:
@@ -210,6 +210,7 @@ class DemoPackage:
         }
 
     def wheel_name(self) -> str:
+        """File name of this package's pure-Python wheel."""
         return f"{self.module}-{self.version}-py3-none-any.whl"
 
 
@@ -541,7 +542,7 @@ def _ecosystem_cells() -> list[NotebookNode]:
 
             </details>
 
-            **Under the hood: a complete build backend in 40 lines.** A backend is just a module
+            **Under the hood: a complete build backend in under 50 lines.** A backend is just a module
             with those functions. The next cell writes one (`tiny_backend.py`), a project that
             uses it through `backend-path` (an in-tree backend, so `requires` is empty), and
             builds it with uv as the frontend.
@@ -549,7 +550,7 @@ def _ecosystem_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            TINY_BACKEND = r"""
+            TINY_BACKEND_CORE = r"""
                 # A minimal PEP 517 + PEP 660 build backend (pure Python, py3-none-any only).
                 import base64, hashlib, io, os, tarfile, tomllib, zipfile
                 from pathlib import Path
@@ -575,7 +576,19 @@ def _ecosystem_cells() -> list[NotebookNode]:
                             wheel.writestr(path, data)
                         wheel.writestr(f"{DIST_INFO}/RECORD", "\n".join(record) + f"\n{DIST_INFO}/RECORD,,\n")
                     return name
-
+            """
+            '''
+        ),
+        md(
+            """
+            The hooks themselves are thin: the frontend calls `build_wheel`, `build_sdist` or
+            (PEP 660, for `pip install -e`) `build_editable`, and each returns the file name it
+            wrote. The editable "wheel" contains only a `.pth` file pointing at the source.
+            """
+        ),
+        code(
+            r'''
+            TINY_BACKEND_HOOKS = r"""
                 def get_requires_for_build_wheel(config_settings=None):
                     return []
 
@@ -598,6 +611,18 @@ def _ecosystem_cells() -> list[NotebookNode]:
                         sdist.addfile(info, io.BytesIO(METADATA.encode()))
                     return name
             """
+            TINY_BACKEND = TINY_BACKEND_CORE + TINY_BACKEND_HOOKS
+            print(f"tiny_backend.py: {len(TINY_BACKEND.splitlines())} lines")
+            '''
+        ),
+        md(
+            """
+            A project that uses it: `backend-path = ["."]` lets the frontend import the backend
+            from the project folder, and `uv build` calls its hooks:
+            """
+        ),
+        code(
+            r'''
             tiny_root = write_files(
                 fresh_dir("tiny-tax"),
                 {
@@ -675,9 +700,9 @@ def _pip_cells() -> list[NotebookNode]:
             PIP_ENV = tool_env(PIP_NO_INDEX="1", PIP_FIND_LINKS=str(WHEELHOUSE))
 
 
-            def pip(*arguments: str, cwd: Path = UNIT41_DIR, **options: object) -> int:
+            def pip(*arguments: str, cwd: Path = UNIT41_DIR, **options: object) -> None:
                 """Run pip inside the scratch venv against the local wheelhouse."""
-                return shell(PIP_PYTHON, "-m", "pip", *arguments, cwd=cwd, env=PIP_ENV, **options)
+                shell(PIP_PYTHON, "-m", "pip", *arguments, cwd=cwd, env=PIP_ENV, **options)
 
 
             pip("--version")
@@ -938,7 +963,9 @@ def _uv_cells() -> list[NotebookNode]:
 
 
             print(f"locked before the release: rupee-fmt {locked_rupee()}")
-            publish_to_wheelhouse(next(p for p in WHEELHOUSE_PACKAGES if p.version == "1.2.0"))
+            publish_to_wheelhouse(
+                next(package for package in WHEELHOUSE_PACKAGES if package.version == "1.2.0")
+            )
             shell("uv", "lock", cwd=invoicing)
             print(f"after plain `uv lock`:     rupee-fmt {locked_rupee()}")
             shell("uv", "lock", "--upgrade-package", "rupee-fmt", cwd=invoicing)
@@ -1108,6 +1135,16 @@ def _uv_cells() -> list[NotebookNode]:
             """
                 },
             )
+            '''
+        ),
+        md(
+            """
+            Add two members with `uv init` inside the workspace, make `billing-api`
+            depend on `pricing-core`, and run code that crosses the boundary:
+            """
+        ),
+        code(
+            r"""
             UV_INIT_MEMBER = ("uv", "init", "--author-from", "none", "--vcs", "none", "--no-readme")
             shell(*UV_INIT_MEMBER, "--lib", "packages/pricing-core", cwd=monorepo)
             shell(*UV_INIT_MEMBER, "--package", "packages/billing-api", cwd=monorepo)
@@ -1126,7 +1163,7 @@ def _uv_cells() -> list[NotebookNode]:
             )
             workspace_lock = tomllib.loads((monorepo / "uv.lock").read_text())
             print(f"one uv.lock for the workspace, members: {workspace_lock['manifest']['members']}")
-            '''
+            """
         ),
         md(
             """
@@ -1211,7 +1248,7 @@ def _pyproject_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            ANATOMY_PYPROJECT = """
+            ANATOMY_BUILD_AND_PROJECT = """
             [build-system]                                  # PEP 518: how to build this project
             requires = ["uv_build>=0.13,<0.14"]             # installed into the isolated build env
             build-backend = "uv_build"                      # module whose PEP 517 hooks build it
@@ -1229,7 +1266,17 @@ def _pyproject_cells() -> list[NotebookNode]:
                 "gst-calc>=1.0,<2",
                 "win-colors>=1.0; sys_platform == 'win32'", # environment marker: Windows only
             ]
-
+            """
+            '''
+        ),
+        md(
+            """
+            Extras, console scripts, links and the local-only dependency groups:
+            """
+        ),
+        code(
+            r'''
+            ANATOMY_EXTRAS_AND_GROUPS = """
             [project.optional-dependencies]                 # extras: pip install "invoice-kit[report]"
             report = ["table-print>=0.1"]
 
@@ -1242,7 +1289,18 @@ def _pyproject_cells() -> list[NotebookNode]:
             [dependency-groups]                             # PEP 735: local-only groups, never published
             dev = ["rupee-fmt>=1.1", { include-group = "lint" }]
             lint = ["table-print"]
-
+            """
+            '''
+        ),
+        md(
+            """
+            Finally the `[tool.*]` tables. The next cell joins the three parts into
+            `ANATOMY_PYPROJECT` and parses it with `tomllib`:
+            """
+        ),
+        code(
+            r'''
+            ANATOMY_TOOLS = """
             [tool.uv]                                       # uv settings for this project
             no-index = true
             find-links = ["../wheelhouse"]
@@ -1262,6 +1320,7 @@ def _pyproject_cells() -> list[NotebookNode]:
             testpaths = ["tests"]
             addopts = "-ra --strict-markers"
             """
+            ANATOMY_PYPROJECT = ANATOMY_BUILD_AND_PROJECT + ANATOMY_EXTRAS_AND_GROUPS + ANATOMY_TOOLS
             anatomy = tomllib.loads(ANATOMY_PYPROJECT)
             for table, content in anatomy.items():
                 keys = list(content)
@@ -1419,9 +1478,8 @@ def _specifier_cells() -> list[NotebookNode]:
         code(
             r"""
             print(f"{matching('>=2')=}")
-            print(
-                f"{[str(v) for v in SpecifierSet('>=2', prereleases=True).filter(map(Version, CANDIDATES))]=}"
-            )
+            with_prereleases = SpecifierSet(">=2", prereleases=True)
+            print(f"{[str(candidate) for candidate in with_prereleases.filter(map(Version, CANDIDATES))]=}")
             print(f"{matching('>=2.1.0rc1')=}  (naming a pre-release opts in)")
             ordering = ["1.0", "1.0.post1", "1.0rc1", "1.0a1", "1.0.dev1", "1.0b2"]
             print(f"{sorted(ordering, key=Version)=}")
@@ -1501,7 +1559,7 @@ def _specifier_cells() -> list[NotebookNode]:
             from packaging.specifiers import SpecifierSet
 
             spec = SpecifierSet("~=2.2")
-            print([v for v in ["2.1", "2.2", "2.9", "3.0", "2.10"] if v in spec])
+            print([version for version in ["2.1", "2.2", "2.9", "3.0", "2.10"] if version in spec])
             """,
             """
             `['2.2', '2.9', '2.10']`. `~=2.2` means `>=2.2, ==2.*`, so 2.1 is too old and 3.0
@@ -1512,7 +1570,7 @@ def _specifier_cells() -> list[NotebookNode]:
             from packaging.specifiers import SpecifierSet
 
             spec = SpecifierSet("~=2.2")
-            print([v for v in ["2.1", "2.2", "2.9", "3.0", "2.10"] if v in spec])
+            print([version for version in ["2.1", "2.2", "2.9", "3.0", "2.10"] if version in spec])
             """,
         ),
     ]
@@ -1678,6 +1736,33 @@ def _layout_cells() -> list[NotebookNode]:
             dist_info = next(invoicing_site.glob("invoicing-*.dist-info"))
             print(f"direct_url.json -> {tidy((dist_info / 'direct_url.json').read_text())}")
             """
+        ),
+        md(
+            """
+            **Under the hood: where an editable module really lives.** Inside the project's
+            environment, `inspect.getsourcefile()` and the module's `__dict__` (`__file__`,
+            `__spec__.origin`, `__path__`) all point at `src/invoicing/`, not `site-packages`:
+            the `.pth` line above put `src/` on `sys.path`, so an edit to the source is live at
+            the next import, with no reinstall.
+            """
+        ),
+        code(
+            r'''
+            EDITABLE_PROBE = """
+            import inspect, invoicing
+            print("getsourcefile:", inspect.getsourcefile(invoicing))
+            print("__spec__.origin:", vars(invoicing)["__spec__"].origin)
+            print("__path__:", list(vars(invoicing)["__path__"]))
+            print("in site-packages:", "site-packages" in invoicing.__file__)
+            print("public names:", sorted(name for name in vars(invoicing) if not name.startswith("_")))
+            """
+            probe_exit_code, probe_output = run_tool(
+                "uv", "run", "python", "-c", textwrap.dedent(EDITABLE_PROBE), cwd=invoicing
+            )
+            print(
+                probe_output if probe_exit_code == 0 else f"probe failed ({probe_exit_code}):\n{probe_output}"
+            )
+            '''
         ),
         md(
             """
@@ -1889,8 +1974,17 @@ def _publishing_cells() -> list[NotebookNode]:
 
             </details>
 
-            ```yaml
-            # .github/workflows/release.yml (shown, not used by the course)
+            The minimal trusted-publishing job has two parts that matter: the job runs in a
+            protected **environment** (the name PyPI's trusted-publisher entry names), and it is
+            granted `id-token: write` (without it GitHub refuses to mint the OIDC token). The
+            next cell writes that job to `notebooks/_scratch/unit41/release.yml`, offline, and
+            checks both with `yaml`:
+            """
+        ),
+        code(
+            r'''
+            RELEASE_WORKFLOW = """
+            # .github/workflows/release.yml (written to the scratch folder, never run)
             on:
               release:
                 types: [published]
@@ -1905,8 +1999,38 @@ def _publishing_cells() -> list[NotebookNode]:
                   - uses: astral-sh/setup-uv@v7
                   - run: uv build
                   - run: uv publish      # detects the OIDC environment: --trusted-publishing automatic
-            ```
+            """
+            release_workflow_path = UNIT41_DIR / "release.yml"
+            release_workflow_path.write_text(textwrap.dedent(RELEASE_WORKFLOW).lstrip())
+            print(f"wrote {tidy(str(release_workflow_path))}")
+            '''
+        ),
+        md(
+            """
+            Parse it and check the job. Note the YAML 1.1 trap PyYAML follows: the bare key `on`
+            is read as the boolean `True`, so the trigger lives under `workflow[True]`.
+            """
+        ),
+        code(
+            r"""
+            if importlib.util.find_spec("yaml") is None:
+                print("SKIP: PyYAML is not installed, so the workflow cannot be parsed here")
+            else:
+                import yaml
 
+                workflow = yaml.safe_load(release_workflow_path.read_text())
+                publish_job = workflow["jobs"]["publish"]
+                print(f"{sorted(workflow, key=str)=}  (the 'on' key became True)")
+                print(f"{workflow[True]=}")
+                print(f"{publish_job['permissions']=}")
+                print(f"{publish_job.get('environment')=}")
+                print(f"has id-token: write -> {publish_job['permissions'].get('id-token') == 'write'}")
+                print(f"runs in an environment -> {bool(publish_job.get('environment'))}")
+                print(f"no stored secrets -> {'secrets.' not in release_workflow_path.read_text()}")
+            """
+        ),
+        md(
+            """
             **SemVer vs CalVer.**
 
             | Scheme | Format | Says | Used by |
@@ -1975,18 +2099,24 @@ def _publishing_cells() -> list[NotebookNode]:
                 return "\n".join(lines)
 
 
-            print(
-                draft_changelog(
-                    "1.4.2",
-                    [
-                        "feat(cli): add --currency option",
-                        "fix: round GST half up",
-                        "docs: fix typo",
-                        "feat!: drop Python 3.11",
-                    ],
-                )
-            )
             '''
+        ),
+        md(
+            """
+            Four commits since 1.4.2: one breaking change makes the next version 2.0.0, and the
+            `docs:` commit is left out of the changelog.
+            """
+        ),
+        code(
+            r"""
+            COMMIT_SUBJECTS = [
+                "feat(cli): add --currency option",
+                "fix: round GST half up",
+                "docs: fix typo",
+                "feat!: drop Python 3.11",
+            ]
+            print(draft_changelog("1.4.2", COMMIT_SUBJECTS))
+            """
         ),
     ]
 
@@ -2134,7 +2264,9 @@ def _supply_chain_cells() -> list[NotebookNode]:
                 declared_modules = {name.replace("-", "_").lower(): name for name in declared}
                 return {
                     "DEP001 missing": sorted(third_party - set(declared_modules)),
-                    "DEP002 unused": sorted(declared_modules[m] for m in set(declared_modules) - third_party),
+                    "DEP002 unused": sorted(
+                        declared_modules[module] for module in set(declared_modules) - third_party
+                    ),
                 }
 
 
@@ -2183,9 +2315,9 @@ def _supply_chain_cells() -> list[NotebookNode]:
                 if expression := metadata.get("License-Expression"):
                     return f"{expression} (SPDX)"
                 classifiers = [
-                    c.split(" :: ")[-1]
-                    for c in metadata.get_all("Classifier") or []
-                    if c.startswith("License ::")
+                    classifier.split(" :: ")[-1]
+                    for classifier in metadata.get_all("Classifier") or []
+                    if classifier.startswith("License ::")
                 ]
                 if classifiers:
                     return f"{', '.join(classifiers)} (classifier)"
@@ -2431,6 +2563,7 @@ def _lab_cells() -> list[NotebookNode]:
 
 
             def learner_version() -> str:
+                """Build the learner's library and print its version from the installed wheel."""
                 wheel_path, _ = build_learner_library()
                 return run_tool(
                     "uv",
@@ -2451,7 +2584,9 @@ def _lab_cells() -> list[NotebookNode]:
                 [
                     (
                         "src layout",
-                        lambda: sorted(p for p in library_files() if p.startswith("src/invoice_tools/")),
+                        lambda: sorted(
+                            name for name in library_files() if name.startswith("src/invoice_tools/")
+                        ),
                         [
                             "src/invoice_tools/__init__.py",
                             "src/invoice_tools/cli.py",
@@ -2460,7 +2595,7 @@ def _lab_cells() -> list[NotebookNode]:
                     ),
                     (
                         "nothing importable at the root",
-                        lambda: [p for p in library_files() if p.endswith(".py") and "/" not in p],
+                        lambda: [name for name in library_files() if name.endswith(".py") and "/" not in name],
                         [],
                     ),
                     (
@@ -2534,7 +2669,9 @@ def _lab_cells() -> list[NotebookNode]:
             def read_script_metadata(script: str) -> dict[str, object]:
                 """Parse the `# /// script` block of a PEP 723 script."""
                 script = textwrap.dedent(script)
-                match = next((m for m in PEP723_BLOCK.finditer(script) if m["type"] == "script"), None)
+                match = next(
+                    (block for block in PEP723_BLOCK.finditer(script) if block["type"] == "script"), None
+                )
                 if match is None:
                     raise ValueError("no `# /// script` block")
                 toml_text = "".join(
@@ -2545,6 +2682,7 @@ def _lab_cells() -> list[NotebookNode]:
 
 
             def run_learner_script() -> list[str]:
+                """Run the learner's PEP 723 script with uv; return its output lines."""
                 root = fresh_dir("lab/script")
                 (root / "quote.py").write_text(textwrap.dedent(pep723_script()))
                 output = run_tool(
@@ -2571,7 +2709,8 @@ def _lab_cells() -> list[NotebookNode]:
                     (
                         "dependencies",
                         lambda: [
-                            d.replace(" ", "") for d in read_script_metadata(pep723_script())["dependencies"]
+                            dependency.replace(" ", "")
+                            for dependency in read_script_metadata(pep723_script())["dependencies"]
                         ],
                         ["rupee-fmt>=2"],
                     ),
@@ -2639,7 +2778,10 @@ def _lab_cells() -> list[NotebookNode]:
                     ("three requirements", lambda: len(wheel_summary(GST_WHEEL)["requires_dist"]), 3),
                     (
                         "one extra requirement",
-                        lambda: sum("extra ==" in r for r in wheel_summary(GST_WHEEL)["requires_dist"]),
+                        lambda: sum(
+                            "extra ==" in requirement
+                            for requirement in wheel_summary(GST_WHEEL)["requires_dist"]
+                        ),
                         1,
                     ),
                     ("RECORD verifies", lambda: wheel_summary(GST_WHEEL)["record_ok"], True),

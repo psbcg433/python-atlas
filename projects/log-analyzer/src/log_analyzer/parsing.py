@@ -58,13 +58,16 @@ def is_gzip_file(path: Path) -> bool:
         return raw_file.read(len(GZIP_MAGIC)) == GZIP_MAGIC
 
 
-def open_log(path: Path) -> TextIO:
+def open_log(path: Path, *, compressed: bool | None = None) -> TextIO:
     """Open a log for reading as text, decompressing gzip transparently.
 
     Bytes that are not valid UTF-8 become U+FFFD instead of raising, so one bad byte turns
-    one line into a malformed line rather than stopping the whole run.
+    one line into a malformed line rather than stopping the whole run. Pass ``compressed``
+    when the caller has already checked the magic bytes, so the file is not sniffed twice.
     """
-    if is_gzip_file(path):
+    if compressed is None:
+        compressed = is_gzip_file(path)
+    if compressed:
         return gzip.open(path, "rt", encoding="utf-8", errors="replace")
     return path.open(encoding="utf-8", errors="replace")
 
@@ -75,9 +78,10 @@ def read_lines(path: Path) -> Iterator[tuple[int, str]]:
     Raises:
         LogFileError: The file is gzip-compressed but truncated or corrupt.
     """
-    logger.debug("reading %s (%s)", path, "gzip" if is_gzip_file(path) else "plain text")
+    compressed = is_gzip_file(path)
+    logger.debug("reading %s (%s)", path, "gzip" if compressed else "plain text")
     try:
-        with open_log(path) as log_file:
+        with open_log(path, compressed=compressed) as log_file:
             for line_number, raw_line in enumerate(log_file, start=1):
                 line = raw_line.rstrip("\n")
                 if line.strip():

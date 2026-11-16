@@ -106,6 +106,11 @@ def _overview_cells() -> list[NotebookNode]:
 
             Every demo writes under `notebooks/_scratch/unit45/` (paths are shown as
             `<scratch>`). The file contents are fixed, so outputs are the same on every run.
+
+            > **Changed in 3.15 (PEP 686):** UTF-8 mode is on by default, so the setup cell
+            > prints `sys.flags.utf8_mode=1`. On 3.12–3.14 it prints `0` unless Python runs
+            > with `-X utf8` or `PYTHONUTF8=1`, and `open()` without `encoding=` uses the
+            > locale's encoding (often cp1252 on Windows).
             """
         ),
         code(UNIT_SETUP_SOURCE),
@@ -301,7 +306,10 @@ def _pattern_cells() -> list[NotebookNode]:
             r"""
             access_log = io_demo / "access.log"
             access_log.write_text(
-                "".join(f"2026-11-07 GET /products/{n} {200 if n % 7 else 500}\n" for n in range(1, 1001)),
+                "".join(
+                    f"2026-11-07 GET /products/{number} {200 if number % 7 else 500}\n"
+                    for number in range(1, 1001)
+                ),
                 encoding="utf-8",
             )
             with access_log.open(encoding="utf-8") as log_file:
@@ -477,7 +485,7 @@ def _memory_file_cells() -> list[NotebookNode]:
                 (workspace_path / "export.csv").write_text("sku\nTEA-500\n", encoding="utf-8")
                 print(
                     f"inside:  {workspace_path.name.startswith('shop-')=}, "
-                    f"{[p.name for p in workspace_path.iterdir()]}"
+                    f"{[path.name for path in workspace_path.iterdir()]}"
                 )
             print(f"after:   {workspace_path.exists()=}")
 
@@ -558,6 +566,7 @@ def _binary_cells() -> list[NotebookNode]:
                 """A valid RGB PNG (solid colour) built by hand, no image library needed."""
 
                 def chunk(kind: bytes, data: bytes) -> bytes:
+                    """One PNG chunk: length, type, data and CRC."""
                     return (
                         struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
                     )
@@ -570,12 +579,21 @@ def _binary_cells() -> list[NotebookNode]:
                     + chunk(b"IDAT", zlib.compress(pixels))
                     + chunk(b"IEND", b"")
                 )
-
-
+            '''
+        ),
+        md(
+            """
+            Parse it back with `struct.unpack_from`: check the signature, then read the
+            IHDR fields at fixed offsets.
+            """
+        ),
+        code(
+            r'''
             PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
             def png_header(data: bytes) -> dict[str, int]:
+                """Width, height, bit depth and colour type from a PNG's IHDR chunk."""
                 if data[:8] != PNG_SIGNATURE:
                     raise ValueError("not a PNG file")
                 length, kind = struct.unpack_from(">I4s", data, 8)
@@ -633,7 +651,7 @@ def _binary_cells() -> list[NotebookNode]:
             r"""
             records_path = io_demo / "records.bin"
             records_path.write_bytes(
-                b"".join(struct.pack("<I8s", n, f"SKU{n:05d}".encode()) for n in range(10_000))
+                b"".join(struct.pack("<I8s", number, f"SKU{number:05d}".encode()) for number in range(10_000))
             )
             RECORD = struct.Struct("<I8s")
             with records_path.open("r+b") as records_file, mmap.mmap(records_file.fileno(), 0) as mapped:
@@ -828,9 +846,11 @@ def _serialization_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             @dataclasses.dataclass(frozen=True)
             class StockRow:
+                """One stock row, used for the CSV and JSON round trips."""
+
                 sku: str
                 quantity: int
                 unit_price: Decimal
@@ -847,7 +867,7 @@ def _serialization_cells() -> list[NotebookNode]:
                 ]
             print(rows)
             print(f"stock value: {sum(row.quantity * row.unit_price for row in rows)}")
-            """
+            '''
         ),
         md(
             """
@@ -1016,9 +1036,11 @@ def _pickle_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             @dataclasses.dataclass
             class Basket:
+                """A shopping basket to pickle and unpickle."""
+
                 customer: str
                 items: dict[str, int]
                 created: datetime
@@ -1032,7 +1054,7 @@ def _pickle_cells() -> list[NotebookNode]:
             print(f"{restored[0] == basket=}, {restored[0] is restored[1]=}  (shared reference kept)")
             print(f"{pickle.DEFAULT_PROTOCOL=}, {pickle.HIGHEST_PROTOCOL=}")
             print(f"{pickle.dumps(42, protocol=0)=}")
-            """
+            '''
         ),
         md(
             """
@@ -1048,16 +1070,19 @@ def _pickle_cells() -> list[NotebookNode]:
                 """Holds an open SQLite connection (unpicklable) plus cached prices."""
 
                 def __init__(self, database: str) -> None:
+                    """Open the price database."""
                     self.database = database
                     self.prices = {"TEA-500": 240}
                     self.connection = sqlite3.connect(database)
 
                 def __getstate__(self) -> dict[str, object]:
+                    """Pickle everything except the open connection."""
                     state = self.__dict__.copy()
                     del state["connection"]  # not picklable; reopened on load
                     return state
 
                 def __setstate__(self, state: dict[str, object]) -> None:
+                    """Restore the attributes and reopen the connection."""
                     self.__dict__.update(state)
                     self.connection = sqlite3.connect(self.database)
 
@@ -1083,14 +1108,17 @@ def _pickle_cells() -> list[NotebookNode]:
                 """Validated in __init__, so unpickling must go through __init__ too."""
 
                 def __init__(self, code: str) -> None:
+                    """Accept only upper-case SKU codes."""
                     if not code.isupper():
                         raise ValueError(f"invalid SKU {code!r}")
                     self.code = code
 
                 def __reduce__(self) -> tuple[type, tuple[str]]:
+                    """Rebuild through Sku(code), so validation runs on load."""
                     return (Sku, (self.code,))
 
                 def __repr__(self) -> str:
+                    """Sku('CODE')."""
                     return f"Sku({self.code!r})"
 
 
@@ -1124,7 +1152,10 @@ def _pickle_cells() -> list[NotebookNode]:
 
 
             class Innocent:
+                """A class whose unpickling calls a function of the attacker's choice."""
+
                 def __reduce__(self) -> tuple[Callable[[str], str], tuple[str]]:
+                    """Tell pickle to call record_side_effect when loading."""
                     return (record_side_effect, ("ran during pickle.loads",))
 
 
@@ -1259,7 +1290,7 @@ def _compression_cells() -> list[NotebookNode]:
                 archive.extractall(fresh_dir("restored"), filter="data")
             restored = UNIT45_DIR / "restored"
             restored_files = sorted(
-                p.relative_to(restored).as_posix() for p in restored.rglob("*") if p.is_file()
+                path.relative_to(restored).as_posix() for path in restored.rglob("*") if path.is_file()
             )
             print(f"{restored_files=}")
 
@@ -1346,7 +1377,7 @@ def _sqlite_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            r"""
+            r'''
             user_input = "nothing' OR '1'='1"
             unsafe_sql = f"SELECT sku FROM products WHERE sku = '{user_input}'"  # never do this
             print(f"{unsafe_sql=}")
@@ -1360,6 +1391,7 @@ def _sqlite_cells() -> list[NotebookNode]:
 
 
             def products_sorted_by(column: str) -> list[tuple[str, ...]]:
+                """SKUs ordered by an allow-listed column name."""
                 if column not in SORTABLE_COLUMNS:  # identifiers cannot be parameters
                     raise ValueError(f"cannot sort by {column!r}")
                 return connection.execute(f"SELECT sku FROM products ORDER BY {column}").fetchall()
@@ -1367,7 +1399,7 @@ def _sqlite_cells() -> list[NotebookNode]:
 
             print(f"{products_sorted_by('price_paise')=}")
             print(raised_message(lambda: products_sorted_by("price_paise; DROP TABLE products")))
-            """
+            '''
         ),
         md(
             """
@@ -1389,9 +1421,18 @@ def _sqlite_cells() -> list[NotebookNode]:
                 "INSERT INTO stock VALUES (?, ?, ?)", [("PNQ1", "TEA-500", 10), ("BLR1", "TEA-500", 0)]
             )
             connection.commit()
-
-
+            """
+        ),
+        md(
+            """
+            A transfer touches two rows; `with connection:` commits both or rolls both
+            back. The `CHECK` constraint makes the second transfer fail:
+            """
+        ),
+        code(
+            r'''
             def transfer(quantity: int) -> None:
+                """Move stock between warehouses in one transaction."""
                 with connection:  # commit on success, rollback on error
                     connection.execute(
                         "UPDATE stock SET quantity = quantity + ? WHERE warehouse = 'BLR1' AND sku = 'TEA-500'",
@@ -1414,7 +1455,7 @@ def _sqlite_cells() -> list[NotebookNode]:
                 f"{connection.execute('SELECT warehouse, quantity FROM stock ORDER BY warehouse').fetchall()}"
                 "  (rolled back)"
             )
-            """
+            '''
         ),
         md(
             """
@@ -1543,7 +1584,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
         code(LAB_SETUP_SOURCE),
         md(
             """
-            #### Exercise 1 — `tail(path, n)` reading backwards with `seek`
+            #### Exercise 1 — `tail(path, line_count)` reading backwards with `seek`
 
             Return the last `n` lines of a UTF-8 text file as a list of strings without their
             line endings, **without reading the whole file**: open it in binary mode, `seek`
@@ -1555,8 +1596,8 @@ def _lab_cells_part_1() -> list[NotebookNode]:
         ),
         code(
             r'''
-            def tail(path: Path, n: int, chunk_size: int = 4096) -> list[str]:
-                """The last n lines of a UTF-8 file, read backwards in binary chunks."""
+            def tail(path: Path, line_count: int, chunk_size: int = 4096) -> list[str]:
+                """The last line_count lines of a UTF-8 file, read backwards in binary chunks."""
                 raise NotImplementedError
             '''
         ),
@@ -1576,9 +1617,13 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     ("last 5 lines", lambda: tail(big_log, 5), expected_tail),
                     ("tiny chunks (multi-byte split)", lambda: tail(big_log, 5, chunk_size=7), expected_tail),
                     ("no trailing newline", lambda: tail(no_newline, 2), ["second", "third"]),
-                    ("n larger than the file", lambda: tail(no_newline, 10), ["first", "second", "third"]),
+                    (
+                        "line_count larger than the file",
+                        lambda: tail(no_newline, 10),
+                        ["first", "second", "third"],
+                    ),
                     ("empty file", lambda: tail(LAB45_DIR / "empty.txt", 3), []),
-                    ("n = 0", lambda: tail(big_log, 0), []),
+                    ("line_count = 0", lambda: tail(big_log, 0), []),
                     (
                         "uses seek, not read_text",
                         lambda: (
@@ -1610,7 +1655,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
         ),
         md("Check exercise 2:"),
         code(
-            r"""
+            r'''
             json_dir = LAB45_DIR / "json_out"
             shutil.rmtree(json_dir, ignore_errors=True)
             json_dir.mkdir()
@@ -1618,11 +1663,13 @@ def _lab_cells_part_1() -> list[NotebookNode]:
 
 
             def write_then_read(data: object) -> str:
+                """Write data with write_json and return the file's text."""
                 write_json(settings_target, data)
                 return settings_target.read_text(encoding="utf-8")
 
 
             def failed_write_keeps_old() -> tuple[str, str, list[str]]:
+                """A failed write must leave the old file and no temp files."""
                 write_json(settings_target, {"currency": "₹"})
                 error = raised_message(lambda: write_json(settings_target, {"bad": {1, 2}}))
                 leftovers = sorted(path.name for path in json_dir.iterdir() if path.name != "settings.json")
@@ -1654,7 +1701,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     ),
                 ]
             )
-            """
+            '''
         ),
         md(
             """
@@ -1679,7 +1726,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
         ),
         md("Check exercise 3:"),
         code(
-            r"""
+            r'''
             HEADER = "order_id,customer,sku,quantity,unit_price\n"
             good_csv, bad_csv, duplicate_csv = (
                 LAB45_DIR / name for name in ("orders_good.csv", "orders_bad.csv", "orders_dup.csv")
@@ -1698,6 +1745,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
 
 
             def import_story() -> dict[str, object]:
+                """Import good, bad and duplicate CSVs; collect what happened."""
                 database = sqlite3.connect(":memory:")
                 story: dict[str, object] = {"good": import_orders(good_csv, database)}
                 story["bad"] = raised_message(lambda: import_orders(bad_csv, database)).split(":")[0]
@@ -1733,7 +1781,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     ),
                 ]
             )
-            """
+            '''
         ),
     ]
 
@@ -1764,8 +1812,9 @@ def _lab_cells_part_2() -> list[NotebookNode]:
         ),
         md("Check exercise 4 (the WAV files are written with the standard `wave` module):"),
         code(
-            r"""
+            r'''
             def make_wav(channels: int, sample_rate: int, sample_width: int, frames: int) -> bytes:
+                """A silent WAV file with the given format, as bytes."""
                 buffer = io.BytesIO()
                 with wave.open(buffer, "wb") as wav_file:
                     wav_file.setnchannels(channels)
@@ -1822,7 +1871,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     ("uses struct", lambda: "struct" in inspect.getsource(parse_wav_header), True),
                 ]
             )
-            """
+            '''
         ),
         md(
             """
@@ -1840,20 +1889,25 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 """JSON for Decimal, datetime/date, UUID and dataclasses."""
 
                 def default(self, value: object) -> object:
+                    """Convert Decimal, datetime, UUID and dataclasses (exercise 5 stub)."""
                     raise NotImplementedError
             '''
         ),
         md("Check exercise 5:"),
         code(
-            r"""
+            r'''
             @dataclasses.dataclass
             class LabLine:
+                """One line of a lab order."""
+
                 sku: str
                 price: Decimal
 
 
             @dataclasses.dataclass
             class LabOrder:
+                """A lab order with a UUID, a timestamp and lines."""
+
                 order_id: uuid.UUID
                 placed_at: datetime
                 lines: list[LabLine]
@@ -1900,7 +1954,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     ),
                 ]
             )
-            """
+            '''
         ),
         md(
             """
@@ -1923,8 +1977,9 @@ def _lab_cells_part_2() -> list[NotebookNode]:
         ),
         md("Check exercise 6:"),
         code(
-            r"""
+            r'''
             def make_zip(name: str, members: dict[str, str]) -> Path:
+                """Write a zip of name -> text members under the lab folder."""
                 path = LAB45_DIR / name
                 with zipfile.ZipFile(path, "w") as archive:
                     for member_name, text in members.items():
@@ -1933,6 +1988,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
 
 
             def extract_into(archive: Path, folder_name: str) -> tuple[str, list[str]]:
+                """Try safe_extract_zip; return the outcome and the files written."""
                 destination = LAB45_DIR / folder_name
                 shutil.rmtree(destination, ignore_errors=True)
                 outcome = raised_message(lambda: safe_extract_zip(archive, destination))
@@ -1949,6 +2005,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
 
 
             def read_if_exists(path: Path) -> str | None:
+                """The file's text, or None if it does not exist."""
                 return path.read_text() if path.exists() else None
 
 
@@ -1993,7 +2050,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     ("nothing escaped", lambda: (LAB45_DIR.parent / "evil.txt").exists(), False),
                 ]
             )
-            """
+            '''
         ),
     ]
 

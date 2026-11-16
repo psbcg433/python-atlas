@@ -1056,11 +1056,11 @@ class Err[E]:
 type Result[T, E] = Ok[T] | Err[E]
 
 
-def safe_divide(a: float, b: float) -> Result[float, str]:
-    """Ok(a / b), or Err("division by zero")."""
-    if b == 0:
+def safe_divide(dividend: float, divisor: float) -> Result[float, str]:
+    """Ok(dividend / divisor), or Err("division by zero")."""
+    if divisor == 0:
         return Err("division by zero")
-    return Ok(a / b)
+    return Ok(dividend / divisor)
 
 
 # Exercise 3 ------------------------------------------------------------------------------------
@@ -3344,12 +3344,12 @@ def verify_webhook(
 # Exercise 5 ------------------------------------------------------------------------------------
 
 
-def top_k(scores: Iterable[tuple[str, int]], k: int) -> list[tuple[str, int]]:
-    """The k highest (name, score) pairs, highest first, ties by name."""
-    if k <= 0:
+def top_k(scores: Iterable[tuple[str, int]], count: int) -> list[tuple[str, int]]:
+    """The count highest (name, score) pairs, highest first, ties by name."""
+    if count <= 0:
         return []
-    # nsmallest keeps a heap of only k items: (-score, name) puts high scores, then A-Z, first.
-    return heapq.nsmallest(k, scores, key=lambda pair: (-pair[1], pair[0]))
+    # nsmallest keeps a heap of only count items: (-score, name) puts high scores, then A-Z, first.
+    return heapq.nsmallest(count, scores, key=lambda pair: (-pair[1], pair[0]))
 
 
 # Exercise 6 ------------------------------------------------------------------------------------
@@ -3679,8 +3679,8 @@ def check_lab_4_4() -> None:
         for number in range(count):
             yield f"customer-{number:06d}", generator.randint(0, 1_000_000)
 
-    def expected_top(pairs: list[tuple[str, int]], k: int) -> list[tuple[str, int]]:
-        return sorted(pairs, key=lambda pair: (-pair[1], pair[0]))[:k]
+    def expected_top(pairs: list[tuple[str, int]], count: int) -> list[tuple[str, int]]:
+        return sorted(pairs, key=lambda pair: (-pair[1], pair[0]))[:count]
 
     run_checks(
         [
@@ -3689,13 +3689,13 @@ def check_lab_4_4() -> None:
                 lambda: top_k(LEADERBOARD, 3),
                 [("asha", 90), ("meera", 90), ("fatima", 82)],
             ),
-            ("k = 1", lambda: top_k(LEADERBOARD, 1), [("asha", 90)]),
+            ("count = 1", lambda: top_k(LEADERBOARD, 1), [("asha", 90)]),
             (
-                "k larger than the input",
+                "count larger than the input",
                 lambda: top_k(LEADERBOARD, 10),
                 expected_top(LEADERBOARD, 10),
             ),
-            ("k = 0", lambda: top_k(LEADERBOARD, 0), []),
+            ("count = 0", lambda: top_k(LEADERBOARD, 0), []),
             ("generator input", lambda: top_k(iter(LEADERBOARD), 2), [("asha", 90), ("meera", 90)]),
             (
                 "100,000-item stream",
@@ -3883,15 +3883,15 @@ LAB45_DIR.mkdir(parents=True, exist_ok=True)
 # Exercise 1 ------------------------------------------------------------------------------------
 
 
-def tail(path: Path, n: int, chunk_size: int = 4096) -> list[str]:
-    """The last n lines of a UTF-8 file, read backwards in binary chunks."""
-    if n <= 0:
+def tail(path: Path, line_count: int, chunk_size: int = 4096) -> list[str]:
+    """The last line_count lines of a UTF-8 file, read backwards in binary chunks."""
+    if line_count <= 0:
         return []
     with path.open("rb") as binary_file:
         position = binary_file.seek(0, os.SEEK_END)
         blocks: list[bytes] = []
         newlines = 0
-        while position > 0 and newlines <= n:
+        while position > 0 and newlines <= line_count:
             step = min(chunk_size, position)
             position -= step
             binary_file.seek(position)
@@ -3899,7 +3899,7 @@ def tail(path: Path, n: int, chunk_size: int = 4096) -> list[str]:
             blocks.append(block)
             newlines += block.count(b"\n")
     text = b"".join(reversed(blocks)).decode("utf-8")
-    return text.splitlines()[-n:]
+    return text.splitlines()[-line_count:]
 
 
 # Exercise 2 ------------------------------------------------------------------------------------
@@ -4030,9 +4030,13 @@ def check_lab_4_5() -> None:
                 expected_tail,
             ),
             ("no trailing newline", lambda: tail(no_newline, 2), ["second", "third"]),
-            ("n larger than the file", lambda: tail(no_newline, 10), ["first", "second", "third"]),
+            (
+                "line_count larger than the file",
+                lambda: tail(no_newline, 10),
+                ["first", "second", "third"],
+            ),
             ("empty file", lambda: tail(LAB45_DIR / "empty.txt", 3), []),
-            ("n = 0", lambda: tail(big_log, 0), []),
+            ("line_count = 0", lambda: tail(big_log, 0), []),
             (
                 "uses seek, not read_text",
                 lambda: (

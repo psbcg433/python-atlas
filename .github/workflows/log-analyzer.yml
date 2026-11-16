@@ -1,12 +1,17 @@
 # CI and release for the log-analyzer package in projects/log-analyzer/.
 #
-# - test:    ruff, mypy --strict and pytest (coverage must stay >= 90%) on Python 3.12-3.15,
-#            for pushes and pull requests that touch the package (and for releases).
-# - build:   sdist + wheel, smoke-tested, uploaded as an artifact. On a release tag it also
-#            checks that the tag matches the version in pyproject.toml.
-# - publish: uploads the artifact to TestPyPI with trusted publishing (OpenID Connect):
-#            no API token is stored anywhere. Runs only for tags log-analyzer-v* and for a
-#            manual "Run workflow", and only after test and build pass.
+# - test:    ruff, mypy --strict and pytest (coverage must stay >= 90%) on Python 3.12-3.15
+#            (Linux), plus Windows and macOS on 3.15, for pushes, pull requests and manual runs
+#            that touch the package (and for release tags).
+# - build:   sdist + wheel, smoke-tested, the test suite run again from the unpacked sdist,
+#            uploaded as an artifact. On a release tag it also checks that the tag matches
+#            the version in pyproject.toml.
+# - publish: uploads the artifact to TestPyPI with trusted publishing (OpenID Connect): no
+#            API token is stored anywhere. Runs only for tags log-analyzer-v*, and only after
+#            test and build pass. A manual "Run workflow" runs test and build, never publish.
+#
+# Every action is pinned to a full commit SHA (a moved tag cannot change what runs); the
+# comment names the release that SHA belongs to.
 name: log-analyzer
 
 on:
@@ -20,7 +25,7 @@ on:
     paths:
       - "projects/log-analyzer/**"
       - ".github/workflows/log-analyzer.yml"
-  workflow_dispatch:
+  workflow_dispatch: # manual runs: test and build only
 
 permissions:
   contents: read
@@ -38,17 +43,23 @@ env:
 
 jobs:
   test:
-    name: test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.12", "3.13", "3.14", "3.15"]
+        include:
+          - os: windows-latest
+            python-version: "3.15"
+          - os: macos-latest
+            python-version: "3.15"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
@@ -68,10 +79,10 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           python-version: "3.15"
       - name: Check that the tag matches the package version
@@ -87,7 +98,13 @@ jobs:
         run: uv build
       - name: Smoke-test the wheel in a clean environment
         run: uv run --isolated --no-project --with dist/*.whl log-analyzer --version
-      - uses: actions/upload-artifact@v7
+      - name: Run the test suite from the unpacked sdist
+        run: |
+          mkdir -p "$RUNNER_TEMP/sdist"
+          tar -xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist"
+          cd "$RUNNER_TEMP"/sdist/log_analyzer_psbcg433-*/
+          uv run --isolated --group dev pytest -p no:cacheprovider
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: log-analyzer-dist
           path: projects/log-analyzer/dist/
@@ -96,7 +113,7 @@ jobs:
   publish:
     name: publish to TestPyPI
     needs: build
-    if: startsWith(github.ref, 'refs/tags/log-analyzer-v') || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/log-analyzer-v')
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -104,10 +121,10 @@ jobs:
     permissions:
       id-token: write # lets the job request the OIDC token that TestPyPI trusts
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: log-analyzer-dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
