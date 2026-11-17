@@ -114,7 +114,8 @@ def render_report(summary: SalesSummary, profiles: list[dict[str, str]]) -> str:
         f"{'Rank':<6}{'Store':<7}{'City':<13}{'Region':<9}{'Revenue INR':>18}",
     ]
     store_order = sorted(
-        profiles, key=lambda p: (-summary.store_paise[STORE_INDEX[p["code"]]], p["code"])
+        profiles,
+        key=lambda profile: (-summary.store_paise[STORE_INDEX[profile["code"]]], profile["code"]),
     )
     for rank, profile in enumerate(store_order[:10], start=1):
         amount = format_paise(summary.store_paise[STORE_INDEX[profile["code"]]])
@@ -127,7 +128,11 @@ def render_report(summary: SalesSummary, profiles: list[dict[str, str]]) -> str:
         f"{'Rank':<6}{'SKU':<9}{'Product':<22}{'Units':>9}{'Revenue INR':>18}",
     ]
     product_order = sorted(
-        range(PRODUCT_COUNT), key=lambda i: (-summary.product_paise[i], PRODUCTS[i].sku)
+        range(PRODUCT_COUNT),
+        key=lambda product_index: (
+            -summary.product_paise[product_index],
+            PRODUCTS[product_index].sku,
+        ),
     )
     for rank, index in enumerate(product_order[:10], start=1):
         product, units = PRODUCTS[index], summary.product_units[index]
@@ -186,8 +191,8 @@ def summarize_rows_single_pass(rows: list[slow_report.Row]) -> SalesSummary:
         summary.last_day = (date.fromisoformat(max(dates)) - year_start).days
     summary.store_paise = [to_paise(store_revenue[code]) for code in STORE_CODES]
     summary.store_lines = [store_lines[code] for code in STORE_CODES]
-    summary.product_paise = [to_paise(product_revenue[p.sku]) for p in PRODUCTS]
-    summary.product_units = [product_units[p.sku] for p in PRODUCTS]
+    summary.product_paise = [to_paise(product_revenue[product.sku]) for product in PRODUCTS]
+    summary.product_units = [product_units[product.sku] for product in PRODUCTS]
     months = [f"{YEAR}-{month:02d}" for month in range(1, 13)]
     summary.month_paise = [to_paise(month_revenue.get(month, 0.0)) for month in months]
     summary.month_lines = [month_lines.get(month, 0) for month in months]
@@ -338,7 +343,10 @@ def summarize_vectorized(row_count: int, seed: int) -> SalesSummary:
         product_paise=pair_paise.sum(axis=0).tolist(),
         month_paise=month_paise.tolist(),
         month_lines=month_lines.tolist(),
-        pair_paise={(int(s), int(p)): int(pair_paise[s, p]) for s, p in nonzero},
+        pair_paise={
+            (int(store), int(product)): int(pair_paise[store, product])
+            for store, product in nonzero
+        },
     )
 
 

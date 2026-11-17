@@ -74,15 +74,18 @@ class Timer:
     """Timing context manager (shared since Unit 1.14): reports on exit, keeps elapsed_seconds."""
 
     def __init__(self, label: str, report: Callable[[str], None] | None = print) -> None:
+        """Remember the label and where to report the elapsed time."""
         self.label = label
         self.report = report
         self.elapsed_seconds = 0.0
 
     def __enter__(self) -> Timer:
+        """Start the clock."""
         self._start = time.perf_counter()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        """Stop the clock and report the elapsed milliseconds."""
         self.elapsed_seconds = time.perf_counter() - self._start
         if self.report is not None:
             self.report(f"{self.label} took {self.elapsed_seconds * 1000:.2f} ms")
@@ -518,6 +521,7 @@ def _toy_loop_cells_part_1() -> list[NotebookNode]:
                 """Step 1: a ready queue of generators, resumed in turn until each finishes."""
 
                 def __init__(self) -> None:
+                    """Start with an empty ready queue and a step counter."""
                     self.ready: deque[tuple[ToyCoroutine, object]] = deque()
                     self.steps = 0
 
@@ -591,11 +595,13 @@ def _toy_loop_cells_part_1() -> list[NotebookNode]:
                 """Step 2: a task may yield ("sleep", seconds); sleepers wait in a heap."""
 
                 def __init__(self) -> None:
+                    """Add a heap of (wake time, tie-breaker, coroutine) timers."""
                     super().__init__()
                     self.timers: list[tuple[float, int, ToyCoroutine]] = []
                     self.tie_breaker = itertools.count()
 
                 def handle(self, coroutine: ToyCoroutine, request: object) -> None:
+                    """Park a coroutine on the timer heap for sleep requests."""
                     match request:
                         case ("sleep", float() | int() as seconds):
                             wake_at = time.monotonic() + seconds
@@ -616,15 +622,14 @@ def _toy_loop_cells_part_1() -> list[NotebookNode]:
                     """0 if work is ready, else until the next timer, else forever (None)."""
                     if self.ready:
                         return 0
-                    if self.timers:
-                        return max(0.0, self.timers[0][0] - time.monotonic())
-                    return None
+                    return max(0.0, self.timers[0][0] - time.monotonic()) if self.timers else None
 
                 def wait_for_events(self, timeout: float | None) -> None:
-                    if timeout:
-                        time.sleep(timeout)  # nothing else to do until the next timer
+                    """Sleep until the next timer is due (no I/O to wait for yet)."""
+                    time.sleep(timeout or 0)  # nothing else to do until the next timer
 
                 def waiting_for_io(self) -> bool:
+                    """This loop never waits for I/O."""
                     return False
             '''
         ),
@@ -667,10 +672,12 @@ def _toy_loop_cells_part_1() -> list[NotebookNode]:
                 """Step 3: a task may yield ("read", sock) or ("write", sock)."""
 
                 def __init__(self) -> None:
+                    """Add a selector for sockets that coroutines wait on."""
                     super().__init__()
                     self.selector = selectors.DefaultSelector()
 
                 def handle(self, coroutine: ToyCoroutine, request: object) -> None:
+                    """Register the coroutine with the selector for read or write requests."""
                     match request:
                         case ("read", socket.socket() as sock):
                             self.selector.register(sock, selectors.EVENT_READ, coroutine)
@@ -680,6 +687,7 @@ def _toy_loop_cells_part_1() -> list[NotebookNode]:
                             super().handle(coroutine, request)
 
                 def waiting_for_io(self) -> bool:
+                    """True while any socket is registered with the selector."""
                     return bool(self.selector.get_map())
 
                 def wait_for_events(self, timeout: float | None) -> None:
@@ -834,25 +842,38 @@ def _toy_loop_cells_part_2() -> list[NotebookNode]:
                 """What asyncio calls a Task: a running coroutine plus its result and waiters."""
 
                 def __init__(self, coroutine: ToyCoroutine) -> None:
+                    """Wrap a coroutine with a result and the coroutines waiting for it."""
                     self.coroutine = coroutine
                     self.done = False
                     self.result: object = None
                     self.waiters: list[ToyCoroutine] = []
-
-
+            '''
+        ),
+        md(
+            """
+            `ToyLoop` adds the bookkeeping: `spawn` returns the task, a `("join", task)`
+            request either resumes at once or parks the joiner, and `finish` wakes the
+            waiters:
+            """
+        ),
+        code(
+            '''
             class ToyLoop(IOLoop):
                 """Step 5: spawn() returns a ToyTask; a task may yield ("join", other_task)."""
 
                 def __init__(self) -> None:
+                    """Add a table from coroutine to its ToyTask."""
                     super().__init__()
                     self.tasks: dict[ToyCoroutine, ToyTask] = {}
 
                 def spawn(self, coroutine: ToyCoroutine) -> ToyTask:
+                    """Schedule a coroutine and return its ToyTask handle."""
                     task = self.tasks[coroutine] = ToyTask(coroutine)
                     super().spawn(coroutine)
                     return task
 
                 def handle(self, coroutine: ToyCoroutine, request: object) -> None:
+                    """Resume the joiner now if the task is done, else queue it as a waiter."""
                     match request:
                         case ("join", ToyTask() as other) if other.done:
                             self.ready.append((coroutine, other.result))
@@ -862,6 +883,7 @@ def _toy_loop_cells_part_2() -> list[NotebookNode]:
                             super().handle(coroutine, request)
 
                 def finish(self, coroutine: ToyCoroutine, result: object) -> None:
+                    """Record the result and wake every coroutine waiting for this task."""
                     task = self.tasks.pop(coroutine)
                     task.done, task.result = True, result
                     for waiter in task.waiters:  # like a Future's done-callbacks
@@ -1030,9 +1052,11 @@ def _native_coroutine_cells() -> list[NotebookNode]:
                 """A custom awaitable: __await__ returns a generator."""
 
                 def __init__(self, seconds: float) -> None:
+                    """Remember how long to wait."""
                     self.seconds = seconds
 
                 def __await__(self) -> Generator[Any, None, str]:
+                    """Delegate to asyncio.sleep, then return a message."""
                     yield from asyncio.sleep(self.seconds).__await__()
                     return f"waited {self.seconds} s"
 
@@ -1103,9 +1127,11 @@ def _native_coroutine_cells() -> list[NotebookNode]:
                 """An awaitable that hands a question to the driver and returns its reply."""
 
                 def __init__(self, question: str) -> None:
+                    """Remember the question to yield."""
                     self.question = question
 
                 def __await__(self) -> Generator[str, object, object]:
+                    """Yield the question and return whatever is sent back."""
                     reply = yield self.question
                     return reply
 
@@ -1267,16 +1293,19 @@ def _await_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def inner(future: asyncio.Future[int]) -> int:
+                """Await the future directly."""
                 return await future
 
 
             async def middle(future: asyncio.Future[int]) -> int:
+                """Await inner and double the result."""
                 return await inner(future) * 2
 
 
             async def outer(future: asyncio.Future[int]) -> int:
+                """Await middle and add one."""
                 return await middle(future) + 1
 
 
@@ -1293,7 +1322,7 @@ def _await_cells() -> list[NotebookNode]:
                 chain.send(None)
             except StopIteration as stop:
                 print(f"{stop.value=}  (20 * 2 + 1)")
-            """
+            '''
         ),
         md(
             """
@@ -1323,12 +1352,14 @@ def _await_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def courier(parcel: asyncio.Future[str]) -> str:
+                """Wait for the parcel, then report the delivery."""
                 return f"delivered {await parcel}"
 
 
             async def shop(parcel: asyncio.Future[str]) -> str:
+                """Await the courier."""
                 return await courier(parcel)
 
 
@@ -1344,7 +1375,7 @@ def _await_cells() -> list[NotebookNode]:
                 print("asyncio.capture_call_graph needs Python 3.14+: skipped")
             parcel.set_result("parcel #5")
             print(f"{await shop_task=}")
-            """
+            '''
         ),
     ]
 
@@ -1586,11 +1617,12 @@ def _future_task_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             task_trace: list[str] = []
 
 
             async def brew(kind: str) -> str:
+                """Log the start, yield once, log the end."""
                 task_trace.append(f"{kind}: starts")
                 await asyncio.sleep(0)
                 task_trace.append(f"{kind}: done")
@@ -1602,7 +1634,7 @@ def _future_task_cells() -> list[NotebookNode]:
             task_trace.append(f"awaited: {await brew_task!r}")
             print("\\n".join(task_trace))
             print(f"{brew_task.get_coro().__qualname__=}")
-            """
+            '''
         ),
         md(
             """
@@ -1615,11 +1647,12 @@ def _future_task_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             task_trace.clear()
 
 
             async def cached_price(label: str) -> int:
+                """Return a cached price without ever suspending."""
                 task_trace.append(f"{label}: body runs")
                 return 99  # never suspends
 
@@ -1632,7 +1665,7 @@ def _future_task_cells() -> list[NotebookNode]:
                 print("\\n".join(task_trace))
             else:
                 print("create_task(eager_start=True) needs Python 3.14+: skipped")
-            """
+            '''
         ),
         md(
             """
@@ -1772,8 +1805,9 @@ def _core_api_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def main_entry() -> str:
+                """Yield once, then return done."""
                 await asyncio.sleep(0)
                 return "done"
 
@@ -1785,7 +1819,7 @@ def _core_api_cells() -> list[NotebookNode]:
                 print(f"{type(error).__name__}: {error}")
             finally:
                 entry.close()
-            """
+            '''
         ),
         md(
             """
@@ -1864,8 +1898,9 @@ def _core_api_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def fetch_menu(section: str, seconds: float = 0.2) -> str:
+                """Pretend to fetch one menu section."""
                 await asyncio.sleep(seconds)
                 return section
 
@@ -1886,7 +1921,7 @@ def _core_api_cells() -> list[NotebookNode]:
             print(
                 f"sequential / gather: {sequential_timer.elapsed_seconds / gather_timer.elapsed_seconds:.1f}x"
             )
-            """
+            '''
         ),
         md(
             """
@@ -1908,6 +1943,7 @@ def _core_api_cells() -> list[NotebookNode]:
 
 
             async def worker(name: str, pause: Callable[[], Coroutine[Any, Any, None]]) -> None:
+                """Log two steps, awaiting pause() after each."""
                 for step in range(2):
                     yield_trace.append(f"{name}{step}")
                     await pause()
@@ -1929,8 +1965,9 @@ def _core_api_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def slow_quote() -> int:
+                """Sleep a second unless wait_for cancels it first."""
                 try:
                     await asyncio.sleep(1)
                     return 100
@@ -1945,7 +1982,7 @@ def _core_api_cells() -> list[NotebookNode]:
                 print(f"{type(error).__name__} after 0.05 s")
             print(f"{await asyncio.wait_for(fetch_menu('tea', 0.01), timeout=1)=}")
             print(f"{await asyncio.wait_for(fetch_menu('snacks', 0.01), timeout=None)=}")
-            """
+            '''
         ),
         md(
             """
@@ -2096,8 +2133,9 @@ def _js_bridge_cells_part_1() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def place_order() -> str:
+                """Run the body when awaited (a lazy coroutine)."""
                 print("  place_order body runs")
                 return "order-1"
 
@@ -2108,7 +2146,7 @@ def _js_bridge_cells_part_1() -> list[NotebookNode]:
             order_task = asyncio.create_task(pending_order)
             print(f"create_task scheduled it: done={order_task.done()}")
             print(f"{await order_task=}")
-            """
+            '''
         ),
         md(
             f"""
@@ -2182,9 +2220,18 @@ def _js_bridge_cells_part_1() -> list[NotebookNode]:
 
             asyncio.run(main())
             """
+            '''
+        ),
+        md(
+            """
+            Run it in a fresh interpreter (so it starts on a new loop, like `node script.js`):
+            """
+        ),
+        code(
+            """
             python_order_output = run_child(PYTHON_ORDER_SOURCE)
             print(python_order_output)
-            '''
+            """
         ),
         md(
             """
@@ -2199,8 +2246,7 @@ def _js_bridge_cells_part_1() -> list[NotebookNode]:
             | 7 | `readFile callback` (poll phase) | `to_thread(read) done callback` | both are I/O completions arriving from a thread pool; asyncio delivers it as a Future callback through the self-pipe and the selector |
             | 8–9 | `setImmediate` beats `setTimeout 0` (check phase comes right after poll) | `call_soon` beats `call_later(0)` | Node: phase order. Python: the `call_soon` handle is already in the ready queue when the timer becomes due and is appended after it |
 
-            If `node` is installed, the next cell runs the JS program and compares it
-            with the known output (otherwise it prints a skip message):
+            The JS program and its known output, as strings for the live run below:
             """
         ),
         code(
@@ -2210,6 +2256,16 @@ def _js_bridge_cells_part_1() -> list[NotebookNode]:
             """
             JS_ORDER_OUTPUT = """
             {_indented(JS_ORDER_OUTPUT, 12)}
+            """
+            '''
+        ),
+        md(
+            """
+            Run the JS version with `node` if it is installed (otherwise print a skip message)
+            and compare its output with the known output:
+            """
+        ),
+        code(
             """
             node_path = shutil.which("node")
             if node_path is None:
@@ -2223,8 +2279,8 @@ def _js_bridge_cells_part_1() -> list[NotebookNode]:
                 node_version = version_run.stdout.strip()
                 print(node_run.stdout.rstrip())
                 matches = node_run.stdout.strip() == JS_ORDER_OUTPUT.strip()
-                print(f"node {{node_version}}: matches the known output: {{matches}}")
-            '''
+                print(f"node {node_version}: matches the known output: {matches}")
+            """
         ),
     ]
 
@@ -2291,8 +2347,9 @@ def _js_bridge_cells_part_2() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def stock_level(sku: str, seconds: float, fail: bool = False) -> int:
+                """Return a fake stock level after a delay, or raise LookupError."""
                 await asyncio.sleep(seconds)
                 if fail:
                     raise LookupError(f"no such sku: {sku}")
@@ -2304,7 +2361,7 @@ def _js_bridge_cells_part_2() -> list[NotebookNode]:
                 await asyncio.gather(stock_level("chai", 0.01), stock_level("unknown", 0.01, fail=True))
             except LookupError as error:
                 print(f"gather raised the first failure: {type(error).__name__}: {error}")
-            """
+            '''
         ),
         md(
             """
@@ -2525,6 +2582,7 @@ def _function_color_cells() -> list[NotebookNode]:
         code(
             '''
             async def get_stock(sku: str) -> int:
+                """Return a fixed stock level after one yield."""
                 await asyncio.sleep(0)
                 return 12
 
@@ -2577,10 +2635,12 @@ def _function_color_cells() -> list[NotebookNode]:
 
 
             async def price_directly(sku: str) -> int:
+                """Call the blocking lookup on the loop thread (blocks the loop)."""
                 return legacy_price_lookup(sku)  # blocks the loop
 
 
             async def price_in_thread(sku: str) -> int:
+                """Run the blocking lookup in a worker thread."""
                 return await asyncio.to_thread(legacy_price_lookup, sku)
 
 
@@ -2617,12 +2677,14 @@ def _predict_cells() -> list[NotebookNode]:
             the loop runs the queued task (`A`), then `main` resumes (`C`). In JS,
             calling `say("A")` would print `A` first.
             """,
-            """
+            '''
             async def say(word: str) -> None:
+                """Print the word."""
                 print(word)
 
 
             async def main() -> None:
+                """Schedule say('A'), print B, yield once, print C."""
                 asyncio.create_task(say("A"))
                 print("B")
                 await asyncio.sleep(0)
@@ -2630,7 +2692,7 @@ def _predict_cells() -> list[NotebookNode]:
 
 
             await main()
-            """,
+            ''',
         ),
         *predict_cells(
             """
@@ -2649,11 +2711,12 @@ def _predict_cells() -> list[NotebookNode]:
             `finished` is fast-first, but `gather` returns results in *argument* order,
             exactly like `Promise.all`.
             """,
-            """
+            '''
             finished_steps: list[str] = []
 
 
             async def step(name: str, seconds: float) -> str:
+                """Sleep, record the step as finished, return its name."""
                 await asyncio.sleep(seconds)
                 finished_steps.append(name)
                 return name
@@ -2661,7 +2724,7 @@ def _predict_cells() -> list[NotebookNode]:
 
             step_results = await asyncio.gather(step("slow", 0.02), step("fast", 0.01))
             print(finished_steps, step_results)
-            """,
+            ''',
         ),
         *predict_cells(
             """
@@ -2680,8 +2743,9 @@ def _predict_cells() -> list[NotebookNode]:
             restarted. (A JS Promise, by contrast, can be awaited any number of times;
             in Python, wrap the coroutine in a Task if several places need its result.)
             """,
-            """
+            '''
             async def compute() -> int:
+                """Return 42."""
                 return 42
 
 
@@ -2689,129 +2753,168 @@ def _predict_cells() -> list[NotebookNode]:
             print(type(single_use).__name__, inspect.getcoroutinestate(single_use))
             print(await single_use)
             print(raised_message(lambda: single_use.send(None)))
-            """,
+            ''',
         ),
     ]
 
 
-PUZZLE_SOURCES = [
-    """
-    async def puzzle_1(log: list[str]) -> None:
-        async def child() -> None:
-            log.append("child")
+PUZZLES_TEXT = [
+    (
+        "a task is created, then the parent appends and yields once",
+        """
+        async def puzzle_1(log: list[str]) -> None:
+            \"\"\"Puzzle 1: create_task, then append in the parent.\"\"\"
 
-        asyncio.create_task(child())
-        log.append("parent")
-        await asyncio.sleep(0)
-    """,
-    """
-    async def puzzle_2(log: list[str]) -> None:
-        async def child(name: str) -> None:
-            log.append(name)
+            async def child() -> None:
+                \"\"\"Append "child".\"\"\"
+                log.append("child")
 
-        background = asyncio.create_task(child("task"))
-        await child("direct")
-        log.append("after direct")
-        await background
-    """,
-    """
-    async def puzzle_3(log: list[str]) -> None:
-        loop = asyncio.get_running_loop()
-        loop.call_later(0, log.append, "later")
-        loop.call_soon(log.append, "soon")
-        log.append("now")
-        await asyncio.sleep(0.01)
-    """,
-    """
-    async def puzzle_4(log: list[str]) -> None:  # needs Python 3.14+ (eager_start)
-        async def child(name: str) -> None:
-            log.append(f"{name} start")
+            asyncio.create_task(child())
+            log.append("parent")
             await asyncio.sleep(0)
-            log.append(f"{name} end")
+        """,
+    ),
+    (
+        "a background task, and a coroutine awaited directly",
+        """
+        async def puzzle_2(log: list[str]) -> None:
+            \"\"\"Puzzle 2: a background task vs a coroutine awaited directly.\"\"\"
 
-        asyncio.create_task(child("lazy"))
-        asyncio.create_task(child("eager"), eager_start=True)
-        log.append("parent")
-        await asyncio.sleep(0.01)
-    """,
-    """
-    async def puzzle_5(log: list[str]) -> None:
-        async def child() -> int:
-            log.append("child")
-            return 1
+            async def child(name: str) -> None:
+                \"\"\"Append name.\"\"\"
+                log.append(name)
 
-        task = asyncio.create_task(child())
-        task.add_done_callback(lambda _: log.append("callback"))
-        await task
-        log.append("awaiter")
-    """,
-    """
-    async def puzzle_6(log: list[str]) -> None:
-        async def step(name: str, delay: float) -> str:
-            await asyncio.sleep(delay)
-            log.append(name)
-            return name
+            background = asyncio.create_task(child("task"))
+            await child("direct")
+            log.append("after direct")
+            await background
+        """,
+    ),
+    (
+        "`call_later(0)`, `call_soon` and a plain append",
+        """
+        async def puzzle_3(log: list[str]) -> None:
+            \"\"\"Puzzle 3: call_later(0) vs call_soon vs a plain append.\"\"\"
+            loop = asyncio.get_running_loop()
+            loop.call_later(0, log.append, "later")
+            loop.call_soon(log.append, "soon")
+            log.append("now")
+            await asyncio.sleep(0.01)
+        """,
+    ),
+    (
+        "a lazy task and an eager task (*New in 3.14*: `eager_start`)",
+        """
+        async def puzzle_4(log: list[str]) -> None:  # needs Python 3.14+ (eager_start)
+            \"\"\"Puzzle 4: a lazy task and an eager task.\"\"\"
 
-        results = await asyncio.gather(step("a", 0.02), step("b", 0), step("c", 0.01))
-        log.append("+".join(results))
-    """,
-    """
-    async def puzzle_7(log: list[str]) -> None:
-        async def child() -> None:
-            try:
-                log.append("child start")
-                await asyncio.sleep(1)
-            finally:
-                log.append("child finally")
+            async def child(name: str) -> None:
+                \"\"\"Append a start and an end entry around one yield.\"\"\"
+                log.append(f"{name} start")
+                await asyncio.sleep(0)
+                log.append(f"{name} end")
 
-        task = asyncio.create_task(child())
-        await asyncio.sleep(0)
-        task.cancel()
-        log.append("cancel requested")
-        try:
+            asyncio.create_task(child("lazy"))
+            asyncio.create_task(child("eager"), eager_start=True)
+            log.append("parent")
+            await asyncio.sleep(0.01)
+        """,
+    ),
+    (
+        "a done-callback and the coroutine awaiting the same task",
+        """
+        async def puzzle_5(log: list[str]) -> None:
+            \"\"\"Puzzle 5: a done-callback vs the awaiting coroutine.\"\"\"
+
+            async def child() -> int:
+                \"\"\"Append "child" and return 1.\"\"\"
+                log.append("child")
+                return 1
+
+            task = asyncio.create_task(child())
+            task.add_done_callback(lambda _: log.append("callback"))
             await task
-        except asyncio.CancelledError:
-            log.append("parent saw CancelledError")
-    """,
-    """
-    async def puzzle_8(log: list[str]) -> None:
-        loop = asyncio.get_running_loop()
-        signal = loop.create_future()
+            log.append("awaiter")
+        """,
+    ),
+    (
+        "`gather` over steps with different delays",
+        """
+        async def puzzle_6(log: list[str]) -> None:
+            \"\"\"Puzzle 6: gather over steps with different delays.\"\"\"
 
-        async def waiter(name: str) -> None:
-            await signal
-            log.append(name)
+            async def step(name: str, delay: float) -> str:
+                \"\"\"Sleep, append name, return name.\"\"\"
+                await asyncio.sleep(delay)
+                log.append(name)
+                return name
 
-        waiters = [asyncio.create_task(waiter(name)) for name in ("w1", "w2")]
-        await asyncio.sleep(0)
-        signal.add_done_callback(lambda _: log.append("callback"))
-        loop.call_soon(log.append, "call_soon")
-        signal.set_result(None)
-        log.append("set")
-        await asyncio.gather(*waiters)
-    """,
+            results = await asyncio.gather(step("a", 0.02), step("b", 0), step("c", 0.01))
+            log.append("+".join(results))
+        """,
+    ),
+    (
+        "cancelling a task that is sleeping",
+        """
+        async def puzzle_7(log: list[str]) -> None:
+            \"\"\"Puzzle 7: cancel a sleeping task, then await it.\"\"\"
+
+            async def child() -> None:
+                \"\"\"Sleep for a second, logging start and finally.\"\"\"
+                try:
+                    log.append("child start")
+                    await asyncio.sleep(1)
+                finally:
+                    log.append("child finally")
+
+            task = asyncio.create_task(child())
+            await asyncio.sleep(0)
+            task.cancel()
+            log.append("cancel requested")
+            try:
+                await task
+            except asyncio.CancelledError:
+                log.append("parent saw CancelledError")
+        """,
+    ),
+    (
+        "two waiters, a done-callback and `call_soon` around one Future",
+        """
+        async def puzzle_8(log: list[str]) -> None:
+            \"\"\"Puzzle 8: two waiters, a done-callback and call_soon on one Future.\"\"\"
+            loop = asyncio.get_running_loop()
+            signal = loop.create_future()
+
+            async def waiter(name: str) -> None:
+                \"\"\"Wait for the signal, then append name.\"\"\"
+                await signal
+                log.append(name)
+
+            waiters = [asyncio.create_task(waiter(name)) for name in ("w1", "w2")]
+            await asyncio.sleep(0)
+            signal.add_done_callback(lambda _: log.append("callback"))
+            loop.call_soon(log.append, "call_soon")
+            signal.set_result(None)
+            log.append("set")
+            await asyncio.gather(*waiters)
+        """,
+    ),
 ]
 
 
-def _puzzle_markdown() -> str:
-    """The eight puzzles as one markdown block."""
-    import textwrap
-
-    blocks = []
-    for number, source in enumerate(PUZZLE_SOURCES, start=1):
-        blocks.append(f"**Puzzle {number}**\n\n```python\n{textwrap.dedent(source).strip()}\n```")
-    return "\n\n".join(blocks)
-
-
-def _puzzle_code() -> str:
-    """The eight puzzles as runnable code plus the PUZZLES table."""
-    import textwrap
-
-    functions = "\n\n\n".join(textwrap.dedent(source).strip() for source in PUZZLE_SOURCES)
+def _puzzle_cells() -> list[NotebookNode]:
+    """One markdown + one code cell per puzzle, then the PUZZLES table."""
+    puzzle_cells: list[NotebookNode] = []
+    for number, (topic, source) in enumerate(PUZZLES_TEXT, start=1):
+        puzzle_cells += [md(f"**Puzzle {number}**: {topic}."), code(source)]
     table = "".join(
-        f"    {number}: puzzle_{number},\n" for number in range(1, len(PUZZLE_SOURCES) + 1)
+        f"    {number}: puzzle_{number},\n" for number in range(1, len(PUZZLES_TEXT) + 1)
     )
-    return f'{functions}\n\n\nPUZZLES = {{\n{table}}}\nprint(f"{{len(PUZZLES)}} puzzles loaded")'
+    puzzle_cells += [
+        md("The runner looks the puzzles up in this table:"),
+        code(f'PUZZLES = {{\n{table}}}\nprint(f"{{len(PUZZLES)}} puzzles loaded")'),
+    ]
+    return puzzle_cells
 
 
 LAB_SETUP_SOURCE = r'''
@@ -2897,12 +3000,14 @@ def _lab_cells_part_1() -> list[NotebookNode]:
 
 
             async def order_total(sku: str, quantity: int) -> int:
+                """Ask for the price and the GST rate, then compute the total."""
                 price = await Ask(f"price:{sku}")
                 gst_percent = await Ask("gst")
                 return price * quantity * (100 + gst_percent) // 100
 
 
             async def safe_price(sku: str) -> object:
+                """Ask for a price; turn a KeyError thrown in into 'unavailable'."""
                 try:
                     return await Ask(f"price:{sku}")
                 except KeyError:
@@ -2910,10 +3015,12 @@ def _lab_cells_part_1() -> list[NotebookNode]:
 
 
             async def strict_price(sku: str) -> object:
+                """Ask for a price and let a thrown KeyError escape."""
                 return await Ask(f"price:{sku}")  # lets a KeyError escape
 
 
             async def no_questions() -> str:
+                """Return at once without asking anything."""
                 return "instant"
             '''
         ),
@@ -2991,8 +3098,9 @@ def _lab_cells_part_1() -> list[NotebookNode]:
         ),
         md("Check exercise 2:"),
         code(
-            """
+            '''
             def gather_three(loop: ToyLoop) -> ToyCoroutine:
+                """Gather three sleeps of different lengths on the toy loop."""
                 specs = [("a", 0.2), ("b", 0.1), ("c", 0.15)]
                 return (
                     yield from toy_gather(loop, [toy_sleep_then(value, seconds) for value, seconds in specs])
@@ -3000,10 +3108,12 @@ def _lab_cells_part_1() -> list[NotebookNode]:
 
 
             def gather_mixed(loop: ToyLoop) -> ToyCoroutine:
+                """Gather a sleeping coroutine and an instant one."""
                 return (yield from toy_gather(loop, [toy_sleep_then("later", 0.05), toy_instant("now")]))
 
 
             def gather_nothing(loop: ToyLoop) -> ToyCoroutine:
+                """Gather an empty list."""
                 return (yield from toy_gather(loop, []))
 
 
@@ -3020,7 +3130,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     ("empty list", lambda: run_toy(gather_nothing)[0], []),
                 ]
             )
-            """
+            '''
         ),
         md(
             """
@@ -3033,22 +3143,24 @@ def _lab_cells_part_1() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             WIDGETS = ["sales", "stock", "orders", "returns", "reviews"]
 
 
             async def fetch_widget(name: str, seconds: float = 1.0) -> str:
+                """Pretend to load one dashboard widget."""
                 await asyncio.sleep(seconds)
                 return f"{name}: ok"
 
 
             async def load_dashboard_sequential() -> dict[str, str]:
+                """Load every widget one after another (the slow version)."""
                 return {name: await fetch_widget(name) for name in WIDGETS}
 
 
             with Timer("load_dashboard_sequential"):
                 print(await load_dashboard_sequential())
-            """
+            '''
         ),
         md("Your solution:"),
         code(
@@ -3095,11 +3207,12 @@ def _lab_cells_part_2() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             RACE_LOG: list[str] = []
 
 
             async def contender(name: str, seconds: float, fail: bool = False) -> str:
+                """Sleep, then return the name or raise; log a cancellation."""
                 try:
                     await asyncio.sleep(seconds)
                 except asyncio.CancelledError:
@@ -3108,7 +3221,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 if fail:
                     raise ConnectionError(f"{name} failed")
                 return name
-            """
+            '''
         ),
         md("Your solution:"),
         code(
@@ -3151,7 +3264,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
             """
         ),
         md(
-            f"""
+            """
             #### Exercise 5 — eight event-loop ordering puzzles
 
             Each puzzle appends strings to `log`. For each one, predict the final `log`
@@ -3160,11 +3273,10 @@ def _lab_cells_part_2() -> list[NotebookNode]:
             suspend never yields; due timers join the queue after the handles already in
             it; done-callbacks run in registration order). Then write your answers in
             `predictions()`. The runner awaits the puzzle, then gives stragglers 50 ms.
-
-            {_indented(_puzzle_markdown(), 12)}
+            Each puzzle has its own cell below; running a cell only defines the puzzle.
             """
         ),
-        code(_puzzle_code()),
+        *_puzzle_cells(),
         md("Your predictions:"),
         code(
             '''
@@ -3204,7 +3316,41 @@ def _lab_cells_part_2() -> list[NotebookNode]:
             in 5.3.2). A member that has gone away must not crash the others: catch
             `ConnectionError` while sending. `chat_scenario` starts the server on a free
             port, connects asha, ben and chen, has them talk, and collects what each one
-            received.
+            received. The given code comes first: two client-side helpers, then the
+            scenario itself.
+            """
+        ),
+        code(
+            '''
+            type ChatClients = dict[str, tuple[asyncio.StreamReader, asyncio.StreamWriter]]
+
+
+            async def send_line(clients: ChatClients, nick: str, line: str) -> None:
+                """Send one line as nick, then give the server 50 ms to deliver it."""
+                clients[nick][1].write(f"{line}\\n".encode())
+                with contextlib.suppress(ConnectionError):  # the server may have dropped us
+                    await clients[nick][1].drain()
+                await asyncio.sleep(0.05)  # let the server deliver before the next step
+
+
+            async def lines_received(clients: ChatClients, nick: str) -> list[str]:
+                """Every line nick has received, read until 100 ms of silence or EOF."""
+                lines = []
+                while True:
+                    try:
+                        line = await asyncio.wait_for(clients[nick][0].readline(), 0.1)
+                    except TimeoutError:
+                        return lines
+                    if not line:
+                        return lines
+                    lines.append(line.decode().rstrip("\\n"))
+            '''
+        ),
+        md(
+            """
+            `chat_scenario` starts the server, connects the three clients (each sends its
+            nickname first), has asha and ben talk, disconnects chen, and returns what each
+            client received plus any exception your `handle` raised:
             """
         ),
         code(
@@ -3214,41 +3360,25 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 room, errors, clients = room_factory(), [], {}
 
                 async def guarded(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                    """Run room.handle, recording its exception instead of logging it."""
                     try:
                         await room.handle(reader, writer)
                     except Exception as error:  # keep failures out of the kernel log
                         errors.append(type(error).__name__)
                         writer.close()
 
-                async def send(nick: str, line: str) -> None:
-                    clients[nick][1].write(f"{line}\\n".encode())
-                    with contextlib.suppress(ConnectionError):  # the server may have dropped us
-                        await clients[nick][1].drain()
-                    await asyncio.sleep(0.05)  # let the server deliver before the next step
-
-                async def received(nick: str) -> list[str]:
-                    lines = []
-                    while True:
-                        try:
-                            line = await asyncio.wait_for(clients[nick][0].readline(), 0.1)
-                        except TimeoutError:
-                            return lines
-                        if not line:
-                            return lines
-                        lines.append(line.decode().rstrip("\\n"))
-
                 server = await asyncio.start_server(guarded, "127.0.0.1", 0)
                 port = server.sockets[0].getsockname()[1]
                 try:
                     for nick in ("asha", "ben", "chen"):
                         clients[nick] = await asyncio.open_connection("127.0.0.1", port)
-                        await send(nick, nick)
-                    await send("asha", "hello")
-                    await send("ben", "hi asha")
-                    transcripts = {"chen": await received("chen")}
+                        await send_line(clients, nick, nick)
+                    await send_line(clients, "asha", "hello")
+                    await send_line(clients, "ben", "hi asha")
+                    transcripts = {"chen": await lines_received(clients, "chen")}
                     clients["chen"][1].close()
                     await asyncio.sleep(0.05)
-                    transcripts |= {nick: await received(nick) for nick in ("asha", "ben")}
+                    transcripts |= {nick: await lines_received(clients, nick) for nick in ("asha", "ben")}
                     errors_seen = list(errors)
                 finally:
                     for _, writer in clients.values():
@@ -3266,6 +3396,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 """A chat room served with asyncio streams (protocol in the exercise text)."""
 
                 def __init__(self) -> None:
+                    """Start with no members."""
                     self.members: dict[asyncio.StreamWriter, str] = {}
 
                 async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

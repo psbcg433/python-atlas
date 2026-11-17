@@ -99,15 +99,18 @@ class Timer:
     """Timing context manager (shared since Unit 1.14): reports on exit, keeps elapsed_seconds."""
 
     def __init__(self, label: str, report: Callable[[str], None] | None = print) -> None:
+        """Remember the label and where to report the elapsed time."""
         self.label = label
         self.report = report
         self.elapsed_seconds = 0.0
 
     def __enter__(self) -> Timer:
+        """Start the clock."""
         self._start = time.perf_counter()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        """Stop the clock and report the elapsed milliseconds."""
         self.elapsed_seconds = time.perf_counter() - self._start
         if self.report is not None:
             self.report(f"{self.label} took {self.elapsed_seconds * 1000:.2f} ms")
@@ -380,8 +383,9 @@ def _structured_concurrency_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def quote(supplier: str, seconds: float) -> str:
+                """Return a supplier quote after a delay."""
                 await asyncio.sleep(seconds)
                 return f"{supplier}: Rs {round(seconds * 1000)}"
 
@@ -398,7 +402,7 @@ def _structured_concurrency_cells() -> list[NotebookNode]:
                     print(f"async for: task for {supplier_tasks[finished_task]} -> {finished_task.result()}")
             else:
                 print("async iteration over as_completed needs Python 3.13+: skipped")
-            """
+            '''
         ),
         md(
             """
@@ -408,11 +412,12 @@ def _structured_concurrency_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             found_suppliers: list[str] = []
 
 
             async def search_supplier(group: asyncio.TaskGroup, supplier: str, seconds: float) -> None:
+                """Record the supplier after a delay, then cancel the whole group."""
                 await asyncio.sleep(seconds)
                 found_suppliers.append(supplier)
                 group.cancel()  # enough: stop the whole search
@@ -426,7 +431,7 @@ def _structured_concurrency_cells() -> list[NotebookNode]:
                 print(f"block exited normally; found {found_suppliers}")
             else:
                 print("TaskGroup.cancel() needs Python 3.15+: skipped")
-            """
+            '''
         ),
         md(
             """
@@ -502,11 +507,12 @@ def _timeout_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             print(f"{asyncio.CancelledError.__mro__[1].__name__=}")
 
 
             async def careful_worker() -> None:
+                """Sleep a second, showing that except Exception misses a cancel."""
                 try:
                     await asyncio.sleep(1)
                 except Exception:
@@ -523,7 +529,7 @@ def _timeout_cells() -> list[NotebookNode]:
             except asyncio.CancelledError as error:
                 print(f"CancelledError: {error}; {worker_task.cancelled()=}")
             print(f"cancel a finished task: {worker_task.cancel()=}")
-            """
+            '''
         ),
         md(
             """
@@ -534,8 +540,9 @@ def _timeout_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def stubborn_worker() -> str:
+                """Swallow the cancellation (the bug this demo shows)."""
                 try:
                     await asyncio.sleep(1)
                 except asyncio.CancelledError:
@@ -547,7 +554,7 @@ def _timeout_cells() -> list[NotebookNode]:
             await asyncio.sleep(0)
             stubborn_task.cancel()
             print(f"{await stubborn_task=}  {stubborn_task.cancelled()=}  {stubborn_task.cancelling()=}")
-            """
+            '''
         ),
         md(
             """
@@ -556,11 +563,12 @@ def _timeout_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             cleanup_log: list[str] = []
 
 
             async def upload_report() -> None:
+                """Upload, rolling back and re-raising if cancelled."""
                 try:
                     cleanup_log.append("upload: started")
                     await asyncio.sleep(1)
@@ -577,7 +585,7 @@ def _timeout_cells() -> list[NotebookNode]:
             upload_task.cancel()
             await asyncio.gather(upload_task, return_exceptions=True)
             print(cleanup_log)
-            """
+            '''
         ),
         md(
             """
@@ -588,17 +596,19 @@ def _timeout_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             payment_log: list[str] = []
 
 
             async def charge_card() -> str:
+                """Commit a card charge after 50 ms."""
                 await asyncio.sleep(0.05)
                 payment_log.append("charge: committed")
                 return "TXN-81"
 
 
             async def checkout() -> str:
+                """Charge under a short timeout, shielding the charge itself."""
                 charge_task = asyncio.create_task(charge_card())
                 try:
                     async with asyncio.timeout(0.01):
@@ -610,7 +620,7 @@ def _timeout_cells() -> list[NotebookNode]:
 
             print(f"{await checkout()=}")
             print(payment_log)
-            """
+            '''
         ),
     ]
 
@@ -637,12 +647,13 @@ def _coordination_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             store_open = asyncio.Event()
             arrivals: list[str] = []
 
 
             async def customer(name: str) -> None:
+                """Wait for the store to open, then arrive."""
                 await store_open.wait()
                 arrivals.append(name)
 
@@ -653,7 +664,7 @@ def _coordination_cells() -> list[NotebookNode]:
             store_open.set()
             await asyncio.gather(*customers)
             print(f"after set():  {arrivals}")
-            """
+            '''
         ),
         md(
             """
@@ -664,14 +675,20 @@ def _coordination_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             class Wallet:
+                """A balance that coroutines update."""
+
                 def __init__(self) -> None:
+                    """Start with a zero balance."""
                     self.balance = 0
 
 
             async def deposit(wallet: Wallet, amount: int, lock: asyncio.Lock | None = None) -> None:
+                """Add amount with a read, a yield and a write, optionally under lock."""
+
                 async def read_then_write() -> None:
+                    """Read the balance, yield, then write the new balance."""
                     current = wallet.balance
                     await asyncio.sleep(0)  # e.g. a database round trip
                     wallet.balance = current + amount
@@ -687,7 +704,7 @@ def _coordination_cells() -> list[NotebookNode]:
                 wallet = Wallet()
                 await asyncio.gather(*(deposit(wallet, 10, lock) for _ in range(100)))
                 print(f"{label:<9}: balance {wallet.balance} (expected 1000)")
-            """
+            '''
         ),
         md(
             """
@@ -696,13 +713,14 @@ def _coordination_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             stock = {"chai": 0}
             stock_changed = asyncio.Condition()
             served: list[str] = []
 
 
             async def buyer(name: str, quantity: int) -> None:
+                """Wait until enough chai is in stock, then take it."""
                 async with stock_changed:
                     await stock_changed.wait_for(lambda: stock["chai"] >= quantity)
                     stock["chai"] -= quantity
@@ -710,6 +728,7 @@ def _coordination_cells() -> list[NotebookNode]:
 
 
             async def restock(amount: int) -> None:
+                """Add stock and wake every waiting buyer."""
                 async with stock_changed:
                     stock["chai"] += amount
                     stock_changed.notify_all()
@@ -723,7 +742,7 @@ def _coordination_cells() -> list[NotebookNode]:
                 print(f"after restocking {amount}: served={served} left={stock['chai']}")
             await asyncio.wait(buyers)
             print(f"all buyers done: {all(buyer_task.done() for buyer_task in buyers)}")
-            """
+            '''
         ),
         md(
             """
@@ -732,12 +751,13 @@ def _coordination_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             gateway_slots = asyncio.Semaphore(3)
             gateway_load = {"now": 0, "peak": 0}
 
 
             async def call_gateway(payment_id: int) -> int:
+                """Call the gateway inside the semaphore, tracking the peak load."""
                 async with gateway_slots:
                     gateway_load["now"] += 1
                     gateway_load["peak"] = max(gateway_load["peak"], gateway_load["now"])
@@ -750,7 +770,7 @@ def _coordination_cells() -> list[NotebookNode]:
                 await asyncio.gather(*(call_gateway(payment_id) for payment_id in range(10)))
             print(f"peak concurrent calls: {gateway_load['peak']}")
             print(f"extra release on BoundedSemaphore -> {raised_message(asyncio.BoundedSemaphore(1).release)}")
-            """
+            '''
         ),
         md(
             """
@@ -759,12 +779,13 @@ def _coordination_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             all_ready = asyncio.Barrier(3)
             rider_log: list[str] = []
 
 
             async def rider(name: str, preparation_seconds: float) -> None:
+                """Prepare, wait at the barrier for all riders, then leave."""
                 await asyncio.sleep(preparation_seconds)
                 rider_log.append(f"{name} ready")
                 arrival_index = await all_ready.wait()
@@ -774,7 +795,7 @@ def _coordination_cells() -> list[NotebookNode]:
             await asyncio.gather(rider("asha", 0.03), rider("ben", 0.01), rider("chen", 0.02))
             print("\\n".join(rider_log))
             print(f"{all_ready.parties=} {all_ready.n_waiting=} {all_ready.broken=}")
-            """
+            '''
         ),
     ]
 
@@ -852,18 +873,20 @@ def _queue_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             bounded_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=2)
             flow_log: list[str] = []
 
 
             async def fast_producer() -> None:
+                """Put five items, blocking whenever the bounded queue is full."""
                 for item in range(5):
                     await bounded_queue.put(item)
                     flow_log.append(f"put {item} (queue size {bounded_queue.qsize()})")
 
 
             async def slow_consumer() -> None:
+                """Take five items slowly."""
                 for _ in range(5):
                     await asyncio.sleep(0.02)
                     flow_log.append(f"        got {await bounded_queue.get()}")
@@ -871,7 +894,7 @@ def _queue_cells() -> list[NotebookNode]:
 
             await asyncio.gather(fast_producer(), slow_consumer())
             print("\\n".join(flow_log))
-            """
+            '''
         ),
         md(
             """
@@ -883,8 +906,9 @@ def _queue_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def shutdown_aware_worker(name: str, jobs: asyncio.Queue[str], report: list[str]) -> None:
+                """Process jobs until the queue is shut down."""
                 while True:
                     try:
                         job = await jobs.get()
@@ -914,7 +938,7 @@ def _queue_cells() -> list[NotebookNode]:
                 print(f"immediate: {dropped.qsize()=}, get -> {raised_error_name(dropped.get_nowait)}")
             else:
                 print("Queue.shutdown() needs Python 3.13+: skipped")
-            """
+            '''
         ),
         md(
             """
@@ -926,17 +950,19 @@ def _queue_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             SALES_LINES = ["chai,2", "vada,1", "chai,3", "idli,4", "vada,2", "chai,1"]
 
 
             async def read_stage(lines: list[str], outbox: asyncio.Queue[str]) -> None:
+                """Feed every line downstream, then shut the queue down."""
                 for line in lines:
                     await outbox.put(line)
                 outbox.shutdown()
 
 
             async def parse_stage(inbox: asyncio.Queue[str], outbox: asyncio.Queue[tuple[str, int]]) -> None:
+                """Parse sku,quantity lines until upstream shuts down."""
                 try:
                     while True:
                         sku, quantity = (await inbox.get()).split(",")
@@ -946,6 +972,7 @@ def _queue_cells() -> list[NotebookNode]:
 
 
             async def total_stage(inbox: asyncio.Queue[tuple[str, int]]) -> Counter[str]:
+                """Sum quantities per SKU until upstream shuts down."""
                 totals: Counter[str] = Counter()
                 try:
                     while True:
@@ -963,7 +990,7 @@ def _queue_cells() -> list[NotebookNode]:
                 total_stage(parsed_queue),
             )
             print(dict(sales_totals))
-            """
+            '''
         ),
     ]
 
@@ -997,9 +1024,11 @@ def _async_protocol_cells() -> list[NotebookNode]:
                 """An async context manager: connect on entry, disconnect on exit."""
 
                 def __init__(self, log: list[str]) -> None:
+                    """Remember the log to write to."""
                     self.log = log
 
                 async def __aenter__(self) -> FakeDatabase:
+                    """Connect after a simulated handshake."""
                     await asyncio.sleep(0)  # the network handshake
                     self.log.append("connect")
                     return self
@@ -1007,11 +1036,13 @@ def _async_protocol_cells() -> list[NotebookNode]:
                 async def __aexit__(
                     self, error_type: type[BaseException] | None, error: object, traceback: object
                 ) -> bool:
+                    """Disconnect after a simulated round trip; never swallow errors."""
                     await asyncio.sleep(0)
                     self.log.append(f"disconnect (error: {error_type.__name__ if error_type else None})")
                     return False  # do not swallow exceptions
 
                 async def count_orders(self) -> int:
+                    """Run a fake query."""
                     self.log.append("query")
                     return 3
 
@@ -1030,9 +1061,10 @@ def _async_protocol_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             @contextlib.asynccontextmanager
             async def transaction(log: list[str]) -> AsyncIterator[str]:
+                """Yield a transaction id, committing or rolling back afterwards."""
                 await asyncio.sleep(0)
                 log.append("BEGIN")
                 try:
@@ -1053,7 +1085,7 @@ def _async_protocol_cells() -> list[NotebookNode]:
             except ValueError as error:
                 transaction_log.append(f"caught {error!r}")
             print(transaction_log)
-            """
+            '''
         ),
         md(
             """
@@ -1068,12 +1100,15 @@ def _async_protocol_cells() -> list[NotebookNode]:
                 """Async iterator over order ids, fetching each one with an await."""
 
                 def __init__(self, order_ids: Iterable[str]) -> None:
+                    """Remember the order ids to stream."""
                     self._order_ids = iter(order_ids)
 
                 def __aiter__(self) -> OrderFeed:
+                    """Return self: this object is its own async iterator."""
                     return self
 
                 async def __anext__(self) -> str:
+                    """Return the next order id after a simulated fetch."""
                     try:
                         order_id = next(self._order_ids)
                     except StopIteration:
@@ -1118,11 +1153,12 @@ def _async_protocol_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             closing_log: list[str] = []
 
 
             async def stream_rows() -> AsyncIterator[int]:
+                """Yield rows, reporting in finally when the stream is closed."""
                 try:
                     for row in range(1000):
                         await asyncio.sleep(0)
@@ -1142,7 +1178,7 @@ def _async_protocol_cells() -> list[NotebookNode]:
                         break
             closing_log.append("aclosing: block exited")
             print("\\n".join(closing_log))
-            """
+            '''
         ),
     ]
 
@@ -1210,15 +1246,18 @@ def _blocking_cells() -> list[NotebookNode]:
 
 
             def render_invoice_pdf() -> str:
+                """A blocking library call that takes 200 ms."""
                 time.sleep(0.2)  # a blocking library call
                 return "invoice.pdf"
 
 
             async def invoice_handler_blocking() -> str:
+                """Call the blocking renderer on the loop thread."""
                 return render_invoice_pdf()
 
 
             async def invoice_handler_threaded() -> str:
+                """Run the blocking renderer in a worker thread."""
                 return await asyncio.to_thread(render_invoice_pdf)
 
 
@@ -1278,10 +1317,12 @@ def _blocking_cells() -> list[NotebookNode]:
                 """A logging handler that keeps formatted messages in a list."""
 
                 def __init__(self, messages: list[str]) -> None:
+                    """Collect log messages in a list."""
                     super().__init__()
                     self.messages = messages
 
                 def emit(self, record: logging.LogRecord) -> None:
+                    """Append the formatted message."""
                     self.messages.append(record.getMessage())
 
 
@@ -1347,16 +1388,18 @@ def _blocking_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async_workers = fresh_import("p5_async_workers")
             prime_limit = 120_000 * DEMO_SCALE
 
 
             async def primes_directly() -> int:
+                """Count primes on the loop thread."""
                 return async_workers.count_primes(prime_limit)
 
 
             async def primes_in_thread() -> int:
+                """Count primes in a worker thread (still holds the GIL)."""
                 return await asyncio.to_thread(async_workers.count_primes, prime_limit)
 
 
@@ -1366,6 +1409,7 @@ def _blocking_cells() -> list[NotebookNode]:
                 )  # warm up the worker
 
                 async def primes_in_process() -> int:
+                    """Count primes in a worker process."""
                     return await KERNEL_LOOP.run_in_executor(
                         process_pool, async_workers.count_primes, prime_limit
                     )
@@ -1375,7 +1419,7 @@ def _blocking_cells() -> list[NotebookNode]:
                         lag = await worst_lag_during(strategy)
                     seconds_taken = strategy_timer.elapsed_seconds
                     print(f"{strategy.__name__:<18} took {seconds_taken:.2f} s, worst lag {lag * 1000:6.0f} ms")
-            """
+            '''
         ),
         md(
             """
@@ -1407,8 +1451,9 @@ def _blocking_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def run_python(snippet: str) -> str:
+                """Run a Python snippet as an async subprocess; return its output."""
                 process = await asyncio.create_subprocess_exec(
                     sys.executable, "-c", snippet, stdout=asyncio.subprocess.PIPE, env=CHILD_ENV
                 )
@@ -1418,10 +1463,13 @@ def _blocking_cells() -> list[NotebookNode]:
 
             with Timer("three child interpreters started concurrently"):
                 outputs = await asyncio.gather(
-                    *(run_python(f"import time; time.sleep(0.2); print({n} * {n})") for n in (2, 3, 4))
+                    *(
+                        run_python(f"import time; time.sleep(0.2); print({number} * {number})")
+                        for number in (2, 3, 4)
+                    )
                 )
             print(outputs)
-            """
+            '''
         ),
     ]
 
@@ -1475,17 +1523,19 @@ def _contextvar_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             request_id = contextvars.ContextVar("request_id", default="-")
             context_log: list[str] = []
 
 
             async def child_step() -> None:
+                """Read and change the request id inside a child task."""
                 context_log.append(f"  child task sees {request_id.get()}")
                 request_id.set("changed-by-child")
 
 
             async def handle(new_request_id: str) -> None:
+                """Set a request id, run a child task, then read it again."""
                 request_id.set(new_request_id)
                 await asyncio.create_task(child_step())
                 await asyncio.sleep(0.01)  # let the other request run in between
@@ -1495,7 +1545,7 @@ def _contextvar_cells() -> list[NotebookNode]:
             await asyncio.gather(handle("req-1"), handle("req-2"))
             print("\\n".join(context_log))
             print(f"the cell's own context: {request_id.get()}")
-            """
+            '''
         ),
         md(
             """
@@ -1511,6 +1561,7 @@ def _contextvar_cells() -> list[NotebookNode]:
                 """Attach the current request id to every log record."""
 
                 def filter(self, record: logging.LogRecord) -> bool:
+                    """Copy the current request id onto the log record."""
                     record.request_id = request_id.get()
                     return True
 
@@ -1526,6 +1577,7 @@ def _contextvar_cells() -> list[NotebookNode]:
 
 
             async def handle_order(new_request_id: str, sku: str) -> None:
+                """Log two lines with a request id set for this request only."""
                 token = request_id.set(new_request_id)
                 try:
                     shop_logger.info("checking stock for %s", sku)
@@ -1634,8 +1686,9 @@ def _http_client_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def rates_with_new_client() -> int:
+                """Fetch /rates with a client created just for this call."""
                 async with httpx.AsyncClient(base_url=SHOP_API) as throwaway_client:
                     return (await throwaway_client.get("/rates")).status_code
 
@@ -1655,7 +1708,7 @@ def _http_client_cells() -> list[NotebookNode]:
             )
             print(f"new client per request: {per_request_ms:6.1f} ms, {per_request_connections} connections")
             print(f"one shared client:      {shared_ms:6.1f} ms, {shared_connections} connections")
-            """
+            '''
         ),
         md(
             """
@@ -1769,12 +1822,14 @@ def _rate_limit_cells() -> list[NotebookNode]:
                 """Allow `rate` acquisitions per second on average, bursts up to `capacity`."""
 
                 def __init__(self, rate: float, capacity: int) -> None:
+                    """Start full: capacity tokens, refilled at rate per second."""
                     self.rate, self.capacity = rate, capacity
                     self.tokens = float(capacity)
                     self.updated = KERNEL_LOOP.time()
                     self.lock = asyncio.Lock()
 
                 async def acquire(self) -> None:
+                    """Wait until a token is available, then take it."""
                     async with self.lock:
                         while True:
                             now = KERNEL_LOOP.time()
@@ -1793,13 +1848,14 @@ def _rate_limit_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             bucket = AsyncTokenBucket(rate=50, capacity=5)
             bucket_start = KERNEL_LOOP.time()
             start_times_ms: list[int] = []
 
 
             async def rate_limited_get(client: httpx.AsyncClient) -> int:
+                """Take a token, record the start time, fetch /rates."""
                 await bucket.acquire()
                 start_times_ms.append(round((KERNEL_LOOP.time() - bucket_start) * 1000))
                 return (await client.get("/rates")).status_code
@@ -1811,7 +1867,7 @@ def _rate_limit_cells() -> list[NotebookNode]:
             print(f"start times (ms): {start_times_ms}")
             average_gap = sum(gaps_after_burst) / len(gaps_after_burst)
             print(f"{len(statuses)} requests; after the burst, one every {average_gap:.1f} ms (limit 20 ms)")
-            """
+            '''
         ),
         md(
             """
@@ -1967,7 +2023,9 @@ async def many_tasks():
     started = time.perf_counter()
     await asyncio.gather(*(asyncio.sleep(0) for _ in range(TASKS)))
     return time.perf_counter() - started
+"""
 
+UVLOOP_RUNNER = """
 
 def bench(loop_factory):
     with asyncio.Runner(loop_factory=loop_factory) as runner:
@@ -2014,8 +2072,9 @@ async def fetch_rate(client: httpx.AsyncClient, currency: str) -> float:
 
 def rates_ok(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"rates": {"USD": 0.01}})
+'''
 
-
+ASYNC_TEST_CASES = """
 async def test_fetch_rate_with_mock_transport() -> None:
     transport = httpx.MockTransport(rates_ok)
     async with httpx.AsyncClient(transport=transport, base_url="https://shop.test") as client:
@@ -2040,7 +2099,7 @@ async def test_slow_call_times_out() -> None:
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(0.01):
             await asyncio.sleep(1)
-'''
+"""
 
 PYTEST_ASYNCIO_TEST_FILE = '''
 """The same idea with pytest-asyncio's marker."""
@@ -2073,15 +2132,22 @@ def _testing_cells() -> list[NotebookNode]:
 
             The benchmark runs in a child process: TCP echo round trips over loopback and
             many short tasks, on each loop. Timings vary; read the ratio. First the
-            script:
+            script's workloads:
             """
         ),
-        code(f'UVLOOP_BENCHMARK_SOURCE = r"""\n{UVLOOP_BENCHMARK.strip()}\n"""'),
-        md("Run it (or skip it where uvloop is unavailable):"),
+        code(f'UVLOOP_WORKLOADS_SOURCE = r"""\n{UVLOOP_BENCHMARK.strip()}\n"""'),
+        md(
+            """
+            The second half of the script runs both workloads on each loop with
+            `asyncio.Runner(loop_factory=...)` and prints the times and the ratio:
+            """
+        ),
+        code(f'UVLOOP_RUNNER_SOURCE = r"""\n{UVLOOP_RUNNER.strip()}\n"""'),
+        md("Run the two halves as one script (or skip it where uvloop is unavailable):"),
         code(
             """
             if HAS_UVLOOP:
-                print(run_child(UVLOOP_BENCHMARK_SOURCE))
+                print(run_child(UVLOOP_WORKLOADS_SOURCE + "\\n\\n" + UVLOOP_RUNNER_SOURCE))
             else:
                 reason = (
                     "not supported on Windows" if sys.platform == "win32" else "not installed (uv add uvloop)"
@@ -2097,8 +2163,9 @@ def _testing_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             async def checkout_with(gateway: Any, amount: int) -> str:
+                """Charge the gateway and return the status it reports."""
                 result = await gateway.charge(amount=amount, currency="INR")
                 return result["status"]
 
@@ -2115,7 +2182,7 @@ def _testing_cells() -> list[NotebookNode]:
                 await checkout_with(payment_gateway, 99)
             except ConnectionError as error:
                 print(f"side_effect raised {type(error).__name__}: {error}")
-            """
+            '''
         ),
         md(
             """
@@ -2126,11 +2193,12 @@ def _testing_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             seen_paths: list[str] = []
 
 
             async def fake_shop(request: httpx.Request) -> httpx.Response:
+                """A mock shop: /rates answers, every other path is a 404."""
                 seen_paths.append(request.url.path)
                 if request.url.path == "/rates":
                     return httpx.Response(200, json={"rates": {"USD": 0.012}})
@@ -2144,7 +2212,7 @@ def _testing_cells() -> list[NotebookNode]:
                     mocked_client.get("/rates"), mocked_client.get("/nope")
                 )
             print(f"{rates_reply.json()=} {missing_reply.status_code=} {seen_paths=}")
-            """
+            '''
         ),
         md(
             """
@@ -2157,10 +2225,18 @@ def _testing_cells() -> list[NotebookNode]:
             | pytest-asyncio | `@pytest.mark.asyncio` (or `asyncio_mode = "auto"`) | asyncio only; not a course dependency |
 
             The test module below uses anyio's plugin, `AsyncMock`, `MockTransport` and a
-            timeout:
+            timeout. First its header: imports, the anyio marker and backend fixture, and
+            the code under test:
             """
         ),
-        code(f"ASYNC_TEST_SOURCE = r'''\n{ASYNC_TEST_FILE.strip()}\n'''"),
+        code(f"ASYNC_TEST_HEADER = r'''\n{ASYNC_TEST_FILE.strip()}\n'''"),
+        md(
+            """
+            The four tests: a `MockTransport` success, a 503 that must raise, an
+            `AsyncMock` awaited exactly once, and a timeout:
+            """
+        ),
+        code(f'ASYNC_TEST_CASES = r"""\n{ASYNC_TEST_CASES.strip()}\n"""'),
         md(
             """
             The next cell writes it to a scratch folder with its own `pytest.ini` (so the
@@ -2173,7 +2249,7 @@ def _testing_cells() -> list[NotebookNode]:
             async_test_dir.mkdir(exist_ok=True)
             pytest_ini = "[pytest]\\naddopts = -p no:cacheprovider\\n"
             (async_test_dir / "pytest.ini").write_text(pytest_ini, encoding="utf-8")
-            test_module = textwrap.dedent(ASYNC_TEST_SOURCE).lstrip()
+            test_module = textwrap.dedent(ASYNC_TEST_HEADER + "\\n\\n" + ASYNC_TEST_CASES).lstrip()
             (async_test_dir / "test_async_shop.py").write_text(test_module, encoding="utf-8")
             pytest_run = subprocess.run(
                 [sys.executable, "-m", "pytest", "-v", "--no-header", "test_async_shop.py"],
@@ -2230,6 +2306,7 @@ def _interop_cells() -> list[NotebookNode]:
         code(
             '''
             async def reserve_stock(sku: str) -> str:
+                """Reserve stock on the loop thread after a short wait."""
                 await asyncio.sleep(0.01)
                 return f"{sku} reserved on {threading.current_thread().name}"
 
@@ -2256,11 +2333,12 @@ def _interop_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             readings: asyncio.Queue[float] = asyncio.Queue()
 
 
             def sensor_thread(loop: asyncio.AbstractEventLoop) -> None:
+                """Post readings into the loop from a plain thread, then shut down."""
                 for temperature in (21.5, 22.0, 22.4):
                     time.sleep(0.01)
                     loop.call_soon_threadsafe(readings.put_nowait, temperature)
@@ -2274,7 +2352,7 @@ def _interop_cells() -> list[NotebookNode]:
                     received_readings.append(await readings.get())
             except asyncio.QueueShutDown:
                 print(f"readings from the thread: {received_readings}")
-            """
+            '''
         ),
         md(
             """
@@ -2287,13 +2365,14 @@ def _interop_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             if HAS_ANYIO:
                 import anyio
 
                 anyio_log: list[str] = []
 
                 async def anyio_job(name: str, seconds: float) -> None:
+                    """Sleep, then log the name."""
                     await anyio.sleep(seconds)
                     anyio_log.append(name)
 
@@ -2306,7 +2385,7 @@ def _interop_cells() -> list[NotebookNode]:
                 print(f"anyio.to_thread.run_sync: {await anyio.to_thread.run_sync(sum, [1, 2, 3])}")
             else:
                 print("anyio is not installed: skipping")
-            """
+            '''
         ),
         md(
             """
@@ -2375,8 +2454,9 @@ def _predict_cells() -> list[NotebookNode]:
             (since Python 3.8), so `except Exception` does not catch it; `finally` runs,
             the error propagates out of the task, and awaiting the task re-raises it.
             """,
-            """
+            '''
             async def worker() -> None:
+                """Sleep a second; the except Exception clause will not see a cancel."""
                 try:
                     await asyncio.sleep(1)
                 except Exception:
@@ -2392,7 +2472,7 @@ def _predict_cells() -> list[NotebookNode]:
                 await predict_task
             except asyncio.CancelledError:
                 print("cancelled")
-            """,
+            ''',
         ),
         *predict_cells(
             """
@@ -2419,8 +2499,9 @@ def _predict_cells() -> list[NotebookNode]:
             cancels `steady`, waits for it, and raises an `ExceptionGroup` containing the
             one `KeyError`. `except*` binds the matching *group*, not the bare `KeyError`.
             """,
-            """
+            '''
             async def steady() -> None:
+                """Sleep until cancelled, report it, re-raise."""
                 try:
                     await asyncio.sleep(1)
                 except asyncio.CancelledError:
@@ -2429,6 +2510,7 @@ def _predict_cells() -> list[NotebookNode]:
 
 
             async def broken() -> None:
+                """Fail with a KeyError after 10 ms."""
                 await asyncio.sleep(0.01)
                 raise KeyError("sku-404")
 
@@ -2439,7 +2521,7 @@ def _predict_cells() -> list[NotebookNode]:
                     group.create_task(broken())
             except* KeyError as errors:
                 print(type(errors).__name__, len(errors.exceptions))
-            """,
+            ''',
         ),
         *predict_cells(
             """
@@ -2463,15 +2545,17 @@ def _predict_cells() -> list[NotebookNode]:
             `set()` is visible to `main`. (`main` itself runs as a task so that the
             kernel's context stays untouched.)
             """,
-            """
+            '''
             colour = contextvars.ContextVar("colour", default="outer")
 
 
             async def paint() -> None:
+                """Set the context variable in the current context."""
                 colour.set("painted")
 
 
             async def main() -> None:
+                """Paint inside a task (a copied context), then in this coroutine."""
                 await asyncio.create_task(paint())
                 print(colour.get())
                 await paint()
@@ -2479,7 +2563,7 @@ def _predict_cells() -> list[NotebookNode]:
 
 
             await asyncio.create_task(main())
-            """,
+            ''',
         ),
     ]
 
@@ -2505,17 +2589,29 @@ def quiet_unawaited() -> Generator[None]:
         gc.collect()
 
 
+def scenario_field(result: object, key: str) -> object:
+    """result[key] if result is a dict (a finished scenario), else result itself (an error)."""
+    return result[key] if isinstance(result, dict) else result
+
+
+print("Lab 5.4 helpers ready: outcome, quiet_unawaited, scenario_field")
+'''
+
+LAB_HTTP_SETUP_SOURCE = r'''
 class InFlightTracker:
     """Counts concurrent requests inside a mock transport handler."""
 
     def __init__(self) -> None:
+        """Start with all counters at zero."""
         self.reset()
 
     def reset(self) -> None:
+        """Zero the current and peak counts and the per-key calls."""
         self.now, self.peak, self.calls = 0, 0, Counter()
 
     @contextlib.contextmanager
     def track(self, key: object) -> Generator[None]:
+        """Count one request in flight for the duration of the with block."""
         self.now += 1
         self.peak = max(self.peak, self.now)
         self.calls[key] += 1
@@ -2525,6 +2621,10 @@ class InFlightTracker:
             self.now -= 1
 
 
+print("Lab 5.4 helper ready: InFlightTracker")
+'''
+
+LAB_CLIENT_SETUP_SOURCE = r'''
 def mock_client(handler: Callable[[httpx.Request], Awaitable[httpx.Response]]) -> httpx.AsyncClient:
     """An AsyncClient whose requests go to handler instead of the network."""
     return httpx.AsyncClient(
@@ -2537,6 +2637,7 @@ async def loop_lag_during(work: Callable[[], Awaitable[object]], interval: float
     stop, worst = asyncio.Event(), [0.0]
 
     async def beat() -> None:
+        """Wake every interval and record the worst lateness."""
         while not stop.is_set():
             before = KERNEL_LOOP.time()
             await asyncio.sleep(interval)
@@ -2552,13 +2653,7 @@ async def loop_lag_during(work: Callable[[], Awaitable[object]], interval: float
     return worst[0]
 
 
-def scenario_field(result: object, key: str) -> object:
-    """result[key] if result is a dict (a finished scenario), else result itself (an error)."""
-    return result[key] if isinstance(result, dict) else result
-
-
-print("Lab 5.4 helpers ready: outcome, quiet_unawaited, InFlightTracker, mock_client,")
-print("loop_lag_during, scenario_field")
+print("Lab 5.4 helpers ready: mock_client, loop_lag_during")
 '''
 
 
@@ -2571,10 +2666,27 @@ def _lab_cells_part_1() -> list[NotebookNode]:
 
             Seven exercises. All HTTP goes through `httpx.MockTransport` handlers (no
             network). Replace each `raise NotImplementedError`, then run the check cell;
-            until then the checks print FAIL, which is expected.
+            until then the checks print FAIL, which is expected. The first setup cell
+            defines the general helpers: `outcome` (await, turning an exception into
+            `"raised Name"`), `quiet_unawaited` and `scenario_field`:
             """
         ),
         code(LAB_SETUP_SOURCE),
+        md(
+            """
+            The second defines `InFlightTracker`, which counts concurrent requests inside a
+            mock handler (the current number, the peak, and calls per key):
+            """
+        ),
+        code(LAB_HTTP_SETUP_SOURCE),
+        md(
+            """
+            The third defines `mock_client` (an `AsyncClient` on a `MockTransport`) and
+            `loop_lag_during` (a 10 ms heartbeat that measures how long the loop was
+            blocked):
+            """
+        ),
+        code(LAB_CLIENT_SETUP_SOURCE),
         md(
             """
             #### Exercise 1 — `fetch_all(urls, max_concurrency)`
@@ -2675,6 +2787,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                 def __init__(
                     self, job: Callable[[Any], Awaitable[object]], worker_count: int = 3, queue_size: int = 10
                 ) -> None:
+                    """Store the job, the worker count and a bounded queue."""
                     self.job = job
                     self.worker_count = worker_count
                     self.queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_size)
@@ -2682,19 +2795,23 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     self.results: dict[Any, object] = {}
 
                 async def start(self) -> None:
+                    """Start worker_count worker tasks."""
                     raise NotImplementedError
 
                 async def submit(self, item: Any) -> None:
+                    """Queue one item, waiting while the queue is full."""
                     raise NotImplementedError
 
                 async def shutdown(self, immediate: bool = False) -> dict[Any, object]:
+                    """Stop the workers (gracefully or at once) and return the results."""
                     raise NotImplementedError
             '''
         ),
         md("Check exercise 2:"),
         code(
-            """
+            '''
             async def double_later(item: int) -> int:
+                """Double an item after 10 ms; item 7 raises ValueError."""
                 await asyncio.sleep(0.01)
                 if item == 7:
                     raise ValueError("unlucky item")
@@ -2702,11 +2819,13 @@ def _lab_cells_part_1() -> list[NotebookNode]:
 
 
             async def slow_job(item: int) -> int:
+                """Return the item after 50 ms."""
                 await asyncio.sleep(0.05)
                 return item
 
 
             async def graceful_scenario() -> dict[str, object]:
+                """Run 12 jobs through a 3-worker pool and shut it down gracefully."""
                 pool = WorkerPool(double_later, worker_count=3, queue_size=4)
                 await pool.start()
                 with Timer("12 jobs", report=None) as pool_timer:
@@ -2720,9 +2839,18 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     "all_exited": all(worker.done() for worker in pool.workers),
                     "late_submit": await outcome(pool.submit(99)),
                 }
-
-
+            '''
+        ),
+        md(
+            """
+            The immediate-shutdown scenario queues 20 slow jobs on 2 workers and shuts down
+            after 10 ms with `immediate=True`. Both scenarios run here; the checks follow:
+            """
+        ),
+        code(
+            '''
             async def immediate_scenario() -> dict[str, object]:
+                """Queue 20 slow jobs, then shut the pool down immediately."""
                 pool = WorkerPool(slow_job, worker_count=2, queue_size=50)
                 await pool.start()
                 for item in range(20):
@@ -2733,6 +2861,17 @@ def _lab_cells_part_1() -> list[NotebookNode]:
 
 
             graceful, immediate = await outcome(graceful_scenario()), await outcome(immediate_scenario())
+            '''
+        ),
+        md(
+            """
+            The checks: every queued item processed (errors as class names), three workers that
+            all exit, real concurrency, `submit` refused after shutdown, and an immediate
+            shutdown that drops queued items:
+            """
+        ),
+        code(
+            """
             run_checks(
                 [
                     (
@@ -2817,17 +2956,19 @@ def _lab_cells_part_1() -> list[NotebookNode]:
         ),
         md("Check exercise 3:"),
         code(
-            """
+            '''
             recorded_sleeps: list[float] = []
 
 
             async def record_sleep(seconds: float) -> None:
+                """A fake sleep that records the requested delay."""
                 recorded_sleeps.append(round(seconds, 6))
 
 
             async def retry_case(
                 fail_times: int, error_type: type[Exception] = ConnectionError
             ) -> dict[str, object]:
+                """Run the retry decorator against a call that fails fail_times times."""
                 RETRY_CALLS.clear()
                 recorded_sleeps.clear()
                 decorator = retry_async(
@@ -2840,8 +2981,17 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                 )
                 result = await outcome(decorator(flaky_inventory_call)(fail_times, error_type))
                 return {"result": result, "calls": len(RETRY_CALLS), "sleeps": list(recorded_sleeps)}
-
-
+            '''
+        ),
+        md(
+            """
+            The expected delays come from the same seeded `rng`, so full jitter is checked
+            exactly. Three scenarios run (recover after 2 failures, give up after 10, a
+            non-retryable `KeyError`), then the checks:
+            """
+        ),
+        code(
+            """
             expected_rng = random.Random(7)
             expected_delays = [
                 round(expected_rng.uniform(0, min(0.25, 0.1 * 2**retry)), 6) for retry in range(3)
@@ -2931,10 +3081,11 @@ def _lab_cells_part_2() -> list[NotebookNode]:
         ),
         md("Check exercise 4:"),
         code(
-            """
+            '''
             async def paging_case(
                 path: str, page_size: int = 10, stop_after: int | None = None
             ) -> dict[str, object]:
+                """Collect paginated ids, optionally stopping early."""
                 page_requests.clear()
                 collected: list[int] = []
                 async with mock_client(paged_api) as paging_client:
@@ -2948,8 +3099,17 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     "requests": len(page_requests),
                     "first": page_requests[0] if page_requests else None,
                 }
-
-
+            '''
+        ),
+        md(
+            """
+            Four runs (every page, stop after 12 items, bigger pages, an empty listing), then
+            the checks: order, request count, the first request's parameters, laziness, and
+            the empty case:
+            """
+        ),
+        code(
+            """
             every_page = await outcome(paging_case("/products"))
             stopped_early = await outcome(paging_case("/products", stop_after=12))
             bigger_pages = await outcome(paging_case("/products", page_size=20))
@@ -3000,13 +3160,15 @@ def _lab_cells_part_2() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             def _legacy_pdf(order_id: int) -> str:
+                """A synchronous PDF call that blocks for 100 ms."""
                 time.sleep(0.1)  # a synchronous PDF library
                 return f"invoice-{order_id}.pdf"
 
 
             def _tax_table(region: str) -> dict[str, object]:
+                """A CPU-heavy pure-Python lookup that spins for 100 ms."""
                 end = time.perf_counter() + 0.1
                 while time.perf_counter() < end:  # a CPU-heavy pure-Python loop
                     pass
@@ -3014,28 +3176,32 @@ def _lab_cells_part_2() -> list[NotebookNode]:
 
 
             async def load_profile() -> dict[str, object]:
+                """Load a profile with a real await (harmless)."""
                 await asyncio.sleep(0.15)  # slow, but it awaits: harmless
                 return {"user": "asha"}
 
 
             async def render_invoice() -> dict[str, object]:
+                """Render the invoice with the blocking PDF call."""
                 await asyncio.sleep(0.01)
                 return {"file": _legacy_pdf(42)}
 
 
             async def send_sms() -> dict[str, object]:
+                """Send an SMS with a real await."""
                 await asyncio.sleep(0.02)
                 return {"sms": "sent"}
 
 
             async def lookup_tax() -> dict[str, object]:
+                """Look up tax with the CPU-heavy helper."""
                 await asyncio.sleep(0.01)
                 return _tax_table("KA")
 
 
             HANDLERS_A = {"load_profile": load_profile, "render_invoice": render_invoice, "send_sms": send_sms}
             HANDLERS_B = {"load_profile": load_profile, "send_sms": send_sms, "lookup_tax": lookup_tax}
-            """
+            '''
         ),
         md("Your solution:"),
         code(
@@ -3107,6 +3273,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 """Record (current request id, message) for every log call."""
 
                 def emit(self, record: logging.LogRecord) -> None:
+                    """Record the current request id with each log message."""
                     request_records.append((REQUEST_ID.get(), record.getMessage()))
 
 
@@ -3122,6 +3289,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
 
 
             async def echo_request_id_api(request: httpx.Request) -> httpx.Response:
+                """Echo the request id header back after a short wait."""
                 await asyncio.sleep(0.005)  # let concurrent requests interleave
                 return httpx.Response(
                     200, json={"x-request-id": request.headers.get("x-request-id", "missing")}
@@ -3145,12 +3313,16 @@ def _lab_cells_part_2() -> list[NotebookNode]:
         ),
         md("Check exercise 6:"),
         code(
-            """
+            '''
             async def request_id_scenario() -> dict[str, object]:
+                """Send 20 tagged requests and one untagged; collect what each saw."""
                 request_records.clear()
                 async with make_traced_client(httpx.MockTransport(echo_request_id_api)) as traced_client:
                     many = await asyncio.gather(
-                        *(handle_request(traced_client, f"/orders/{n}", f"req-{n:02d}") for n in range(20))
+                        *(
+                            handle_request(traced_client, f"/orders/{order_number}", f"req-{order_number:02d}")
+                            for order_number in range(20)
+                        )
                     )
                     generated = await handle_request(traced_client, "/orders/new")
                 return {
@@ -3162,20 +3334,32 @@ def _lab_cells_part_2() -> list[NotebookNode]:
 
 
             def records_match(scenario: object) -> bool:
+                """True if all 42 log lines carry the id of their own request."""
                 records = scenario_field(scenario, "records")
-                tagged = [(rid, message) for rid, message in records if "/orders/new" not in message]
+                tagged = [
+                    (logged_id, message) for logged_id, message in records if "/orders/new" not in message
+                ]
                 return len(records) == 42 and all(
-                    rid == f"req-{message.rsplit('/', 1)[1]:0>2}" for rid, message in tagged
+                    logged_id == f"req-{message.rsplit('/', 1)[1]:0>2}" for logged_id, message in tagged
                 )
-
-
+            '''
+        ),
+        md(
+            """
+            Run the scenario, then check: each request's own id in its header and in the worker
+            thread, 42 log lines each tagged with the right id, a generated 8-character id for
+            the request without one, and the caller's context restored afterwards:
+            """
+        ),
+        code(
+            """
             traced = await outcome(request_id_scenario())
             run_checks(
                 [
                     (
                         "header carries each request's id",
                         lambda: [reply["echoed"] for reply in scenario_field(traced, "many")],
-                        [f"req-{n:02d}" for n in range(20)],
+                        [f"req-{order_number:02d}" for order_number in range(20)],
                     ),
                     (
                         "worker thread sees the id",

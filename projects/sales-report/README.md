@@ -8,9 +8,9 @@ steps. Every step prints **exactly the same report**; the test suite checks this
 | `common.py` | product catalog, seeded data generator (`generate_chunks`), simulated store API |
 | `slow_report.py` | the baseline: 1M generated rows, nested loops, repeated scans, string `+=`, float money, 40 sequential API calls |
 | `fast_report.py` | steps 1–5 (`STEPS`), each a complete `build_report(rows, seed)`; the final version is step 5 |
-| `benchmark.py` | wall time and peak memory of every step, each in a fresh process; writes `RESULTS.md` |
+| `benchmark.py` | wall time (best and median of `--repeat N` runs) and peak memory of every step, each run in a fresh process; writes `RESULTS.md` |
 | `tests/test_reports.py` | every step reproduces the slow report byte for byte |
-| `RESULTS.md` | the 1,000,000-row benchmark |
+| `RESULTS.md` | the 1,000,000-row benchmark (3 runs per step) with a note on run-to-run variation |
 
 ## Steps
 
@@ -25,10 +25,10 @@ steps. Every step prints **exactly the same report**; the test suite checks this
 From this folder, with the course environment:
 
 ```bash
-uv run python slow_report.py --rows 100000          # the baseline
-uv run python fast_report.py --rows 1000000         # the final version (or --step N)
-uv run python benchmark.py --rows 1000000           # all steps -> RESULTS.md
-uv run python benchmark.py --rows 50000 --output -  # quick run, table on stdout
+uv run python slow_report.py --rows 100000            # the baseline
+uv run python fast_report.py --rows 1000000           # the final version (or --step N)
+uv run python benchmark.py --rows 1000000 --repeat 3  # all steps -> RESULTS.md
+uv run python benchmark.py --rows 50000 --output -    # quick run, table on stdout
 uv run pytest tests -q
 ```
 

@@ -76,15 +76,18 @@ class Timer:
     """Timing context manager (shared since Unit 1.14): reports on exit, keeps elapsed_seconds."""
 
     def __init__(self, label: str, report: Callable[[str], None] | None = print) -> None:
+        """Remember the label and where to report the elapsed time."""
         self.label = label
         self.report = report
         self.elapsed_seconds = 0.0
 
     def __enter__(self) -> Timer:
+        """Start the clock."""
         self._start = time.perf_counter()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        """Stop the clock and report the elapsed milliseconds."""
         self.elapsed_seconds = time.perf_counter() - self._start
         if self.report is not None:
             self.report(f"{self.label} took {self.elapsed_seconds * 1000:.2f} ms")
@@ -227,6 +230,10 @@ def slow_square(number: int) -> int:
     """Square after a delay that makes later numbers finish first."""
     time.sleep(0.05 * (3 - number % 3))
     return number * number
+'''
+
+BASICS_WORKERS_PART_2 = '''
+%%writefile -a _scratch/phase5/p5_basics.py
 
 
 def nap_then_exit(seconds: float, exit_code: int) -> None:
@@ -278,6 +285,15 @@ def _process_cells() -> list[NotebookNode]:
             """
         ),
         code(BASICS_WORKERS),
+        md(
+            """
+            The rest of the module: helpers for exit codes (`nap_then_exit`), a pool
+            initializer and the task that uses what it loaded (`load_price_table`,
+            `price_with_gst`), and two `Pool` helpers (`pid_after_nap`, `silence_stderr`).
+            `%%writefile -a` **appends** to the same file instead of replacing it:
+            """
+        ),
+        code(BASICS_WORKERS_PART_2),
         md(
             """
             Import it. `fresh_import` re-reads the file, so editing and re-running the cell
@@ -742,6 +758,7 @@ def _data_transfer_cells() -> list[NotebookNode]:
                 """Return a nested function (not picklable)."""
 
                 def apply(amount: float) -> float:
+                    """Apply the captured discount percentage to amount."""
                     return amount * (100 - percent) / 100
 
                 return apply
@@ -856,16 +873,20 @@ IPC_WORKERS = '''
 
 import os
 from multiprocessing import shared_memory
+from multiprocessing.connection import Connection
+from multiprocessing.managers import DictProxy, ListProxy
+from multiprocessing.queues import Queue
+from multiprocessing.sharedctypes import Synchronized, SynchronizedArray
 
 
-def produce_orders(order_queue, count: int) -> None:
+def produce_orders(order_queue: Queue[dict[str, int] | None], count: int) -> None:
     """Put count orders on a multiprocessing.Queue, then a None sentinel."""
     for number in range(1, count + 1):
         order_queue.put({"order_id": number, "producer_pid": os.getpid()})
     order_queue.put(None)
 
 
-def price_service(connection) -> None:
+def price_service(connection: Connection) -> None:
     """Answer price requests over one end of a Pipe until told to stop."""
     prices = {"TEA-500": 240.0, "MUG-02": 199.0}
     while (request := connection.recv()) != "stop":
@@ -873,7 +894,7 @@ def price_service(connection) -> None:
     connection.close()
 
 
-def add_visits(counter, times: int, use_lock: bool) -> None:
+def add_visits(counter: Synchronized[int], times: int, use_lock: bool) -> None:
     """Increment a shared multiprocessing.Value, with or without its lock."""
     for _ in range(times):
         if use_lock:
@@ -881,15 +902,19 @@ def add_visits(counter, times: int, use_lock: bool) -> None:
                 counter.value += 1
         else:
             counter.value += 1  # read and write are separate steps: updates get lost
+'''
+
+IPC_WORKERS_PART_2 = '''
+%%writefile -a _scratch/phase5/p5_ipc.py
 
 
-def fill_squares(shared_array, start: int, stop: int) -> None:
+def fill_squares(shared_array: SynchronizedArray[int], start: int, stop: int) -> None:
     """Write index squared into a slice of a shared multiprocessing.Array."""
     for index in range(start, stop):
         shared_array[index] = index * index
 
 
-def record_stock(stock, log, sku: str, quantity: int) -> None:
+def record_stock(stock: DictProxy[str, int], log: ListProxy[str], sku: str, quantity: int) -> None:
     """Write through Manager proxies (a dict and a list)."""
     stock[sku] = quantity
     log.append(f"set {sku}")
@@ -928,6 +953,15 @@ def _ipc_cells() -> list[NotebookNode]:
             """
         ),
         code(IPC_WORKERS),
+        md(
+            """
+            The second half appends the shared-memory workers: `fill_squares` (a slice of a
+            shared `Array`), `record_stock` (writes through `Manager` proxies) and
+            `square_in_place` (a NumPy view on a named `SharedMemory` block). The
+            annotations name the real proxy and wrapper types the parent passes in:
+            """
+        ),
+        code(IPC_WORKERS_PART_2),
         md("Import it:"),
         code(
             """
@@ -1380,12 +1414,22 @@ def _choosing_cells() -> list[NotebookNode]:
 
 
             worker_counts = [1, 2, 4, 8, 16, 64, math.inf]
-            print("p \\\\ N  " + "".join(f"{('inf' if n == math.inf else n):>7}" for n in worker_counts))
+            print(
+                "p \\\\ N  "
+                + "".join(
+                    f"{('inf' if worker_count == math.inf else worker_count):>7}"
+                    for worker_count in worker_counts
+                )
+            )
             for fraction in (0.5, 0.75, 0.9, 0.95, 0.99):
-                print(f"{fraction:<7}" + "".join(f"{amdahl(fraction, n):>7.1f}" for n in worker_counts))
+                print(
+                    f"{fraction:<7}"
+                    + "".join(f"{amdahl(fraction, worker_count):>7.1f}" for worker_count in worker_counts)
+                )
             print()
-            for n in (1, 2, 4, 8, 16, 32):
-                print(f"p=0.9, N={n:>2} {'#' * round(amdahl(0.9, n) * 4):<40} {amdahl(0.9, n):.1f}x")
+            for worker_count in (1, 2, 4, 8, 16, 32):
+                speedup = amdahl(0.9, worker_count)
+                print(f"p=0.9, N={worker_count:>2} {'#' * round(speedup * 4):<40} {speedup:.1f}x")
             '''
         ),
         md(
@@ -1486,7 +1530,7 @@ def _pattern_cells() -> list[NotebookNode]:
                 return chunks
 
 
-            ten_orders = [f"order-{n}" for n in range(10)]
+            ten_orders = [f"order-{order_number}" for order_number in range(10)]
             print(
                 "batched(size 4):        "
                 f"{[len(batch) for batch in itertools.batched(ten_orders, 4, strict=False)]}"
@@ -1634,9 +1678,12 @@ def _predict_cells() -> list[NotebookNode]:
             could never be sent to a process. (Whether `__main__.outer` could be *loaded*
             by a child is a separate question: 5.2.2.)
             """,
-            """
+            '''
             def outer() -> Callable[[], int]:
+                """Return a nested function (which cannot be pickled by name)."""
+
                 def helper() -> int:
+                    """Return 1."""
                     return 1
 
                 return helper
@@ -1649,7 +1696,7 @@ def _predict_cells() -> list[NotebookNode]:
                 except Exception as error:
                     print(type(error).__name__, end=" ")
             print()
-            """,
+            ''',
         ),
         *predict_cells(
             """
@@ -1668,7 +1715,7 @@ def _predict_cells() -> list[NotebookNode]:
     ]
 
 
-LAB_SETUP_SOURCE = r'''
+LAB_SETUP_SOURCE = r"""
 import concurrent.futures
 import hashlib
 import importlib.util
@@ -1692,6 +1739,12 @@ HASH_FILES = [LAB52_DIR / f"export-{number}.bin" for number in range(8)]
 for path in HASH_FILES:  # 8 files of 8 MiB x DEMO_SCALE, same bytes every run
     path.write_bytes(lab_random.randbytes(8 * 1024 * 1024 * DEMO_SCALE))
 
+if HAS_NUMPY:
+    import numpy as np
+print(f"{len(HASH_FILES)} files of {HASH_FILES[0].stat().st_size // 2**20} MiB")
+"""
+
+LAB_CORPUS_SOURCE = r'''
 WORDS = "chai masala the shop's order delivered late early pune mumbai".split()
 WORDS += "refund invoice gst customer happy isn't tea mug kettle rain".split()
 CORPUS = [
@@ -1705,13 +1758,7 @@ def shm_segments() -> set[str]:
     return {entry.name for entry in folder.glob("psm_*")} if folder.exists() else set()
 
 
-if HAS_NUMPY:
-    import numpy as np
-print(
-    f"{len(HASH_FILES)} files of {HASH_FILES[0].stat().st_size // 2**20} "
-    f"MiB, {len(CORPUS):,} corpus lines"
-)
-print(f"first corpus line: {CORPUS[0]!r}")
+print(f"{len(CORPUS):,} corpus lines; first: {CORPUS[0]!r}")
 '''
 
 
@@ -1728,8 +1775,8 @@ def _lab_cells_part_1() -> list[NotebookNode]:
             `raise NotImplementedError`, then run the check cell. Until you finish, the
             checks print FAIL; that is expected.
 
-            The setup cell writes eight 8 MiB files for exercise 1 and builds a seeded
-            100 000-line corpus for exercise 4.
+            The first setup cell writes eight 8 MiB files for exercise 1; the second builds
+            a seeded 100 000-line corpus for exercise 4.
 
             > **Warning:** after editing a worker module, re-run *both* the `%%writefile`
             > cell and the cell after it. `fresh_import` puts a new module object in
@@ -1739,6 +1786,14 @@ def _lab_cells_part_1() -> list[NotebookNode]:
             """
         ),
         code(LAB_SETUP_SOURCE),
+        md(
+            """
+            The corpus for exercise 4 (100 000 seeded lines × `DEMO_SCALE`), and
+            `shm_segments()`, which lists the shared-memory blocks currently in `/dev/shm`
+            so exercise 3 can prove that none were left behind:
+            """
+        ),
+        code(LAB_CORPUS_SOURCE),
         md(
             """
             #### Exercise 1 — parallel hashing with processes vs threads, with the result explained
@@ -2000,8 +2055,17 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 original = np.arange(5.0)
                 parallel_scale(original, 3.0)
                 return original.tolist()
-
-
+            '''
+        ),
+        md(
+            """
+            The checks: values scaled correctly (also with an uneven split and one worker),
+            `float64` out, the input untouched, no shared-memory block left in `/dev/shm`, and
+            real `Process` + `SharedMemory` underneath:
+            """
+        ),
+        code(
+            """
             if not HAS_NUMPY:
                 print("SKIP: numpy is not installed")
             else:
@@ -2015,7 +2079,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                         (
                             "uneven split: 10 values, 4 workers",
                             lambda: parallel_scale(np.arange(10.0), 10.0, 4).tolist(),
-                            [10.0 * n for n in range(10)],
+                            [10.0 * index for index in range(10)],
                         ),
                         (
                             "one worker",
@@ -2035,7 +2099,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                         ),
                     ]
                 )
-            '''
+            """
         ),
         md(
             """
@@ -2120,8 +2184,16 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     )
                     and 0 < report["parallel_fraction"] <= 1
                 )
-
-
+            '''
+        ),
+        md(
+            """
+            The map-reduce checks: the map step, the reduce step, and the parallel total equal
+            to the sequential one:
+            """
+        ),
+        code(
+            """
             run_checks(
                 [
                     (
@@ -2142,6 +2214,20 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                         ),
                         True,
                     ),
+                ]
+            )
+            """
+        ),
+        md(
+            """
+            The Amdahl checks: the formula on known values, rejection of a fraction outside
+            0..1, and a `speedup_report` whose numbers agree with each other:
+            """
+        ),
+        code(
+            """
+            run_checks(
+                [
                     ("amdahl_speedup(0.9, 16)", lambda: round(amdahl_speedup(0.9, 16), 2), 6.4),
                     (
                         "amdahl_speedup at p=1 and p=0",
@@ -2167,7 +2253,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     ("speedup_report is consistent", report_consistent, True),
                 ]
             )
-            '''
+            """
         ),
         md(
             """

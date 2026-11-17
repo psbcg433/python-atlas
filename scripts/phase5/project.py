@@ -155,8 +155,8 @@ def _overview_cells() -> list[NotebookNode]:
 
             ```bash
             cd projects/sales-report
-            uv run python benchmark.py --rows 1000000      # writes RESULTS.md
-            uv run pytest tests -q                          # same report at every step
+            uv run python benchmark.py --rows 1000000 --repeat 3  # writes RESULTS.md
+            uv run pytest tests -q                                # same report at every step
             ```
             """
         ),
@@ -384,7 +384,11 @@ def _step_cells() -> list[NotebookNode]:
 
 
             lines = [(product.price_paise, quantity) for product in common.PRODUCTS for quantity in range(1, 6)]
-            wrong = [(p, q) for p, q in lines if round(gst_float(p, q) * 100) != gst_paise(p, q)]
+            wrong = [
+                (price_paise, quantity)
+                for price_paise, quantity in lines
+                if round(gst_float(price_paise, quantity) * 100) != gst_paise(price_paise, quantity)
+            ]
             print(
                 f"{len(wrong)} of {len(lines)} catalog lines get a different GST with floats, e.g. {wrong[:3]}"
             )
@@ -410,8 +414,9 @@ def _step_cells() -> list[NotebookNode]:
             "Peak traced memory of the two approaches at `PROJECT_ROWS` (the gap grows with the row count; at 1M rows see `RESULTS.md`):"
         ),
         code(
-            """
+            '''
             def materialize_then_add() -> None:
+                """Materialize four times the rows as tuples, then aggregate them."""
                 fast_report.add_rows(
                     fast_report.SalesSummary(), fast_report.generate_lean_rows(PROJECT_ROWS * 4, 42)
                 )
@@ -424,7 +429,7 @@ def _step_cells() -> list[NotebookNode]:
                 f"streaming peak {stream_peak:.1f} MiB"
             )
             print(f"step 3 matches the baseline: {same_report_as_baseline(fast_report.STEPS[3])}")
-            """
+            '''
         ),
         md(
             """
@@ -560,9 +565,11 @@ def _verification_cells() -> list[NotebookNode]:
             """
             ### The full-size result (1 000 000 rows)
 
-            `RESULTS.md` was written by `benchmark.py --rows 1000000` run from a terminal (it
-            takes about half a minute, most of it the baseline). Your machine will give other
-            numbers; the shape (which step helps time, which helps memory) should hold:
+            `RESULTS.md` was written by `benchmark.py --rows 1000000 --repeat 3` run from a
+            terminal (about a minute: three fresh processes per step, most of the time in the
+            baseline). It records the best and the median run of each step and how much the
+            runs varied. Your machine will give other numbers; the shape (which step helps
+            time, which helps memory) should hold:
             """
         ),
         code(
@@ -830,15 +837,16 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "5.3",
-        """
-        async def total():
+        '''
+        async def total() -> int:
+            """Return 42."""
             return 42
 
 
         result = total()
         print(type(result).__name__)
         result.close()
-        """,
+        ''',
         """
         `coroutine`. Calling an `async def` function runs **none** of its body: it returns a
         coroutine object, which runs only when awaited or wrapped in a task. (Unlike a JS
@@ -1059,7 +1067,7 @@ QUESTIONS: list[tuple[str, str, str, str]] = [
     (
         "5.5",
         """
-        squares = (n * n for n in range(4))
+        squares = (number * number for number in range(4))
         print(sum(squares), sum(squares))
         """,
         """

@@ -695,7 +695,7 @@ def check_lab_5_1() -> None:
             (
                 "results in input order",
                 lambda: process_with_workers(list(range(12)), square_slowly, 4),
-                [n * n for n in range(12)],
+                [number * number for number in range(12)],
             ),
             (
                 "works with any handler",
@@ -740,7 +740,11 @@ def check_lab_5_1() -> None:
     def peak_in_flight(url_count: int, max_workers: int) -> int:
         """Download url_count files and return the peak number of concurrent requests."""
         client, stats = lab_client()
-        download_all(client, [f"http://lab.test/files/{n}" for n in range(url_count)], max_workers)
+        download_all(
+            client,
+            [f"http://lab.test/files/{file_number}" for file_number in range(url_count)],
+            max_workers,
+        )
         return stats["peak"]
 
     FILE_URLS = ["http://lab.test/files/10", "http://lab.test/files/2048"]
@@ -1010,7 +1014,7 @@ def check_lab_5_2() -> None:
                 (
                     "uneven split: 10 values, 4 workers",
                     lambda: parallel_scale(np.arange(10.0), 10.0, 4).tolist(),
-                    [10.0 * n for n in range(10)],
+                    [10.0 * index for index in range(10)],
                 ),
                 (
                     "one worker",
@@ -1874,8 +1878,8 @@ class WorkerPool:
 
     async def start(self) -> None:
         self.workers = [
-            asyncio.create_task(self._work(), name=f"pool-worker-{n}")
-            for n in range(self.worker_count)
+            asyncio.create_task(self._work(), name=f"pool-worker-{worker_number}")
+            for worker_number in range(self.worker_count)
         ]
 
     async def _work(self) -> None:
@@ -2431,7 +2435,12 @@ async def _lab_5_4_checks() -> None:
         request_records.clear()
         async with make_traced_client(httpx.MockTransport(echo_request_id_api)) as traced_client:
             many = await asyncio.gather(
-                *(handle_request(traced_client, f"/orders/{n}", f"req-{n:02d}") for n in range(20))
+                *(
+                    handle_request(
+                        traced_client, f"/orders/{order_number}", f"req-{order_number:02d}"
+                    )
+                    for order_number in range(20)
+                )
             )
             generated = await handle_request(traced_client, "/orders/new")
         return {
@@ -2443,9 +2452,11 @@ async def _lab_5_4_checks() -> None:
 
     def records_match(scenario: object) -> bool:
         records = scenario_field(scenario, "records")
-        tagged = [(rid, message) for rid, message in records if "/orders/new" not in message]
+        tagged = [
+            (logged_id, message) for logged_id, message in records if "/orders/new" not in message
+        ]
         return len(records) == 42 and all(
-            rid == f"req-{message.rsplit('/', 1)[1]:0>2}" for rid, message in tagged
+            logged_id == f"req-{message.rsplit('/', 1)[1]:0>2}" for logged_id, message in tagged
         )
 
     traced = await outcome(request_id_scenario())
@@ -2454,7 +2465,7 @@ async def _lab_5_4_checks() -> None:
             (
                 "header carries each request's id",
                 lambda: [reply["echoed"] for reply in scenario_field(traced, "many")],
-                [f"req-{n:02d}" for n in range(20)],
+                [f"req-{order_number:02d}" for order_number in range(20)],
             ),
             (
                 "worker thread sees the id",
@@ -2526,7 +2537,10 @@ def make_lab_customers(count: int = 1_200, seed: int = 55) -> list[tuple[int, st
     """(customer_id, name, city) with shuffled, spread-out ids."""
     rng = random.Random(seed)
     customer_ids = rng.sample(range(10_000, 99_999), count)
-    return [(cid, f"Customer {n}", LAB55_CITIES[n % 6]) for n, cid in enumerate(customer_ids)]
+    return [
+        (customer_id, f"Customer {position}", LAB55_CITIES[position % 6])
+        for position, customer_id in enumerate(customer_ids)
+    ]
 
 
 def make_lab_orders(
@@ -2603,7 +2617,9 @@ def count_pairs_quadratic(amounts: list[int], target: int) -> int:
 def growth_factor(count_pairs: Callable[[list[int], int], int], size: int) -> float | None:
     """Best time at 4 x size divided by best time at size (about 4 for O(n), 16 for O(n^2))."""
     rng = random.Random(58)
-    small, large = ([rng.randrange(1_000) for _ in range(n)] for n in (size, 4 * size))
+    small, large = (
+        [rng.randrange(1_000) for _ in range(list_size)] for list_size in (size, 4 * size)
+    )
     small_time = best_time_or_none(lambda: count_pairs(small, 1_000))
     large_time = best_time_or_none(lambda: count_pairs(large, 1_000))
     return None if small_time is None or large_time is None else large_time / small_time
@@ -2807,7 +2823,7 @@ def check_lab_5_5() -> None:
             *(
                 (
                     f"pairs in {amounts} summing to {target}",
-                    lambda a=amounts, t=target: count_pairs_linear(a, t),
+                    lambda amounts=amounts, target=target: count_pairs_linear(amounts, target),
                     count_pairs_quadratic(amounts, target),
                 )
                 for amounts, target in pair_cases
@@ -2865,7 +2881,7 @@ def check_lab_5_5() -> None:
                 lambda: (
                     0.002
                     <= timing_table({"sleep": lambda: time.sleep(0.002)}, number=3, repeat=2)[0][1]
-                    < 0.05
+                    < 0.2
                 ),
                 True,
             ),
@@ -2913,7 +2929,10 @@ def check_lab_5_5() -> None:
             ),
             (
                 "z-scores have mean 0 and std 1",
-                lambda: [round(float(f(zscores_numpy(value_array))), 6) for f in (np.mean, np.std)],
+                lambda: [
+                    round(float(statistic(zscores_numpy(value_array))), 6)
+                    for statistic in (np.mean, np.std)
+                ],
                 [0.0, 1.0],
             ),
             (

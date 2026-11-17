@@ -94,15 +94,18 @@ class Timer:
     """Timing context manager (shared since Unit 1.14): reports on exit, keeps elapsed_seconds."""
 
     def __init__(self, label: str, report: Callable[[str], None] | None = print) -> None:
+        """Remember the label and where to report the elapsed time."""
         self.label = label
         self.report = report
         self.elapsed_seconds = 0.0
 
     def __enter__(self) -> Timer:
+        """Start the clock."""
         self._start = time.perf_counter()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        """Stop the clock and report the elapsed milliseconds."""
         self.elapsed_seconds = time.perf_counter() - self._start
         if self.report is not None:
             self.report(f"{self.label} took {self.elapsed_seconds * 1000:.2f} ms")
@@ -286,7 +289,10 @@ def _core_concept_cells() -> list[NotebookNode]:
                 for thread in threads:
                     thread.join()
                 slot_count = int(duration / slot)
-                busy = {name: {int((t - start) / slot) for t in times} for name, times in samples.items()}
+                busy = {
+                    name: {int((sample_time - start) / slot) for sample_time in times}
+                    for name, times in samples.items()
+                }
                 cells = []
                 for index in range(slot_count):
                     ran = [name for name in samples if index in busy[name]]
@@ -533,8 +539,8 @@ def _thread_cells() -> list[NotebookNode]:
             '''
             def greet_customer(customer_name: str, greetings: list[str]) -> None:
                 """Thread body: append a greeting that names the thread running it."""
-                me = threading.current_thread()
-                greetings.append(f"{me.name} greeted {customer_name}")
+                current_thread = threading.current_thread()
+                greetings.append(f"{current_thread.name} greeted {customer_name}")
 
 
             greetings: list[str] = []
@@ -563,11 +569,14 @@ def _thread_cells() -> list[NotebookNode]:
 
             def remember_ids() -> None:
                 """Record this thread's Python ident and OS native id."""
-                me = threading.current_thread()
-                ids_seen[me.name] = (threading.get_ident(), threading.get_native_id())
+                current_thread = threading.current_thread()
+                ids_seen[current_thread.name] = (threading.get_ident(), threading.get_native_id())
 
 
-            workers = [threading.Thread(target=remember_ids, name=f"id-probe-{n}") for n in range(2)]
+            workers = [
+                threading.Thread(target=remember_ids, name=f"id-probe-{probe_number}")
+                for probe_number in range(2)
+            ]
             for worker in workers:
                 worker.start()
             for worker in workers:
@@ -661,6 +670,7 @@ def _thread_cells() -> list[NotebookNode]:
                 """A thread subclass that fetches exchange rates and keeps the result."""
 
                 def __init__(self, base_currency: str) -> None:
+                    """Name the thread after the base currency it fetches rates for."""
                     super().__init__(name=f"rates-{base_currency}")
                     self.base_currency = base_currency
                     self.rates: dict[str, float] = {}
@@ -771,6 +781,7 @@ def _gil_cells() -> list[NotebookNode]:
                 deadline = time.perf_counter() + duration
 
                 def spin(name: str) -> None:
+                    """Spin until the deadline, counting each change of the running thread."""
                     while time.perf_counter() < deadline:
                         if state["owner"] != name:
                             state["owner"] = name
@@ -1004,6 +1015,7 @@ def _race_cells() -> list[NotebookNode]:
                 """A counter with no locking at all."""
 
                 def __init__(self) -> None:
+                    """Start at zero."""
                     self.value = 0
 
 
@@ -1038,9 +1050,11 @@ def _race_cells() -> list[NotebookNode]:
                 """Read, give up the GIL, then write: the classic lost-update race."""
 
                 def __init__(self) -> None:
+                    """Start at zero."""
                     self.value = 0
 
                 def increment(self) -> None:
+                    """Read, yield the GIL, then write: two threads can lose an update."""
                     current = self.value  # read
                     time.sleep(0)  # another thread can run here
                     self.value = current + 1  # write (may overwrite someone else's update)
@@ -1231,10 +1245,12 @@ def _primitive_cells() -> list[NotebookNode]:
                 """The yielding counter from 5.1.4 with its read-modify-write under a lock."""
 
                 def __init__(self) -> None:
+                    """Start at zero with a lock that guards the read-modify-write."""
                     self.value = 0
                     self._lock = threading.Lock()
 
                 def increment(self) -> None:
+                    """Read and write under the lock, so no update is lost."""
                     with self._lock:
                         current = self.value
                         time.sleep(0)  # other threads may run, but cannot enter this block
@@ -1709,7 +1725,10 @@ def _queue_cells() -> list[NotebookNode]:
                 log_lines.task_done()  # the sentinel counts as a task too
 
 
-            consumers = [threading.Thread(target=count_errors, name=f"log-reader-{n}") for n in (1, 2)]
+            consumers = [
+                threading.Thread(target=count_errors, name=f"log-reader-{reader_number}")
+                for reader_number in (1, 2)
+            ]
             for consumer in consumers:
                 consumer.start()
             for number in range(1, 101):
@@ -1723,7 +1742,7 @@ def _queue_cells() -> list[NotebookNode]:
                 consumer.join()
             print(
                 f"total errors: {sum(error_counts.values())}; "
-                f"threads alive: {[c.is_alive() for c in consumers]}"
+                f"threads alive: {[consumer.is_alive() for consumer in consumers]}"
             )
             '''
         ),
@@ -1809,6 +1828,7 @@ def _thread_local_cells() -> list[NotebookNode]:
                 """One in-memory SQLite connection per thread, created on first use."""
 
                 def __init__(self) -> None:
+                    """Open a private in-memory database and record the owning thread."""
                     self.connection = sqlite3.connect(":memory:")
                     self.owner = threading.current_thread().name
 
@@ -1975,7 +1995,9 @@ def _executor_cells() -> list[NotebookNode]:
                     consumed_rows: list[int] = []
                     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                         squares = executor.map(
-                            lambda n: n * n, numbered_rows(10_000, consumed_rows), buffersize=buffer_size
+                            lambda row_number: row_number * row_number,
+                            numbered_rows(10_000, consumed_rows),
+                            buffersize=buffer_size,
                         )
                         first_square = next(squares)
                         print(
@@ -2026,13 +2048,16 @@ def _executor_cells() -> list[NotebookNode]:
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 mirrors = [
-                    executor.submit(slow_echo, f"mirror-{n}", seconds)
-                    for n, seconds in enumerate((0.3, 0.1, 0.2))
+                    executor.submit(slow_echo, f"mirror-{mirror_number}", seconds)
+                    for mirror_number, seconds in enumerate((0.3, 0.1, 0.2))
                 ]
                 done, not_done = concurrent.futures.wait(
                     mirrors, return_when=concurrent.futures.FIRST_COMPLETED
                 )
-                print(f"FIRST_COMPLETED: done={[f.result() for f in done]}, still running={len(not_done)}")
+                print(
+                    f"FIRST_COMPLETED: done={[future.result() for future in done]}, "
+                    f"still running={len(not_done)}"
+                )
 
                 mixed = [executor.submit(fail_after, 0.05), executor.submit(slow_echo, "slow", 0.3)]
                 done, not_done = concurrent.futures.wait(mixed, return_when=concurrent.futures.FIRST_EXCEPTION)
@@ -2089,12 +2114,12 @@ def _executor_cells() -> list[NotebookNode]:
         code(
             """
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            backlog = [executor.submit(slow_echo, f"email-{n}", 0.05) for n in range(10)]
+            backlog = [executor.submit(slow_echo, f"email-{email_number}", 0.05) for email_number in range(10)]
             time.sleep(0.02)
             executor.shutdown(wait=False, cancel_futures=True)
             print(
-                f"cancelled: {sum(f.cancelled() for f in backlog)}, ran "
-                f"or running: {sum(not f.cancelled() for f in backlog)}"
+                f"cancelled: {sum(future.cancelled() for future in backlog)}, ran "
+                f"or running: {sum(not future.cancelled() for future in backlog)}"
             )
             print(f"submit after shutdown: {raised_message(lambda: executor.submit(print))}")
             started = [future.result() for future in backlog if not future.cancelled()]  # let them finish
@@ -2410,8 +2435,17 @@ def _free_threading_cells() -> list[NotebookNode]:
 
                 print(json.dumps({count: wall_seconds(count) for count in (1, 2, 4, 8)}))
             """
-
-
+            '''
+        ),
+        md(
+            """
+            `scaling_table` runs that script in a child interpreter (this kernel's, then
+            `python3.15t` if installed) and parses its JSON line; the loop prints one row per
+            build with the time and throughput speedup for each thread count:
+            """
+        ),
+        code(
+            '''
             def scaling_table(python: str) -> dict[str, float]:
                 """Run the benchmark in a child interpreter; return {thread count: seconds}."""
                 return json.loads(run_child(SCALING_BENCHMARK, python=python).splitlines()[-1])
@@ -2549,15 +2583,16 @@ def _predict_cells() -> list[NotebookNode]:
             thread then starts with no target and does nothing. Pass the function itself:
             `target=work`. (In JS the same slip is `setTimeout(work(), 0)`.)
             """,
-            """
+            '''
             def work() -> None:
+                """Print the name of the thread running this function."""
                 print("working in", threading.current_thread().name)
 
 
             worker = threading.Thread(target=work(), name="worker")
             worker.start()
             worker.join()
-            """,
+            ''',
         ),
         *predict_cells(
             """
@@ -2576,15 +2611,16 @@ def _predict_cells() -> list[NotebookNode]:
             always yields results in **input order**. Use `as_completed` for finish order.
             The whole call takes about 0.3 s (the longest task), not 0.6 s.
             """,
-            """
+            '''
             def nap(seconds: float) -> float:
+                """Sleep for seconds, then return them."""
                 time.sleep(seconds)
                 return seconds
 
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 print(list(executor.map(nap, [0.3, 0.1, 0.2])))
-            """,
+            ''',
         ),
         *predict_cells(
             """
@@ -2604,12 +2640,14 @@ def _predict_cells() -> list[NotebookNode]:
             traceback to stderr, then the main thread prints `joined`. The proof cell
             installs a temporary hook that prints one line instead of the full traceback.
             """,
-            """
+            '''
             def explode() -> None:
+                """Raise a ValueError inside the thread."""
                 raise ValueError("boom")
 
 
             def one_line_hook(hook_args: threading.ExceptHookArgs) -> None:
+                """Print one line for an uncaught thread exception instead of a traceback."""
                 print(f"excepthook: {hook_args.exc_type.__name__}: {hook_args.exc_value}")
 
 
@@ -2621,7 +2659,7 @@ def _predict_cells() -> list[NotebookNode]:
                 print("joined")
             finally:
                 threading.excepthook = saved_hook
-            """,
+            ''',
         ),
     ]
 
@@ -2655,18 +2693,28 @@ def run_threads(work: Callable[[object], object], items: list[object]) -> None:
         thread.join()
 
 
+print("Lab 5.1 imports ready; helper: run_threads")
+'''
+
+LAB_COUNTER_SETUP_SOURCE = r'''
 class UnsafeCounter:
     """Exercise 1: reads, gives up the GIL, then writes, so concurrent updates get lost."""
 
     def __init__(self) -> None:
+        """Start at zero."""
         self.value = 0
 
     def increment(self) -> None:
+        """Read, yield the GIL, then write, so concurrent updates get lost."""
         current = self.value
         time.sleep(0)  # let another thread run between the read and the write
         self.value = current + 1
 
 
+print("Lab 5.1 helper ready: UnsafeCounter")
+'''
+
+LAB_DEADLOCK_SETUP_SOURCE = r'''
 class DeadlockError(RuntimeError):
     """Exercise 5: raised when a lock cannot be acquired in time."""
 
@@ -2706,9 +2754,7 @@ def transfer_naive(
         source.lock.release()
 
 
-print(
-    "Lab 5.1 helpers ready: UnsafeCounter, Account, transfer_naive, acquire_or_fail, DeadlockError"
-)
+print("Lab 5.1 helpers ready: Account, transfer_naive, acquire_or_fail, DeadlockError")
 '''
 
 
@@ -2720,13 +2766,28 @@ def _lab_cells_part_1() -> list[NotebookNode]:
             ### Lab 5.1
 
             Six exercises; replace each `raise NotImplementedError`, then run the check cell.
-            Until you finish, the checks print FAIL; that is expected. The setup cell below
-            defines the helpers the exercises use: `UnsafeCounter` (exercise 1),
-            `Account`, `transfer_naive`, `acquire_or_fail` and `DeadlockError`
-            (exercise 5), and `run_threads` for the checks.
+            Until you finish, the checks print FAIL; that is expected. The first setup cell
+            below imports what the exercises need and defines `run_threads` (used by the
+            checks):
             """
         ),
         code(LAB_SETUP_SOURCE),
+        md(
+            """
+            `UnsafeCounter` for exercise 1: it reads the value, gives up the GIL with
+            `time.sleep(0)`, then writes, so concurrent increments get lost:
+            """
+        ),
+        code(LAB_COUNTER_SETUP_SOURCE),
+        md(
+            """
+            The third setup cell defines the bank-transfer pieces of exercise 5: `Account`
+            (an account with its own lock), `transfer_naive` (locks source, then target),
+            `acquire_or_fail` and `DeadlockError` (a timed acquire, so a deadlock fails fast
+            instead of hanging the notebook):
+            """
+        ),
+        code(LAB_DEADLOCK_SETUP_SOURCE),
         md(
             """
             #### Exercise 1 — prove a race condition and fix it
@@ -2752,9 +2813,11 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                 """UnsafeCounter's read / sleep(0) / write, made safe with a Lock."""
 
                 def __init__(self) -> None:
+                    """Set up the value and whatever protects it."""
                     raise NotImplementedError
 
                 def increment(self) -> None:
+                    """Add one to the value without losing concurrent updates."""
                     raise NotImplementedError
             '''
         ),
@@ -2827,6 +2890,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                 seen: set[str] = set()
 
                 def record(number: int) -> int:
+                    """Remember which thread handled the item, then return it unchanged."""
                     seen.add(threading.current_thread().name)
                     time.sleep(0.01)
                     return number
@@ -2839,14 +2903,22 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                 """Names of consumer threads alive after process_with_workers returns."""
                 process_with_workers(list(range(10)), square_slowly, 3)
                 return [thread.name for thread in threading.enumerate() if thread.name.startswith("consumer-")]
-
-
+            '''
+        ),
+        md(
+            """
+            The checks: results in input order, any handler, empty input, all four named
+            consumers busy, none left alive afterwards, and a real `queue.Queue` underneath:
+            """
+        ),
+        code(
+            """
             run_checks(
                 [
                     (
                         "results in input order",
                         lambda: process_with_workers(list(range(12)), square_slowly, 4),
-                        [n * n for n in range(12)],
+                        [number * number for number in range(12)],
                     ),
                     (
                         "works with any handler",
@@ -2859,7 +2931,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     ("uses queue.Queue", lambda: "Queue(" in inspect.getsource(process_with_workers), True),
                 ]
             )
-            '''
+            """
         ),
         md(
             """
@@ -2896,6 +2968,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                 stats_lock = threading.Lock()
 
                 def handler(request: httpx.Request) -> httpx.Response:
+                    """Answer a mock request after the latency, tracking the in-flight peak."""
                     with stats_lock:
                         stats["now"] += 1
                         stats["peak"] = max(stats["peak"], stats["now"])
@@ -2917,10 +2990,23 @@ def _lab_cells_part_1() -> list[NotebookNode]:
             def peak_in_flight(url_count: int, max_workers: int) -> int:
                 """Download url_count files and return the peak number of concurrent requests."""
                 client, stats = lab_client()
-                download_all(client, [f"http://lab.test/files/{n}" for n in range(url_count)], max_workers)
+                download_all(
+                    client,
+                    [f"http://lab.test/files/{file_number}" for file_number in range(url_count)],
+                    max_workers,
+                )
                 return stats["peak"]
-
-
+            '''
+        ),
+        md(
+            """
+            The checks: byte counts per URL, errors turned into class names, the concurrency
+            cap (more than one request in flight, never more than `max_workers`), and the
+            required `ThreadPoolExecutor` + `as_completed`:
+            """
+        ),
+        code(
+            """
             FILE_URLS = ["http://lab.test/files/10", "http://lab.test/files/2048"]
             BAD_URLS = ["http://lab.test/missing", "http://lab.test/broken"]
             run_checks(
@@ -2948,7 +3034,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     ),
                 ]
             )
-            '''
+            """
         ),
     ]
 
@@ -2978,10 +3064,12 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 """At most `size` connections in use; idle connections are reused."""
 
                 def __init__(self, size: int, connect: Callable[[], object]) -> None:
+                    """Prepare the semaphore, the idle list and the counters."""
                     raise NotImplementedError
 
                 @contextmanager
                 def connection(self) -> Iterator[object]:
+                    """Lend a connection for the duration of a with block."""
                     raise NotImplementedError
                     yield  # (makes this a generator; remove when you implement it)
             '''
@@ -3000,6 +3088,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 pool = make_pool(size)
 
                 def use(_: object) -> None:
+                    """Hold one pooled connection for 20 ms."""
                     with pool.connection():
                         time.sleep(0.02)
 
@@ -3027,8 +3116,17 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     pass
                 with pool.connection() as connection:  # would block forever if the slot leaked
                     return pool.in_use, connection
-
-
+            '''
+        ),
+        md(
+            """
+            The checks: 12 users through a pool of 3 never see more than 3 connections,
+            sequential users reuse one connection, an exception still returns it, and the cap
+            is a `BoundedSemaphore`:
+            """
+        ),
+        code(
+            """
             run_checks(
                 [
                     (
@@ -3048,7 +3146,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     ),
                 ]
             )
-            '''
+            """
         ),
         md(
             """
@@ -3094,15 +3192,18 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 """A lock that records the account id each time it is acquired."""
 
                 def __init__(self, account_id: int, log: list[int]) -> None:
+                    """Wrap a real lock that logs account_id on every acquire."""
                     self._lock, self._account_id, self._log = threading.Lock(), account_id, log
 
                 def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+                    """Acquire the wrapped lock and log the account id on success."""
                     acquired = self._lock.acquire(blocking, timeout)
                     if acquired:
                         self._log.append(self._account_id)
                     return acquired
 
                 def release(self) -> None:
+                    """Release the wrapped lock."""
                     self._lock.release()
 
 
@@ -3113,8 +3214,16 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 second = Account(2, 50, lock=RecordingLock(2, log))
                 transfer_ordered(second, first, 5, pause=lambda: None)
                 return log
-
-
+            '''
+        ),
+        md(
+            """
+            The checks: the naive version deadlocks, the ordered version completes both
+            transfers with the right balances, and it locks the lower `account_id` first:
+            """
+        ),
+        code(
+            """
             run_checks(
                 [
                     (
@@ -3135,7 +3244,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     ("lower account_id is locked first", lock_order_used, [1, 2]),
                 ]
             )
-            '''
+            """
         ),
         md(
             """
@@ -3187,8 +3296,16 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 result = default_build_scaling()
                 expected = 4 * result["one_thread_seconds"] / result["all_threads_seconds"]
                 return math.isclose(result["speedup"], expected, rel_tol=1e-6)
-
-
+            '''
+        ),
+        md(
+            """
+            The checks: the four keys, the GIL flag of this kernel, the speedup formula, the
+            one loose sanity bound for the default build, and the GIL flag of 3.15t:
+            """
+        ),
+        code(
+            """
             run_checks(
                 [
                     (
@@ -3210,7 +3327,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     ("3.15t reports the GIL disabled", free_threaded_reports_no_gil, True),
                 ]
             )
-            '''
+            """
         ),
         md(
             """

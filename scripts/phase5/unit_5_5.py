@@ -76,15 +76,18 @@ class Timer:
     """Timing context manager (shared since Unit 1.14): reports on exit, keeps elapsed_seconds."""
 
     def __init__(self, label: str, report: Callable[[str], None] | None = print) -> None:
+        """Remember the label and where to report the elapsed time."""
         self.label = label
         self.report = report
         self.elapsed_seconds = 0.0
 
     def __enter__(self) -> Timer:
+        """Start the clock."""
         self._start = time.perf_counter()
         return self
 
     def __exit__(self, *exc_info: object) -> None:
+        """Stop the clock and report the elapsed milliseconds."""
         self.elapsed_seconds = time.perf_counter() - self._start
         if self.report is not None:
             self.report(f"{self.label} took {self.elapsed_seconds * 1000:.2f} ms")
@@ -312,7 +315,7 @@ def _method_cells() -> list[NotebookNode]:
                 f"{'part 10x':>8} | {'part infinitely fast':>20}"
             )
             for fraction in (0.05, 0.25, 0.50, 0.90, 0.99):
-                speedups = [overall_speedup(fraction, s) for s in (2, 10, math.inf)]
+                speedups = [overall_speedup(fraction, part_speedup) for part_speedup in (2, 10, math.inf)]
                 print(
                     f"{fraction:>17.0%} | {speedups[0]:>13.2f}x | {speedups[1]:>7.2f}x | {speedups[2]:>19.2f}x"
                 )
@@ -657,6 +660,17 @@ def _cpu_profiling_cells() -> list[NotebookNode]:
                     (customers[(number * 7919) % len(customers)][0], (number * 104729) % 50_000 + 100)
                     for number in range(count)
                 ]
+            '''
+        ),
+        md(
+            """
+            Hot spot 1 and the function that calls it. `%%writefile -a` appends to the same
+            file, so the script is still one module with the same line numbers:
+            """
+        ),
+        code(
+            '''
+            %%writefile -a _scratch/phase5/profile_target.py
 
 
             def find_city(customers: list[tuple[int, str]], customer_id: int) -> str:
@@ -674,6 +688,16 @@ def _cpu_profiling_cells() -> list[NotebookNode]:
                     city = find_city(customers, customer_id)
                     totals[city] = totals.get(city, 0) + amount
                 return totals
+            '''
+        ),
+        md(
+            """
+            Hot spots 2 and 3 and the entry point, appended in the same way:
+            """
+        ),
+        code(
+            '''
+            %%writefile -a _scratch/phase5/profile_target.py
 
 
             def render_lines(orders: list[tuple[int, int]]) -> str:
@@ -1019,10 +1043,15 @@ def _cpu_profiling_cells() -> list[NotebookNode]:
                 lines: list[str] = []
 
                 def draw(path: tuple[str, ...]) -> None:
+                    """Append one bar for path, then recurse into its children."""
                     share = totals[path] / grand_total
                     label = "  " * (len(path) - 1) + path[-1]
                     lines.append(f"{label:<34} {'█' * round(share * width):<{width}} {share:6.1%}")
-                    children = [p for p in totals if len(p) == len(path) + 1 and p[:-1] == path]
+                    children = [
+                        child_path
+                        for child_path in totals
+                        if len(child_path) == len(path) + 1 and child_path[:-1] == path
+                    ]
                     for child in sorted(children, key=totals.__getitem__, reverse=True):
                         if totals[child] / grand_total >= min_share:
                             draw(child)
@@ -1336,20 +1365,20 @@ def _memory_profiling_cells() -> list[NotebookNode]:
             phase_rows = memory_target.load_rows(50_000 * DEMO_SCALE)
             print(
                 "after load_rows:   current {:5.1f} MiB  peak {:5.1f} MiB".format(
-                    *(v / 2**20 for v in tracemalloc.get_traced_memory())
+                    *(byte_count / 2**20 for byte_count in tracemalloc.get_traced_memory())
                 )
             )
             tracemalloc.reset_peak()
             phase_totals = memory_target.summarize(phase_rows)
             print(
                 "summarize only:    current {:5.1f} MiB  peak {:5.1f} MiB".format(
-                    *(v / 2**20 for v in tracemalloc.get_traced_memory())
+                    *(byte_count / 2**20 for byte_count in tracemalloc.get_traced_memory())
                 )
             )
             del phase_rows
             print(
                 "after del rows:    current {:5.1f} MiB  peak {:5.1f} MiB".format(
-                    *(v / 2**20 for v in tracemalloc.get_traced_memory())
+                    *(byte_count / 2**20 for byte_count in tracemalloc.get_traced_memory())
                 )
             )
             tracemalloc.stop()
@@ -1582,7 +1611,7 @@ def _algorithmic_cells() -> list[NotebookNode]:
             "Membership tests show the same gap, and `list.pop(0)` vs `deque.popleft()` shows the cost of shifting:"
         ),
         code(
-            """
+            '''
             blocked_ids = list(range(0, 200_000, 3))
             blocked_set = set(blocked_ids)
             queries = range(1_000)
@@ -1592,12 +1621,14 @@ def _algorithmic_cells() -> list[NotebookNode]:
 
 
             def drain_list(count: int) -> None:
+                """Empty a list from the front (each pop(0) shifts the rest)."""
                 items = list(range(count))
                 while items:
                     items.pop(0)  # shifts every remaining element
 
 
             def drain_deque(count: int) -> None:
+                """Empty a deque from the front (each popleft is O(1))."""
                 items = deque(range(count))
                 while items:
                     items.popleft()
@@ -1608,7 +1639,7 @@ def _algorithmic_cells() -> list[NotebookNode]:
                 f"list {best_seconds(lambda: drain_list(50_000), number=1) * 1000:.1f} ms, "
                 f"deque {best_seconds(lambda: drain_deque(50_000), number=1) * 1000:.1f} ms"
             )
-            """
+            '''
         ),
         md(
             """
@@ -1650,7 +1681,7 @@ def _algorithmic_cells() -> list[NotebookNode]:
                 timings = []
                 for size in (2_000, 4_000):
                     order_ids = [id_rng.randrange(size * 10) for _ in range(size)]
-                    timings.append(best_seconds(lambda f=finder, ids=order_ids: f(ids), number=1))
+                    timings.append(best_seconds(lambda find=finder, ids=order_ids: find(ids), number=1))
                 print(
                     f"{label:<9} n=2000: {timings[0] * 1000:7.2f} ms  n=4000: {timings[1] * 1000:7.2f} ms  "
                     f"growth x{timings[1] / timings[0]:.1f}"
@@ -1748,7 +1779,9 @@ def _algorithmic_cells() -> list[NotebookNode]:
         ),
         code(
             """
-            price_list = sorted((sale_rng.randrange(1_000_000), f"SKU-{n}") for n in range(200_000))
+            price_list = sorted(
+                (sale_rng.randrange(1_000_000), f"SKU-{sku_number}") for sku_number in range(200_000)
+            )
             target_price = price_list[150_000][0]
             by_bisect = price_list[bisect.bisect_left(price_list, target_price, key=lambda item: item[0])]
             by_scan = next(item for item in price_list if item[0] >= target_price)
@@ -1868,7 +1901,7 @@ def _interpreter_cells() -> list[NotebookNode]:
                 return result
 
 
-            float_values = [float(n) for n in range(10_000)]
+            float_values = [float(number) for number in range(10_000)]
             compare_variants(
                 "10 000 square roots",
                 {
@@ -1888,12 +1921,14 @@ def _interpreter_cells() -> list[NotebookNode]:
             for function in (roots_global, roots_local):
                 source_lines, first_line = inspect.getsourcelines(function)
                 body_line = first_line + next(
-                    n for n, line in enumerate(source_lines) if "append(" in line and "=" not in line
+                    line_number
+                    for line_number, line in enumerate(source_lines)
+                    if "append(" in line and "=" not in line
                 )
                 body_ops = [
-                    i.opname
-                    for i in dis.get_instructions(function)
-                    if i.positions and i.positions.lineno == body_line
+                    instruction.opname
+                    for instruction in dis.get_instructions(function)
+                    if instruction.positions and instruction.positions.lineno == body_line
                 ]
                 print(f"{function.__name__:<13} loop body: {' '.join(body_ops)}")
             """
@@ -1948,11 +1983,12 @@ def _interpreter_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
-            pieces = [f"line {n}\\n" for n in range(20_000)]
+            '''
+            pieces = [f"line {line_number}\\n" for line_number in range(20_000)]
 
 
             def concat_plus(parts: list[str]) -> str:
+                """Join with += on a string that has no other reference."""
                 text = ""
                 for part in parts:
                     text += part  # in-place resize when `text` has no other reference
@@ -1960,6 +1996,7 @@ def _interpreter_cells() -> list[NotebookNode]:
 
 
             def concat_plus_shared(parts: list[str]) -> str:
+                """Join with += while keeping old strings alive (full copies)."""
                 text, history = "", []
                 for part in parts[:5_000]:
                     history.append(text)  # a second reference defeats the shortcut: full copy each time
@@ -1976,7 +2013,7 @@ def _interpreter_cells() -> list[NotebookNode]:
                 },
                 number=10,
             )
-            """
+            '''
         ),
         md(
             """
@@ -1992,8 +2029,9 @@ def _interpreter_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             def squares_loop(count: int) -> list[int]:
+                """Build the squares with append in a loop."""
                 result = []
                 for number in range(count):
                     result.append(number * number)
@@ -2001,6 +2039,7 @@ def _interpreter_cells() -> list[NotebookNode]:
 
 
             def squares_comprehension(count: int) -> list[int]:
+                """Build the squares with a list comprehension."""
                 return [number * number for number in range(count)]
 
 
@@ -2016,7 +2055,7 @@ def _interpreter_cells() -> list[NotebookNode]:
                 for instruction in dis.get_instructions(squares_comprehension)
             )
             print("comprehension compiled inline (no hidden function object):", not makes_function)
-            """
+            '''
         ),
         md(
             """
@@ -2029,11 +2068,12 @@ def _interpreter_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
-            stock = {f"SKU-{n}": n for n in range(1_000)}
+            '''
+            stock = {f"SKU-{sku_number}": sku_number for sku_number in range(1_000)}
 
 
             def count_with_try(skus: list[str]) -> int:
+                """Sum stock with try/except for missing SKUs."""
                 total = 0
                 for sku in skus:
                     try:
@@ -2044,17 +2084,18 @@ def _interpreter_cells() -> list[NotebookNode]:
 
 
             def count_with_get(skus: list[str]) -> int:
+                """Sum stock with dict.get for missing SKUs."""
                 total = 0
                 for sku in skus:
                     total += stock.get(sku, 0)
                 return total
-            """
+            '''
         ),
         md("Two workloads: every key present, and half the keys missing:"),
         code(
             """
-            all_hits = [f"SKU-{n % 1_000}" for n in range(10_000)]
-            half_misses = [f"SKU-{n % 2_000}" for n in range(10_000)]
+            all_hits = [f"SKU-{lookup_number % 1_000}" for lookup_number in range(10_000)]
+            half_misses = [f"SKU-{lookup_number % 2_000}" for lookup_number in range(10_000)]
             compare_variants(
                 "all keys present",
                 {
@@ -2101,15 +2142,15 @@ def _interpreter_cells() -> list[NotebookNode]:
                     fresh(values)
                 return sorted(
                     {
-                        i.opname
-                        for i in dis.get_instructions(fresh, adaptive=True)
-                        if i.opname.startswith("BINARY_OP")
+                        instruction.opname
+                        for instruction in dis.get_instructions(fresh, adaptive=True)
+                        if instruction.opname.startswith("BINARY_OP")
                     }
                 )
 
 
             print("ints only:   ", specialized_adds(list(range(1_000))))
-            print("floats only: ", specialized_adds([n / 2 for n in range(1_000)]))
+            print("floats only: ", specialized_adds([number / 2 for number in range(1_000)]))
             '''
         ),
         md(
@@ -2132,6 +2173,7 @@ def _interpreter_cells() -> list[NotebookNode]:
                 """`count` distinct classes whose instances all have a `price` attribute."""
 
                 def __init__(self: object, price: int) -> None:
+                    """Store the price."""
                     self.price = price
 
                 return [type(f"Item{number}", (), {"__init__": __init__}) for number in range(count)]
@@ -2146,8 +2188,8 @@ def _interpreter_cells() -> list[NotebookNode]:
 
 
             one_class, four_classes = make_item_classes(1), make_item_classes(4)
-            same_shape = [one_class[0](n) for n in range(100_000)]
-            mixed_shapes = [four_classes[n % 4](n) for n in range(100_000)]
+            same_shape = [one_class[0](index) for index in range(100_000)]
+            mixed_shapes = [four_classes[index % 4](index) for index in range(100_000)]
             compare_variants(
                 "total_price over 100 000 objects",
                 {
@@ -2207,24 +2249,32 @@ def _memory_lean_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             class PlainReading:
+                """A reading with a per-instance __dict__."""
+
                 def __init__(self, sensor_id: int, value: float) -> None:
+                    """Store the sensor id and value."""
                     self.sensor_id, self.value = sensor_id, value
 
 
             class SlottedReading:
+                """A reading with __slots__ (no per-instance __dict__)."""
+
                 __slots__ = ("sensor_id", "value")
 
                 def __init__(self, sensor_id: int, value: float) -> None:
+                    """Store the sensor id and value."""
                     self.sensor_id, self.value = sensor_id, value
 
 
             @dataclass(slots=True)
             class DataclassReading:
+                """A reading as a slotted dataclass."""
+
                 sensor_id: int
                 value: float
-            """
+            '''
         ),
         md("100 000 instances of each, plus the bare tuple:"),
         code(
@@ -2237,7 +2287,9 @@ def _memory_lean_cells() -> list[NotebookNode]:
                 ("tuple", lambda *fields: fields),
             ):
                 _, kept = retained_bytes(
-                    lambda make=record_type: [make(n, n * 0.5) for n in range(reading_count)]
+                    lambda make=record_type: [
+                        make(reading_number, reading_number * 0.5) for reading_number in range(reading_count)
+                    ]
                 )
                 print(
                     f"{label:<22} {kept / reading_count:6.1f} bytes per record "
@@ -2262,9 +2314,9 @@ def _memory_lean_cells() -> list[NotebookNode]:
         code(
             """
             int_count = 200_000 * DEMO_SCALE
-            int_list, list_bytes = retained_bytes(lambda: [n * 1_000 for n in range(int_count)])
+            int_list, list_bytes = retained_bytes(lambda: [number * 1_000 for number in range(int_count)])
             int_array, array_bytes = retained_bytes(
-                lambda: array.array("q", (n * 1_000 for n in range(int_count)))
+                lambda: array.array("q", (number * 1_000 for number in range(int_count)))
             )
             print(f"list of ints : {list_bytes / int_count:5.1f} bytes per item")
             print(
@@ -2323,13 +2375,23 @@ def _memory_lean_cells() -> list[NotebookNode]:
 
 
             line_count = 300_000 * DEMO_SCALE
-            list_peak = peak_during(lambda: sum([len(f"order {n},Pune,{n % 997}") for n in range(line_count)]))
+            list_peak = peak_during(
+                lambda: sum(
+                    [
+                        len(f"order {order_number},Pune,{order_number % 997}")
+                        for order_number in range(line_count)
+                    ]
+                )
+            )
             generator_peak = peak_during(
-                lambda: sum(len(f"order {n},Pune,{n % 997}") for n in range(line_count))
+                lambda: sum(
+                    len(f"order {order_number},Pune,{order_number % 997}") for order_number in range(line_count)
+                )
             )
             print(f"sum over a list comprehension: peak {list_peak / 2**20:7.2f} MiB")
             print(f"sum over a generator:          peak {generator_peak / 2**20:7.2f} MiB")
-            print(f"generator object itself: {sys.getsizeof(n for n in range(line_count))} bytes")
+            generator_bytes = sys.getsizeof(order_number for order_number in range(line_count))
+            print(f"generator object itself: {generator_bytes} bytes")
             '''
         ),
         md(
@@ -2346,8 +2408,9 @@ def _memory_lean_cells() -> list[NotebookNode]:
         code(
             """
             csv_lines = [
-                f"{n},{('Pune', 'Delhi', 'Kochi', 'Patna', 'Surat')[n % 5]},{n % 997}"
-                for n in range(200_000 * DEMO_SCALE)
+                f"{row_number},{('Pune', 'Delhi', 'Kochi', 'Patna', 'Surat')[row_number % 5]},"
+                f"{row_number % 997}"
+                for row_number in range(200_000 * DEMO_SCALE)
             ]
             plain_cities, plain_bytes = retained_bytes(lambda: [line.split(",")[1] for line in csv_lines])
             interned_cities, interned_bytes = retained_bytes(
@@ -2407,6 +2470,7 @@ def _caching_cells() -> list[NotebookNode]:
 
                 @functools.lru_cache(maxsize=maxsize)
                 def load_product(product_id: int) -> str:
+                    """Pretend to load a product from the database."""
                     return f"product {product_id}"
 
                 for product_id in requests:
@@ -2440,7 +2504,7 @@ def _caching_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             if has_module("cachetools"):
                 import cachetools
 
@@ -2450,6 +2514,7 @@ def _caching_cells() -> list[NotebookNode]:
 
                 @cachetools.cached(rate_cache)
                 def exchange_rate(currency: str) -> float:
+                    """Record the upstream call and return the rate."""
                     upstream_calls.append((fake_now[0], currency))
                     return {"USD": 83.25, "EUR": 90.10}[currency]
 
@@ -2462,7 +2527,7 @@ def _caching_cells() -> list[NotebookNode]:
                 )
             else:
                 print("cachetools is not installed: skipping.")
-            """
+            '''
         ),
         md(
             """
@@ -2535,11 +2600,15 @@ def _caching_cells() -> list[NotebookNode]:
 
 
             class Basket:
+                """A basket whose total is computed once and cached."""
+
                 def __init__(self, prices: list[int]) -> None:
+                    """Store the prices."""
                     self.prices = prices
 
                 @functools.cached_property
                 def total(self) -> int:
+                    """Sum the prices (computed on first access, then cached)."""
                     return sum(self.prices)
 
 
@@ -2586,7 +2655,7 @@ def _vectorization_cells() -> list[NotebookNode]:
                 import numpy as np
 
                 element_count = 1_000_000 * DEMO_SCALE
-                amounts_list = [n % 50_000 for n in range(element_count)]
+                amounts_list = [number % 50_000 for number in range(element_count)]
                 amounts_array = np.array(amounts_list, dtype=np.int64)
                 print(
                     f"dtype={amounts_array.dtype}, shape={amounts_array.shape}, nbytes={amounts_array.nbytes:,}"
@@ -2711,7 +2780,7 @@ def _vectorization_cells() -> list[NotebookNode]:
             """
         ),
         code(
-            """
+            '''
             frame_rng = random.Random(42)
             frame_size = 500_000 * DEMO_SCALE
             frame_cities = [
@@ -2721,6 +2790,7 @@ def _vectorization_cells() -> list[NotebookNode]:
 
 
             def python_group_sum() -> dict[str, int]:
+                """Group-by sum in plain Python, for reference."""
                 totals: dict[str, int] = {}
                 for city, amount in zip(frame_cities, frame_amounts, strict=True):
                     totals[city] = totals.get(city, 0) + amount
@@ -2730,13 +2800,13 @@ def _vectorization_cells() -> list[NotebookNode]:
             print(
                 f"{frame_size:,} rows; plain Python: {best_seconds(python_group_sum, number=1) * 1000:.0f} ms"
             )
-            """
+            '''
         ),
         md(
             "pandas and Polars, eager and lazy; each result is checked against the plain-Python one:"
         ),
         code(
-            """
+            '''
             expected_totals = python_group_sum()
             if HAS_PANDAS:
                 import pandas as pd
@@ -2754,9 +2824,11 @@ def _vectorization_cells() -> list[NotebookNode]:
                 sales_pl = pl.DataFrame({"city": frame_cities, "amount": frame_amounts})
 
                 def eager_query() -> pl.DataFrame:
+                    """Polars eager group-by."""
                     return sales_pl.group_by("city").agg(pl.col("amount").sum())
 
                 def lazy_query() -> pl.DataFrame:
+                    """Polars lazy group-by, collected."""
                     return sales_pl.lazy().group_by("city").agg(pl.col("amount").sum()).collect()
 
                 polars_totals = dict(eager_query().sort("city").iter_rows())
@@ -2768,7 +2840,7 @@ def _vectorization_cells() -> list[NotebookNode]:
                     )
             if not (HAS_PANDAS or HAS_POLARS):
                 print("neither pandas nor Polars is installed: skipping.")
-            """
+            '''
         ),
         md(
             """
@@ -3162,27 +3234,42 @@ def _free_threading_jit_cells() -> list[NotebookNode]:
             import sysconfig
             import threading
             import time
+            from collections.abc import Callable
 
             LOOPS = 2_000_000 * int(os.environ.get("PHASE5_DEMO_SCALE", "1"))
 
 
             def busy(loops: int) -> int:
+                """The CPU-bound work: a pure-Python arithmetic loop."""
                 total = 0
                 for index in range(loops):
                     total += (index % 7) * (index % 11)
                 return total
 
 
-            def best_of(runs: int, work) -> float:
+            def best_of(runs: int, work: Callable[[], object]) -> float:
+                """Fastest wall time of work() over runs attempts."""
                 timings = []
                 for _ in range(runs):
                     start = time.perf_counter()
                     work()
                     timings.append(time.perf_counter() - start)
                 return min(timings)
+            '''
+        ),
+        md(
+            """
+            The second half (appended to the same file) starts four threads on the same
+            loop and prints one JSON line with the build's flags and both timings:
+            """
+        ),
+        code(
+            '''
+            %%writefile -a _scratch/phase5/p5_build_benchmark.py
 
 
             def four_threads() -> None:
+                """Run busy(LOOPS) on four threads at once and wait for all of them."""
                 threads = [threading.Thread(target=busy, args=(LOOPS,)) for _ in range(4)]
                 for thread in threads:
                     thread.start()
@@ -3294,11 +3381,13 @@ def _production_cells() -> list[NotebookNode]:
 
 
             def handle_request(request_number: int) -> dict[str, int]:
+                """Handle one fake request: build orders and total them."""
                 orders = profile_target.make_orders(500, CUSTOMERS)
                 return profile_target.city_totals(orders, CUSTOMERS)
 
 
             def serve_forever() -> None:
+                """Handle requests forever, pausing 1 ms between them."""
                 request_number = 0
                 while True:
                     handle_request(request_number)
@@ -3334,7 +3423,9 @@ def _production_cells() -> list[NotebookNode]:
             One dump is a single sample, but it is often enough: a process that is "stuck"
             shows the line it is stuck on. `py-spy record --pid PID --duration 10` and
             `py-spy top --pid PID` sample over time. Tachyon does the same with `attach`
-            (*New in 3.15*), here for one second:
+            (*New in 3.15*), here for one second. In its header, *Error rate* is the share of
+            samples it failed to take (for example, a stack read while the process was
+            changing it), not a failure of the program being profiled:
             """
         ),
         code(
@@ -3490,10 +3581,12 @@ def _production_cells() -> list[NotebookNode]:
 
 
             def test_same_result() -> None:
+                """The dict version gives the same totals."""
                 assert city_totals_dict(ORDERS, CUSTOMERS) == profile_target.city_totals(ORDERS, CUSTOMERS)
 
 
             def test_dict_version_is_much_faster() -> None:
+                """The dict version is far faster, measured in the same run."""
                 slow = min(timeit.repeat(lambda: profile_target.city_totals(ORDERS, CUSTOMERS), number=1, repeat=3))
                 fast = min(timeit.repeat(lambda: city_totals_dict(ORDERS, CUSTOMERS), number=1, repeat=3))
                 print(f"ratio {slow / fast:.0f}x")
@@ -3623,7 +3716,10 @@ def make_lab_customers(count: int = 1_200, seed: int = 55) -> list[tuple[int, st
     """(customer_id, name, city) with shuffled, spread-out ids."""
     rng = random.Random(seed)
     customer_ids = rng.sample(range(10_000, 99_999), count)
-    return [(cid, f"Customer {n}", LAB55_CITIES[n % 6]) for n, cid in enumerate(customer_ids)]
+    return [
+        (customer_id, f"Customer {position}", LAB55_CITIES[position % 6])
+        for position, customer_id in enumerate(customer_ids)
+    ]
 
 
 def make_lab_orders(
@@ -3637,6 +3733,10 @@ def make_lab_orders(
     ]
 
 
+print("Lab 5.5 generators ready: make_lab_customers, make_lab_orders")
+'''
+
+LAB_DATA_SOURCE = r'''
 def write_events(path: Path, count: int, seed: int = 57) -> Path:
     """Write a seeded CSV event log: timestamp,user_id,event,bytes."""
     rng = random.Random(seed)
@@ -3705,10 +3805,18 @@ def _lab_cells_part_1() -> list[NotebookNode]:
             a large margin against a much larger real gap and print the measured ratio; memory
             checks are exact properties of the code, not of the machine.
 
-            The setup cell creates the lab data (seeded) under `notebooks/_scratch/phase5/lab55/`:
+            The first setup cell defines the seeded customer and order generators:
             """
         ),
         code(LAB_SETUP_SOURCE),
+        md(
+            """
+            The second writes the event log for exercise 5, creates the lab data under
+            `notebooks/_scratch/phase5/lab55/`, and defines `best_time_or_none` (a timing that
+            returns `None` instead of raising while a stub is unfinished):
+            """
+        ),
+        code(LAB_DATA_SOURCE),
         md(
             """
             #### Exercise 1 — Profile and fix a slow function
@@ -3815,7 +3923,9 @@ def _lab_cells_part_1() -> list[NotebookNode]:
             def growth_factor(count_pairs: Callable[[list[int], int], int], size: int) -> float | None:
                 """Best time at 4 x size divided by best time at size (about 4 for O(n), 16 for O(n^2))."""
                 rng = random.Random(58)
-                small, large = ([rng.randrange(1_000) for _ in range(n)] for n in (size, 4 * size))
+                small, large = (
+                    [rng.randrange(1_000) for _ in range(list_size)] for list_size in (size, 4 * size)
+                )
                 small_time = best_time_or_none(lambda: count_pairs(small, 1_000))
                 large_time = best_time_or_none(lambda: count_pairs(large, 1_000))
                 return None if small_time is None or large_time is None else large_time / small_time
@@ -3848,7 +3958,7 @@ def _lab_cells_part_1() -> list[NotebookNode]:
                     *(
                         (
                             f"pairs in {amounts} summing to {target}",
-                            lambda a=amounts, t=target: count_pairs_linear(a, t),
+                            lambda amounts=amounts, target=target: count_pairs_linear(amounts, target),
                             count_pairs_quadratic(amounts, target),
                         )
                         for amounts, target in pair_cases
@@ -3938,6 +4048,21 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                         lambda: render_timing_table([("a", 0.5e-6), ("b", 1.5e-3)]).splitlines()[-1],
                         "| b | 1,500.00 µs | 3000.00x |",
                     ),
+                ]
+            )
+            """
+        ),
+        md(
+            """
+            The `timing_table` checks: rows sorted fastest first, and times reported per call
+            (a 2 ms sleep must come out between 2 ms and 200 ms, not ×3 for `number=3`; the
+            upper bound is generous so a busy machine cannot fail it):
+            """
+        ),
+        code(
+            """
+            run_checks(
+                [
                     (
                         "sorted fastest first",
                         lambda: [
@@ -3953,7 +4078,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                         lambda: (
                             0.002
                             <= timing_table({"sleep": lambda: time.sleep(0.002)}, number=3, repeat=2)[0][1]
-                            < 0.05
+                            < 0.2
                         ),
                         True,
                     ),
@@ -3965,11 +4090,12 @@ def _lab_cells_part_2() -> list[NotebookNode]:
             "Once it passes, your functions produce a real table for four ways to build a CSV line:"
         ),
         code(
-            """
-            csv_fields = [str(n) for n in range(30)]
+            '''
+            csv_fields = [str(column_number) for column_number in range(30)]
 
 
             def csv_line_plus() -> str:
+                """Build the CSV line with += (the slow variant)."""
                 line = ""
                 for csv_field in csv_fields:
                     line += csv_field + ","
@@ -3986,7 +4112,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 print(render_timing_table(timing_table(csv_candidates, number=2_000)))
             except NotImplementedError:
                 print("finish exercise 3 to see the table")
-            """
+            '''
         ),
         md(
             """
@@ -4047,6 +4173,16 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 np.array(amount_list),
                 np.array(value_list),
             )
+            """
+        ),
+        md(
+            """
+            The expected result comes from the given loop; both versions are timed once here,
+            then the revenue checks (exact values, `int64`, zeros for stores without sales):
+            """
+        ),
+        code(
+            """
             expected_revenue = revenue_by_store_loop(store_id_list, amount_list, 50)
             loop_seconds = best_time_or_none(lambda: revenue_by_store_loop(store_id_list, amount_list, 50))
             numpy_seconds = best_time_or_none(lambda: revenue_by_store_numpy(store_id_array, amount_array, 50))
@@ -4067,6 +4203,20 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                         lambda: revenue_by_store_numpy(store_id_array, amount_array, 50)[45:].tolist(),
                         [0] * 5,
                     ),
+                ]
+            )
+            """
+        ),
+        md(
+            """
+            The z-score checks, then the one speed check (with a wide margin) and the measured
+            ratio:
+            """
+        ),
+        code(
+            """
+            run_checks(
+                [
                     (
                         "z-scores match the loop",
                         lambda: bool(np.allclose(zscores_numpy(value_array), zscores_loop(value_list))),
@@ -4074,7 +4224,10 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     ),
                     (
                         "z-scores have mean 0 and std 1",
-                        lambda: [round(float(f(zscores_numpy(value_array))), 6) for f in (np.mean, np.std)],
+                        lambda: [
+                            round(float(statistic(zscores_numpy(value_array))), 6)
+                            for statistic in (np.mean, np.std)
+                        ],
                         [0.0, 1.0],
                     ),
                     (
@@ -4155,8 +4308,16 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                     peak_memory(event_summary_eager, LAB55_EVENTS)[1]
                     / peak_memory(event_summary_lean, LAB55_EVENTS)[1]
                 )
-
-
+            '''
+        ),
+        md(
+            """
+            The checks: `peak_memory` returns the result, sees a 5 MB temporary, stops only its
+            own trace, and the lean summary gives the same result with at least 5× lower peak:
+            """
+        ),
+        code(
+            """
             run_checks(
                 [
                     ("peak_memory returns the result", lambda: peak_memory(len, "chai")[0], 4),
@@ -4183,7 +4344,7 @@ def _lab_cells_part_2() -> list[NotebookNode]:
                 print(f"measured peak ratio eager/lean: {peak_ratio():.0f}x")
             except NotImplementedError:
                 pass
-            '''
+            """
         ),
     ]
 
