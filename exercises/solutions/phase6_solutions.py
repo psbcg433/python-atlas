@@ -3,7 +3,7 @@
 Run from the repository root:
 
     uv run python exercises/solutions/phase6_solutions.py            # every lab
-    uv run python exercises/solutions/phase6_solutions.py "Lab 6.1"  # one lab
+    uv run python exercises/solutions/phase6_solutions.py "Lab 6.3"  # one lab
 
 Each check_lab_6_N() repeats the notebook's check cells, so the notebook and this file test the
 same things. Each solution sits between ``# >>> Lab 6.N exercise K`` and ``# <<<`` markers, so a
@@ -12,36 +12,90 @@ harness can paste it into the notebook's stub cell. Every server in these checks
 """
 
 import asyncio
+import base64
+import binascii
 import contextlib
+import contextvars
 import dataclasses
 import http.client
 import inspect
 import json
+import os
+import random
 import re
+import secrets
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 import wsgiref.util
-from collections.abc import Awaitable, Callable, Iterable, Iterator
-from datetime import UTC, date, datetime
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 from http import HTTPStatus
+from pathlib import Path
 from typing import Annotated, Any, Literal
 from wsgiref.validate import validator
 
+import fastapi
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Response
+import sqlalchemy as sa
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response, UploadFile, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from fastapi.testclient import TestClient
 from pydantic import (
     BaseModel,
     ConfigDict,
     EmailStr,
     Field,
+    SecretStr,
     ValidationError,
     field_validator,
     model_validator,
 )
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import (
+    Column,
+    ForeignKey,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+    delete,
+    event,
+    func,
+    insert,
+    select,
+    text,
+    tuple_,
+    update,
+)
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.dialects import sqlite
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    raiseload,
+    relationship,
+    selectinload,
+    sessionmaker,
+)
+from sqlalchemy.orm.exc import StaleDataError
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope  # Send: the Lab 6.1 alias below
 
 type TestCase = tuple[str, Callable[[], object], object]
 
@@ -1591,9 +1645,1990 @@ def check_lab_6_2() -> None:
         check()
 
 
+# ----- Lab 6.3: helpers and the given code from the lab setup cells -----
+
+
+def raised_error_name(thunk: Callable[[], object]) -> str:
+    """Call thunk and return the name of the exception it raised, or "no error"."""
+    try:
+        thunk()
+    except Exception as error:
+        return type(error).__name__
+    return "no error"
+
+
+@contextlib.contextmanager
+def temporary_env(**variables: str) -> Iterator[None]:
+    """Set environment variables inside a with block and restore the old values afterwards."""
+    saved = {name: os.environ.get(name) for name in variables}
+    os.environ.update(variables)
+    try:
+        yield
+    finally:
+        for name, old_value in saved.items():
+            if old_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old_value
+
+
+class LabNoteIn(BaseModel):
+    """Body of POST /api/v1/notes in the lab app."""
+
+    title: str = Field(min_length=1, max_length=100)
+
+
+class LabNoteStore:
+    """In-memory notes: ids from 1; newest() lists the latest first."""
+
+    def __init__(self) -> None:
+        """Start empty."""
+        self.notes: list[dict[str, object]] = []
+
+    def add(self, title: str) -> dict[str, object]:
+        """Store a note and return it."""
+        note = {"id": len(self.notes) + 1, "title": title}
+        self.notes.append(note)
+        return note
+
+    def newest(self, limit: int) -> list[dict[str, object]]:
+        """At most limit notes, newest first."""
+        return list(reversed(self.notes))[:limit]
+
+
+lab_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "lab_request_id", default=None
+)
+
+
+class LoanError(Exception):
+    """Base of the library's domain errors."""
+
+    status_code = 400
+    problem_type = "loan-error"
+    title = "Loan rule violated"
+
+
+class BookNotFoundError(LoanError, LookupError):
+    """No book with this id."""
+
+    status_code, problem_type, title = 404, "book-not-found", "Book not found"
+
+
+class BookAlreadyLoanedError(LoanError):
+    """Somebody else has the book."""
+
+    status_code, problem_type, title = 409, "book-already-loaned", "Book already on loan"
+
+
+class Member(BaseModel):
+    """Body of POST /members."""
+
+    name: str = Field(min_length=1)
+    age: int = Field(ge=0)
+
+
+def build_library_app() -> FastAPI:
+    """Routes that raise a domain error, an HTTPException and validation errors."""
+    app = FastAPI()
+
+    @app.get("/books/{book_id}")
+    async def get_book(book_id: int) -> dict[str, object]:
+        """Only book 1 exists."""
+        if book_id != 1:
+            raise BookNotFoundError(f"book {book_id} not found")
+        return {"id": 1, "title": "Dune"}
+
+    @app.post("/loans/{book_id}")
+    async def loan_book(book_id: int) -> None:
+        """Every book is already on loan."""
+        raise BookAlreadyLoanedError(f"book {book_id} is already on loan")
+
+    @app.post("/members")
+    async def add_member(member: Member) -> Member:
+        """Validated body."""
+        return member
+
+    @app.get("/teapot")
+    async def teapot() -> None:
+        """An HTTPException with a header."""
+        raise HTTPException(418, "I refuse to brew coffee", headers={"X-Teapot": "yes"})
+
+    return app
+
+
+# ----- Lab 6.3: reference solutions -----
+
+
+# >>> Lab 6.3 exercise 1
+class LabSettings(BaseSettings):
+    """Settings for the lab Notes API."""
+
+    model_config = SettingsConfigDict(env_prefix="LAB_NOTES_", extra="ignore")
+
+    app_name: str = "Lab Notes"
+    api_key: SecretStr
+    page_size: int = Field(default=20, ge=1, le=100)
+    cors_origins: list[str] = []
+
+
+@lru_cache
+def get_lab_settings() -> LabSettings:
+    """The settings, read once per process."""
+    return LabSettings()  # api_key comes from the environment
+
+
+def get_lab_store(request: fastapi.Request) -> LabNoteStore:
+    """The store the lifespan created."""
+    return request.app.state.store
+
+
+@contextlib.asynccontextmanager
+async def lab_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """A fresh store for each app."""
+    app.state.store = LabNoteStore()
+    yield
+
+
+def create_lab_app(settings: LabSettings) -> FastAPI:
+    """A layered app with its own store."""
+    app = FastAPI(title=settings.app_name, lifespan=lab_lifespan)
+    app.state.settings = settings
+    router = APIRouter(prefix="/api/v1/notes", tags=["notes"])
+    store_dependency = Depends(get_lab_store)
+
+    @router.post("", status_code=status.HTTP_201_CREATED)
+    async def create_note(
+        note: LabNoteIn, store: LabNoteStore = store_dependency
+    ) -> dict[str, object]:
+        """Store a note."""
+        return store.add(note.title)
+
+    @router.get("")
+    async def list_notes(store: LabNoteStore = store_dependency) -> list[dict[str, object]]:
+        """The newest notes, at most page_size of them."""
+        return store.newest(settings.page_size)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        """Liveness probe."""
+        return {"status": "ok"}
+
+    app.include_router(router)
+    return app
+
+
+# <<< Lab 6.3 exercise 1
+
+
+# >>> Lab 6.3 exercise 2
+def build_admin_app(api_key: str) -> FastAPI:
+    """Public /health plus an /admin router guarded by an X-API-Key dependency."""
+    header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+    def require_admin_key(supplied: Annotated[str | None, Depends(header_scheme)]) -> None:
+        """401 without a key, 403 with a wrong one."""
+        if supplied is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing API key")
+        if not secrets.compare_digest(supplied.encode(), api_key.encode()):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid API key")
+
+    app = FastAPI()
+    admin_router = APIRouter(
+        prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin_key)]
+    )
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        """Open to everybody."""
+        return {"status": "ok"}
+
+    @admin_router.get("/stats")
+    async def stats() -> dict[str, int]:
+        """Guarded by the router dependency."""
+        return {"notes": 0}
+
+    @admin_router.delete("/cache")
+    async def clear_cache() -> dict[str, bool]:
+        """Guarded by the router dependency."""
+        return {"cleared": True}
+
+    app.include_router(admin_router)
+    return app
+
+
+# <<< Lab 6.3 exercise 2
+
+
+# >>> Lab 6.3 exercise 3
+LAB_VALID_REQUEST_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
+
+
+class LabRequestIdMiddleware:
+    """Pure ASGI request-id middleware."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Wrap the next app."""
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Choose the id, expose it in the context variable and the response header."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        incoming = Headers(scope=scope).get("x-request-id", "")
+        current = incoming if LAB_VALID_REQUEST_ID.fullmatch(incoming) else uuid.uuid4().hex
+        token = lab_request_id.set(current)
+
+        async def send_with_id(message: Message) -> None:
+            """Add the header to the response start message."""
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["X-Request-ID"] = current
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_id)
+        finally:
+            lab_request_id.reset(token)
+
+
+class LabTimingMiddleware:
+    """Pure ASGI Server-Timing middleware."""
+
+    def __init__(self, app: ASGIApp, clock: Callable[[], float] = time.perf_counter) -> None:
+        """Wrap the next app; clock is injectable."""
+        self.app = app
+        self.clock = clock
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Measure from the request to the response start."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = self.clock()
+
+        async def send_with_timing(message: Message) -> None:
+            """Add Server-Timing to the response start message."""
+            if message["type"] == "http.response.start":
+                elapsed_ms = (self.clock() - started) * 1000
+                MutableHeaders(scope=message)["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+            await send(message)
+
+        await self.app(scope, receive, send_with_timing)
+
+
+# <<< Lab 6.3 exercise 3
+
+
+# >>> Lab 6.3 exercise 4
+def install_problem_handlers(app: FastAPI) -> None:
+    """Register Problem Details handlers on app."""
+
+    def problem(
+        request: fastapi.Request,
+        status_code: int,
+        title: str,
+        detail: str,
+        problem_type: str = "about:blank",
+        headers: dict[str, str] | None = None,
+        **extra: object,
+    ) -> JSONResponse:
+        """An application/problem+json response."""
+        body = {
+            "type": problem_type,
+            "title": title,
+            "status": status_code,
+            "detail": detail,
+            "instance": request.url.path,
+            **extra,
+        }
+        return JSONResponse(
+            body, status_code=status_code, headers=headers, media_type="application/problem+json"
+        )
+
+    async def loan_error(request: fastapi.Request, error: LoanError) -> JSONResponse:
+        """Domain errors carry their own status, type and title."""
+        problem_type = f"/problems/{error.problem_type}"
+        return problem(request, error.status_code, error.title, str(error), problem_type)
+
+    async def http_error(request: fastapi.Request, error: StarletteHTTPException) -> JSONResponse:
+        """HTTPException: the standard phrase as the title; keep the headers."""
+        title = HTTPStatus(error.status_code).phrase
+        return problem(request, error.status_code, title, str(error.detail), headers=error.headers)
+
+    async def validation_error(
+        request: fastapi.Request, error: RequestValidationError
+    ) -> JSONResponse:
+        """422 with the list of problems, without the input."""
+        problems = [
+            {"loc": list(item["loc"]), "msg": item["msg"], "type": item["type"]}
+            for item in error.errors()
+        ]
+        detail = f"{len(problems)} validation error(s)"
+        return problem(
+            request, 422, "Invalid request", detail, "/problems/validation-error", errors=problems
+        )
+
+    app.add_exception_handler(LoanError, loan_error)
+    app.add_exception_handler(StarletteHTTPException, http_error)
+    app.add_exception_handler(RequestValidationError, validation_error)
+
+
+# <<< Lab 6.3 exercise 4
+
+
+# >>> Lab 6.3 exercise 5
+def build_weather_app(transport: httpx.AsyncBaseTransport) -> FastAPI:
+    """An app whose lifespan owns one upstream HTTP client."""
+
+    @contextlib.asynccontextmanager
+    async def weather_lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """One client for the app's whole life, closed on shutdown."""
+        async with httpx.AsyncClient(
+            base_url="https://weather.example", transport=transport, timeout=2.0
+        ) as client:
+            app.state.weather_client = client
+            yield
+
+    app = FastAPI(lifespan=weather_lifespan)
+
+    @app.get("/forecast/{city}")
+    async def forecast(city: str, request: fastapi.Request) -> dict[str, object]:
+        """Translate the upstream forecast and its failures."""
+        client: httpx.AsyncClient = request.app.state.weather_client
+        try:
+            upstream = await client.get("/v1/forecast", params={"city": city})
+        except httpx.TimeoutException as error:
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "weather service timed out"
+            ) from error
+        if upstream.status_code == 404:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown city {city}")
+        if upstream.status_code >= 500:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "weather service failed")
+        data = upstream.json()
+        return {"city": data["city"], "temperature": data["temp_c"], "summary": data["summary"]}
+
+    return app
+
+
+# <<< Lab 6.3 exercise 5
+
+
+# >>> Lab 6.3 exercise 6
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8\xff"
+
+
+def build_avatar_app(max_bytes: int) -> FastAPI:
+    """POST /avatars with size and content checks."""
+    app = FastAPI()
+
+    @app.post("/avatars", status_code=status.HTTP_201_CREATED)
+    async def upload_avatar(file: UploadFile) -> dict[str, object]:
+        """Accept a small PNG or JPEG, judged by its first bytes."""
+        content = await file.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise HTTPException(
+                status.HTTP_413_CONTENT_TOO_LARGE, f"avatar larger than {max_bytes} bytes"
+            )
+        if content.startswith(PNG_SIGNATURE):
+            kind = "png"
+        elif content.startswith(JPEG_SIGNATURE):
+            kind = "jpeg"
+        else:
+            raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "only PNG or JPEG images")
+        return {"filename": file.filename, "kind": kind, "bytes": len(content)}
+
+    return app
+
+
+def encode_event_cursor(at: str, event_id: int) -> str:
+    """Opaque cursor for the key (at, event_id)."""
+    raw = json.dumps([at, event_id], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_event_cursor(cursor: str) -> tuple[str, int]:
+    """The key inside a cursor, or ValueError."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        at, event_id = json.loads(raw)
+    except (binascii.Error, ValueError, TypeError) as error:
+        raise ValueError(f"invalid cursor {cursor!r}") from error
+    if not isinstance(at, str) or not isinstance(event_id, int):
+        raise ValueError(f"invalid cursor {cursor!r}")
+    return at, event_id
+
+
+def build_events_app(events: list[dict[str, object]]) -> FastAPI:
+    """GET /events with keyset pagination, newest first."""
+    app = FastAPI()
+
+    @app.get("/events")
+    async def list_events(
+        limit: Annotated[int, Query(ge=1, le=50)] = 10, cursor: str | None = None
+    ) -> dict[str, object]:
+        """Events strictly older than the cursor's (at, id) key."""
+        try:
+            after = decode_event_cursor(cursor) if cursor else None
+        except ValueError as error:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid cursor") from error
+        ordered = sorted(
+            events, key=lambda event: (str(event["at"]), int(event["id"])), reverse=True
+        )
+        older = [
+            event
+            for event in ordered
+            if after is None or (str(event["at"]), int(event["id"])) < after
+        ]
+        page = older[:limit]
+        more = len(older) > limit
+        next_cursor = (
+            encode_event_cursor(str(page[-1]["at"]), int(page[-1]["id"])) if more else None
+        )
+        return {"items": page, "next_cursor": next_cursor}
+
+    return app
+
+
+# <<< Lab 6.3 exercise 6
+
+
+# ----- Lab 6.3: the notebook's check cells -----
+
+
+def lab_settings_from_env(**variables: str) -> tuple[object, ...]:
+    """(app_name, page_size, cors_origins) of LabSettings built from these variables."""
+    with temporary_env(**variables):
+        settings = LabSettings(_env_file=None)
+    return settings.app_name, settings.page_size, settings.cors_origins
+
+
+def lab_app_scenario(page_size: int) -> dict[str, object]:
+    """Two apps from one factory; three notes created in the first."""
+    settings = LabSettings(_env_file=None, api_key="lab-secret-123", page_size=page_size)
+    first_app, second_app = create_lab_app(settings), create_lab_app(settings)
+    with TestClient(first_app) as first, TestClient(second_app) as second:
+        created = [
+            first.post("/api/v1/notes", json={"title": f"Note {number}"}) for number in range(3)
+        ]
+        return {
+            "statuses": [response.status_code for response in created],
+            "first": [note["title"] for note in first.get("/api/v1/notes").json()],
+            "second": second.get("/api/v1/notes").json(),
+            "unprefixed": first.get("/notes").status_code,
+            "health": first.get("/health").json(),
+            "empty title": first.post("/api/v1/notes", json={"title": ""}).status_code,
+            "tags": first_app.openapi()["paths"]["/api/v1/notes"]["post"]["tags"],
+            "title": first_app.title,
+        }
+
+
+def lab_override_titles() -> list[object]:
+    """Titles listed when get_lab_store is overridden with a prepared store."""
+    prepared = LabNoteStore()
+    prepared.add("from the override")
+    app = create_lab_app(LabSettings(_env_file=None, api_key="k"))
+    app.dependency_overrides[get_lab_store] = lambda: prepared
+    with TestClient(app) as client:
+        return [note["title"] for note in client.get("/api/v1/notes").json()]
+
+
+def cached_settings_are_shared() -> bool:
+    """get_lab_settings returns the same object twice."""
+    with temporary_env(LAB_NOTES_API_KEY="cached-key"):
+        get_lab_settings.cache_clear()
+        shared = get_lab_settings() is get_lab_settings()
+    get_lab_settings.cache_clear()
+    return shared
+
+
+def check_exercise_6_3_1() -> None:
+    """Exercise 1 checks."""
+    env = {
+        "LAB_NOTES_API_KEY": "k",
+        "LAB_NOTES_PAGE_SIZE": "5",
+        "LAB_NOTES_CORS_ORIGINS": '["http://localhost:5173"]',
+    }
+    run_checks(
+        [
+            (
+                "env variables are parsed",
+                lambda: lab_settings_from_env(**env),
+                ("Lab Notes", 5, ["http://localhost:5173"]),
+            ),
+            (
+                "api_key is required",
+                lambda: raised_error_name(lambda: LabSettings(_env_file=None)),
+                "ValidationError",
+            ),
+            (
+                "page_size 0 is rejected",
+                lambda: raised_error_name(
+                    lambda: LabSettings(_env_file=None, api_key="k", page_size=0)
+                ),
+                "ValidationError",
+            ),
+            (
+                "the key is hidden in repr",
+                lambda: (
+                    "lab-secret-123" in repr(LabSettings(_env_file=None, api_key="lab-secret-123"))
+                ),
+                False,
+            ),
+            ("get_lab_settings is cached", cached_settings_are_shared, True),
+            ("POST returns 201", lambda: lab_app_scenario(20)["statuses"], [201, 201, 201]),
+            (
+                "GET lists newest first",
+                lambda: lab_app_scenario(20)["first"],
+                ["Note 2", "Note 1", "Note 0"],
+            ),
+            (
+                "page_size limits the list",
+                lambda: lab_app_scenario(2)["first"],
+                ["Note 2", "Note 1"],
+            ),
+            ("each app has its own store", lambda: lab_app_scenario(20)["second"], []),
+            ("routes live under /api/v1/notes", lambda: lab_app_scenario(20)["unprefixed"], 404),
+            ("health route", lambda: lab_app_scenario(20)["health"], {"status": "ok"}),
+            ("the body is validated", lambda: lab_app_scenario(20)["empty title"], 422),
+            (
+                "router tag and app title",
+                lambda: (lab_app_scenario(20)["tags"], lab_app_scenario(20)["title"]),
+                (["notes"], "Lab Notes"),
+            ),
+            ("get_lab_store can be overridden", lab_override_titles, ["from the override"]),
+        ]
+    )
+
+
+def admin_statuses(headers: dict[str, str]) -> list[object]:
+    """Status and body of each route when called with these headers."""
+    with TestClient(build_admin_app("s3cret-admin-key")) as client:
+        calls = [
+            client.get("/health", headers=headers),
+            client.get("/admin/stats", headers=headers),
+            client.delete("/admin/cache", headers=headers),
+        ]
+        return [(response.status_code, response.json()) for response in calls]
+
+
+def admin_security() -> tuple[object, ...]:
+    """The security schemes and which operations require one."""
+    schema = build_admin_app("k").openapi()
+    schemes = schema["components"]["securitySchemes"]
+    return (
+        [(scheme["type"], scheme["in"], scheme["name"]) for scheme in schemes.values()],
+        "security" in schema["paths"]["/admin/stats"]["get"],
+        "security" in schema["paths"]["/health"]["get"],
+    )
+
+
+def check_exercise_6_3_2() -> None:
+    """Exercise 2 checks."""
+    missing = (401, {"detail": "missing API key"})
+    invalid = (403, {"detail": "invalid API key"})
+    healthy = (200, {"status": "ok"})
+    run_checks(
+        [
+            ("no key", lambda: admin_statuses({}), [healthy, missing, missing]),
+            (
+                "wrong key",
+                lambda: admin_statuses({"X-API-Key": "guess"}),
+                [healthy, invalid, invalid],
+            ),
+            (
+                "right key",
+                lambda: admin_statuses({"X-API-Key": "s3cret-admin-key"}),
+                [healthy, (200, {"notes": 0}), (200, {"cleared": True})],
+            ),
+            (
+                "OpenAPI: an apiKey header scheme on admin routes only",
+                admin_security,
+                ([("apiKey", "header", "X-API-Key")], True, False),
+            ),
+        ]
+    )
+
+
+def lab_middleware_app(clock: Callable[[], float]) -> FastAPI:
+    """An app using both middlewares; the endpoint reports the id it sees."""
+    app = FastAPI()
+    app.add_middleware(LabTimingMiddleware, clock=clock)
+    app.add_middleware(LabRequestIdMiddleware)
+
+    @app.get("/whoami")
+    async def whoami() -> dict[str, object]:
+        """Report the context variable."""
+        return {"seen": lab_request_id.get()}
+
+    return app
+
+
+def lab_middleware_call(
+    headers: dict[str, str], clock: Callable[[], float] = time.perf_counter
+) -> dict[str, object]:
+    """Response header, the id the endpoint saw, and Server-Timing."""
+    with TestClient(lab_middleware_app(clock)) as client:
+        response = client.get("/whoami", headers=headers)
+    return {
+        "header": response.headers.get("x-request-id"),
+        "seen": response.json().get("seen"),
+        "timing": response.headers.get("server-timing"),
+    }
+
+
+async def lab_reset_probe() -> object:
+    """The variable after a call in this task (ASGITransport runs the app here)."""
+    try:
+        transport = httpx.ASGITransport(app=lab_middleware_app(time.perf_counter))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.get("/whoami", headers={"X-Request-ID": "x-1"})
+    except Exception as error:  # a check must never stop the run
+        return f"raised {type(error).__name__}"
+    return lab_request_id.get()
+
+
+def check_exercise_6_3_3() -> None:
+    """Exercise 3 checks."""
+    reset_probe = asyncio.run(lab_reset_probe())
+    run_checks(
+        [
+            (
+                "a new id is 32 hex digits",
+                lambda: bool(
+                    re.fullmatch(r"[0-9a-f]{32}", str(lab_middleware_call({})["header"] or ""))
+                ),
+                True,
+            ),
+            (
+                "the endpoint sees the same id",
+                lambda: (lambda result: result["seen"] == result["header"])(
+                    lab_middleware_call({})
+                ),
+                True,
+            ),
+            (
+                "a valid incoming id is kept",
+                lambda: lab_middleware_call({"X-Request-ID": "order-42"})["header"],
+                "order-42",
+            ),
+            (
+                "an invalid incoming id is replaced",
+                lambda: (
+                    lab_middleware_call({"X-Request-ID": "bad id;drop"})["header"] != "bad id;drop"
+                ),
+                True,
+            ),
+            (
+                "Server-Timing from the clock",
+                lambda: lab_middleware_call({}, ManualClock(10.0, 10.0123))["timing"],
+                "app;dur=12.3",
+            ),
+            ("the variable is reset afterwards", lambda: reset_probe, None),
+            (
+                "pure ASGI classes that work",
+                lambda: (
+                    not issubclass(LabRequestIdMiddleware, BaseHTTPMiddleware)
+                    and not issubclass(LabTimingMiddleware, BaseHTTPMiddleware)
+                    and lab_middleware_call({})["timing"] is not None
+                ),
+                True,
+            ),
+        ]
+    )
+
+
+def library_problem(method: str, path: str, **request_options: Any) -> tuple[object, ...]:
+    """Status, content type and body for one request to the library app."""
+    app = build_library_app()
+    install_problem_handlers(app)
+    with TestClient(app) as client:
+        response = client.request(method, path, **request_options)
+    return response.status_code, response.headers["content-type"], response.json()
+
+
+def teapot_header() -> object:
+    """The X-Teapot header of the 418 response (handlers must keep it)."""
+    app = build_library_app()
+    install_problem_handlers(app)
+    with TestClient(app) as client:
+        return client.get("/teapot").headers.get("x-teapot")
+
+
+def check_exercise_6_3_4() -> None:
+    """Exercise 4 checks."""
+    problem_json = "application/problem+json"
+    validation_body = {
+        "type": "/problems/validation-error",
+        "title": "Invalid request",
+        "status": 422,
+        "detail": "2 validation error(s)",
+        "instance": "/members",
+        "errors": [
+            {
+                "loc": ["body", "name"],
+                "msg": "String should have at least 1 character",
+                "type": "string_too_short",
+            },
+            {
+                "loc": ["body", "age"],
+                "msg": "Input should be greater than or equal to 0",
+                "type": "greater_than_equal",
+            },
+        ],
+    }
+    run_checks(
+        [
+            (
+                "domain 404",
+                lambda: library_problem("GET", "/books/7"),
+                (
+                    404,
+                    problem_json,
+                    {
+                        "type": "/problems/book-not-found",
+                        "title": "Book not found",
+                        "status": 404,
+                        "detail": "book 7 not found",
+                        "instance": "/books/7",
+                    },
+                ),
+            ),
+            (
+                "domain 409",
+                lambda: library_problem("POST", "/loans/1")[2]["type"],
+                "/problems/book-already-loaned",
+            ),
+            ("HTTPException keeps its headers", teapot_header, "yes"),
+            (
+                "HTTPException body",
+                lambda: library_problem("GET", "/teapot"),
+                (
+                    418,
+                    problem_json,
+                    {
+                        "type": "about:blank",
+                        "title": "I'm a Teapot",
+                        "status": 418,
+                        "detail": "I refuse to brew coffee",
+                        "instance": "/teapot",
+                    },
+                ),
+            ),
+            ("unknown route", lambda: library_problem("GET", "/nowhere")[:2], (404, problem_json)),
+            (
+                "wrong method",
+                lambda: library_problem("DELETE", "/books/1")[2]["title"],
+                "Method Not Allowed",
+            ),
+            (
+                "validation problem",
+                lambda: library_problem("POST", "/members", json={"name": "", "age": -1})[2],
+                validation_body,
+            ),
+            (
+                "a valid request still works",
+                lambda: library_problem("POST", "/members", json={"name": "Ravi", "age": 30})[2],
+                {"name": "Ravi", "age": 30},
+            ),
+        ]
+    )
+
+
+def fake_weather_upstream() -> tuple[httpx.MockTransport, list[str]]:
+    """A mock upstream and the list of URLs it received."""
+    received: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Answer by city name."""
+        received.append(str(request.url))
+        city = request.url.params.get("city", "")
+        if city == "slow":
+            raise httpx.ReadTimeout("upstream too slow", request=request)
+        if city == "crash":
+            return httpx.Response(503)
+        if city != "pune":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"city": "Pune", "temp_c": 31.5, "summary": "sunny"})
+
+    return httpx.MockTransport(handle), received
+
+
+def weather_scenario() -> dict[str, object]:
+    """Call every route variant; record what happened to the client."""
+    transport, received = fake_weather_upstream()
+    app = build_weather_app(transport)
+    with TestClient(app) as client:
+        first_client = app.state.weather_client
+        results = {}
+        for city in ("pune", "atlantis", "crash", "slow"):
+            response = client.get(f"/forecast/{city}")
+            results[city] = (response.status_code, response.json())
+        same_client = app.state.weather_client is first_client
+    return {
+        "results": results,
+        "received": received[0],
+        "same client": same_client,
+        "closed after shutdown": first_client.is_closed,
+        "base url": str(first_client.base_url),
+    }
+
+
+def check_exercise_6_3_5() -> None:
+    """Exercise 5 checks."""
+    run_checks(
+        [
+            (
+                "forecast is mapped",
+                lambda: weather_scenario()["results"]["pune"],
+                (200, {"city": "Pune", "temperature": 31.5, "summary": "sunny"}),
+            ),
+            (
+                "upstream URL",
+                lambda: weather_scenario()["received"],
+                "https://weather.example/v1/forecast?city=pune",
+            ),
+            (
+                "upstream 404",
+                lambda: weather_scenario()["results"]["atlantis"],
+                (404, {"detail": "unknown city atlantis"}),
+            ),
+            (
+                "upstream 5xx → 502",
+                lambda: weather_scenario()["results"]["crash"],
+                (502, {"detail": "weather service failed"}),
+            ),
+            (
+                "timeout → 504",
+                lambda: weather_scenario()["results"]["slow"],
+                (504, {"detail": "weather service timed out"}),
+            ),
+            ("one client for all requests", lambda: weather_scenario()["same client"], True),
+            ("closed on shutdown", lambda: weather_scenario()["closed after shutdown"], True),
+            ("base URL", lambda: weather_scenario()["base url"], "https://weather.example"),
+        ]
+    )
+
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 20
+
+
+def avatar_upload(name: str, content: bytes, claimed_type: str) -> tuple[int, Any]:
+    """Status and body for one upload to an app with a 100-byte limit."""
+    with TestClient(build_avatar_app(100)) as client:
+        response = client.post("/avatars", files={"file": (name, content, claimed_type)})
+    return response.status_code, response.json()
+
+
+def lab_events() -> list[dict[str, object]]:
+    """Seven events; two share a timestamp (the id breaks the tie)."""
+    times = ["09:00", "09:05", "09:05", "09:10", "09:20", "09:30", "09:40"]
+    return [
+        {"id": number, "at": f"2026-11-17T{clock}:00Z", "name": f"event {number}"}
+        for number, clock in enumerate(times, start=1)
+    ]
+
+
+def walk_events(limit: int, add_between: bool = False) -> list[list[object]]:
+    """Follow next_cursor to the end; optionally add a newer event after page one."""
+    events = lab_events()
+    pages: list[list[object]] = []
+    params: dict[str, object] = {"limit": limit}
+    with TestClient(build_events_app(events)) as client:
+        while True:
+            page = client.get("/events", params=params).json()
+            pages.append([event["id"] for event in page["items"]])
+            if add_between and len(pages) == 1:
+                events.append({"id": 99, "at": "2026-11-17T10:00:00Z", "name": "late"})
+            if page["next_cursor"] is None:
+                return pages
+            params = {"limit": limit, "cursor": page["next_cursor"]}
+
+
+def bad_cursor_response() -> tuple[int, object]:
+    """Status and body for a cursor the app never issued."""
+    with TestClient(build_events_app(lab_events())) as client:
+        response = client.get("/events", params={"cursor": "definitely-not-a-cursor"})
+    return response.status_code, response.json()
+
+
+def check_exercise_6_3_6() -> None:
+    """Exercise 6 checks."""
+    sample_cursor = encode_event_cursor("2026-11-17T09:05:00Z", 3)
+    run_checks(
+        [
+            (
+                "PNG accepted",
+                lambda: avatar_upload("me.png", PNG_BYTES, "image/png"),
+                (201, {"filename": "me.png", "kind": "png", "bytes": 28}),
+            ),
+            (
+                "JPEG accepted whatever the header says",
+                lambda: avatar_upload("me.bin", JPEG_BYTES, "application/octet-stream")[1]["kind"],
+                "jpeg",
+            ),
+            (
+                "GIF refused despite image/png",
+                lambda: avatar_upload("me.png", b"GIF89a" + b"\x00" * 20, "image/png"),
+                (415, {"detail": "only PNG or JPEG images"}),
+            ),
+            (
+                "too large",
+                lambda: avatar_upload("big.png", PNG_BYTES * 10, "image/png"),
+                (413, {"detail": "avatar larger than 100 bytes"}),
+            ),
+            (
+                "cursor round trip",
+                lambda: decode_event_cursor(sample_cursor),
+                ("2026-11-17T09:05:00Z", 3),
+            ),
+            ("cursor is opaque", lambda: "2026" in sample_cursor or "=" in sample_cursor, False),
+            (
+                "garbage cursor → ValueError",
+                lambda: raised_error_name(lambda: decode_event_cursor("%%%")),
+                "ValueError",
+            ),
+            ("pages of 3, newest first", lambda: walk_events(3), [[7, 6, 5], [4, 3, 2], [1]]),
+            (
+                "limit = number of events gives one page",
+                lambda: walk_events(7),
+                [[7, 6, 5, 4, 3, 2, 1]],
+            ),
+            (
+                "a new event does not shift later pages",
+                lambda: walk_events(3, add_between=True),
+                [[7, 6, 5], [4, 3, 2], [1]],
+            ),
+            ("bad cursor → 400", bad_cursor_response, (400, {"detail": "invalid cursor"})),
+        ]
+    )
+
+
+def check_lab_6_3() -> None:
+    """Run every Lab 6.3 check (each check prints PASS/FAIL)."""
+    for title, check in (
+        ("exercise 1", check_exercise_6_3_1),
+        ("exercise 2", check_exercise_6_3_2),
+        ("exercise 3", check_exercise_6_3_3),
+        ("exercise 4", check_exercise_6_3_4),
+        ("exercise 5", check_exercise_6_3_5),
+        ("exercise 6", check_exercise_6_3_6),
+    ):
+        print(f"--- {title}")
+        check()
+
+
+# ----- Lab 6.4: the given code from the lab setup cells -----
+
+PHASE6_DIR = Path(
+    tempfile.mkdtemp(prefix="phase6_lab64_")
+)  # the notebook uses notebooks/_scratch/phase6
+CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "NO_COLOR": "1"}
+PG_URL: str | None = (
+    None  # the notebook passes its PostgreSQL container here; this script uses SQLite
+)
+
+
+class QBase(DeclarativeBase):
+    """Base for the given notes schema of exercises 2-3."""
+
+
+q_note_tags = Table(
+    "q_note_tags",
+    QBase.metadata,
+    Column("note_id", ForeignKey("q_notes.id", ondelete="CASCADE"), primary_key=True),
+    Column("tag_id", ForeignKey("q_tags.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
+class QTag(QBase):
+    """A tag."""
+
+    __tablename__ = "q_tags"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(30), unique=True)
+    notes: Mapped[list[QNote]] = relationship(secondary=q_note_tags, back_populates="tags")
+
+
+class QNote(QBase):
+    """A note (tags load lazily, the default)."""
+
+    __tablename__ = "q_notes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    pinned: Mapped[bool] = mapped_column(default=False)
+    created_on: Mapped[date]
+    tags: Mapped[list[QTag]] = relationship(
+        secondary=q_note_tags, back_populates="notes", order_by=QTag.name
+    )
+
+
+Q_SEED = [
+    ("Buy tea", True, ["shop", "food"]),
+    ("Call Ravi", False, ["home"]),
+    ("Draft: plan", False, ["work"]),
+    ("Pay rent", True, ["home", "bills"]),
+    ("Fix bug", False, ["work"]),
+    ("Read book", False, []),
+    ("Draft: email", False, []),
+]
+
+
+def fresh_q_engine() -> sa.Engine:
+    """A new SQLite file with the seven seeded notes (note n was created on 2026-11-0n)."""
+    path = PHASE6_DIR / "lab_queries.db"
+    path.unlink(missing_ok=True)
+    engine = create_engine(f"sqlite:///{path}")
+    event.listen(
+        engine,
+        "connect",
+        lambda dbapi_connection, _: dbapi_connection.execute("PRAGMA foreign_keys=ON"),
+    )
+    QBase.metadata.create_all(engine)
+    with Session(engine) as session, session.begin():
+        tags = {name: QTag(name=name) for name in ("bills", "food", "home", "shop", "work")}
+        for day, (title, pinned, names) in enumerate(Q_SEED, start=1):
+            session.add(
+                QNote(
+                    title=title,
+                    pinned=pinned,
+                    created_on=date(2026, 11, day),
+                    tags=[tags[name] for name in names],
+                )
+            )
+    return engine
+
+
+def titles_with_tags_slow(session: Session) -> list[tuple[str, list[str]]]:
+    """Every note's title and tag names: the N+1 way (one query per note for its tags)."""
+    notes = session.scalars(select(QNote).order_by(QNote.id))
+    return [(note.title, [tag.name for tag in note.tags]) for note in notes]
+
+
+class DocBase(DeclarativeBase):
+    """Base for exercise 5."""
+
+
+class LabDocument(DocBase):
+    """A document with optimistic locking."""
+
+    __tablename__ = "lab_documents"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column()
+    __mapper_args__ = {"version_id_col": version}
+
+
+class DocumentConflictError(Exception):
+    """Somebody changed the document since it was read."""
+
+
+def fresh_documents() -> sessionmaker[Session]:
+    """A session factory on a new database holding document 1 ("first draft", version 1)."""
+    path = PHASE6_DIR / "lab_documents.db"
+    path.unlink(missing_ok=True)
+    engine = create_engine(
+        f"sqlite:///{path}", connect_args={"check_same_thread": False}
+    )  # def routes run in worker threads
+    DocBase.metadata.create_all(engine)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    with factory.begin() as session:
+        session.add(LabDocument(id=1, content="first draft"))
+    return factory
+
+
+class ItemBase(DeclarativeBase):
+    """Base for exercise 6."""
+
+
+class LabItem(ItemBase):
+    """A searchable, pageable item."""
+
+    __tablename__ = "lab_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime]
+
+
+ITEM_WORDS = [
+    "river",
+    "Rice",
+    "ridge",
+    "Ring",
+    "robot",
+    "Ruby",
+    "rust",
+    "Rain",
+    "atlas",
+    "Basil",
+    "cedar",
+    "Delta",
+]
+
+
+def fresh_items_engine() -> sa.Engine:
+    """3000 items with mixed-case titles; every three share a timestamp (the id breaks ties)."""
+    path = PHASE6_DIR / "lab_items.db"
+    path.unlink(missing_ok=True)
+    engine = create_engine(f"sqlite:///{path}")
+    ItemBase.metadata.create_all(engine)
+    rng = random.Random(42)
+    start = datetime(2026, 1, 1)
+    rows = [
+        {
+            "title": f"{rng.choice(ITEM_WORDS)} {rng.choice(ITEM_WORDS).lower()} {number}",
+            "created_at": start + timedelta(minutes=number // 3),
+        }
+        for number in range(3000)
+    ]
+    with engine.begin() as connection:
+        connection.execute(insert(LabItem), rows)
+    return engine
+
+
+LAB_ALEMBIC = PHASE6_DIR / "lab_alembic"
+LAB_ALEMBIC_DB = LAB_ALEMBIC / "links.db"
+
+
+def write_lab_alembic_project() -> None:
+    """The lab's Alembic project: a sync env.py with batch mode, no models."""
+    (LAB_ALEMBIC / "migrations" / "versions").mkdir(parents=True, exist_ok=True)
+    (LAB_ALEMBIC / "alembic.ini").write_text(
+        f"[alembic]\nscript_location = migrations\nsqlalchemy.url = sqlite:///{LAB_ALEMBIC_DB}\n",
+        encoding="utf-8",
+    )
+    (LAB_ALEMBIC / "migrations" / "env.py").write_text(
+        "from alembic import context\nfrom sqlalchemy import create_engine\n\n"
+        "engine = create_engine(context.config.get_main_option('sqlalchemy.url'))\n"
+        "with engine.connect() as connection:\n"
+        "    context.configure(connection=connection, target_metadata=None, render_as_batch=True)\n"
+        "    with context.begin_transaction():\n"
+        "        context.run_migrations()\n",
+        encoding="utf-8",
+    )
+    (LAB_ALEMBIC / "migrations" / "script.py.mako").write_text(
+        '"""${message}"""\n', encoding="utf-8"
+    )
+
+
+def reset_lab_alembic() -> Path:
+    """Delete the database and every migration file; return the versions folder."""
+    write_lab_alembic_project()
+    LAB_ALEMBIC_DB.unlink(missing_ok=True)
+    versions = LAB_ALEMBIC / "migrations" / "versions"
+    for migration in versions.glob("*.py"):
+        migration.unlink()
+    shutil.rmtree(versions / "__pycache__", ignore_errors=True)
+    return versions
+
+
+def lab_alembic(*arguments: str) -> str:
+    """Run alembic in the lab project; return the output, raise if it failed."""
+    run = subprocess.run(
+        [sys.executable, "-m", "alembic", *arguments],
+        cwd=LAB_ALEMBIC,
+        capture_output=True,
+        text=True,
+        env=CHILD_ENV,
+        timeout=120,
+    )
+    if run.returncode != 0:
+        raise RuntimeError(
+            f"alembic {' '.join(arguments)} failed: {run.stderr.strip().splitlines()[-1:]}"
+        )
+    return run.stdout + run.stderr
+
+
+# ----- Lab 6.4: reference solutions -----
+
+# >>> Lab 6.4 exercise 1
+LAB_NAMING = {
+    "ix": "ix_%(column_0_label)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+
+class LabBase(DeclarativeBase):
+    """Base with a naming convention."""
+
+    metadata = MetaData(naming_convention=LAB_NAMING)
+
+
+lab_note_tags = Table(
+    "lab_note_tags",
+    LabBase.metadata,
+    Column("note_id", ForeignKey("lab_notes.id", ondelete="CASCADE"), primary_key=True),
+    Column("tag_id", ForeignKey("lab_tags.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
+class LabTag(LabBase):
+    """A tag name, stored once."""
+
+    __tablename__ = "lab_tags"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(30), unique=True)
+
+
+class LabNote(LabBase):
+    """A note with many-to-many tags."""
+
+    __tablename__ = "lab_notes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text, default="")
+    pinned: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    tags: Mapped[list[LabTag]] = relationship(secondary=lab_note_tags, order_by=LabTag.name)
+
+
+def add_lab_note(session: Session, title: str, tag_names: list[str]) -> LabNote:
+    """Create a note, reusing tags that already exist."""
+    found = {
+        tag.name: tag for tag in session.scalars(select(LabTag).where(LabTag.name.in_(tag_names)))
+    }
+    note = LabNote(title=title, tags=[found.get(name) or LabTag(name=name) for name in tag_names])
+    session.add(note)
+    session.flush()
+    return note
+
+
+# <<< Lab 6.4 exercise 1
+
+
+# >>> Lab 6.4 exercise 2
+def build_eight_queries() -> dict[str, sa.Executable]:
+    """The eight statements, by key."""
+    note_count = func.count(QNote.id)
+    newest = (
+        select(q_note_tags.c.tag_id, func.max(QNote.created_on).label("newest_on"))
+        .join(QNote, QNote.id == q_note_tags.c.note_id)
+        .group_by(q_note_tags.c.tag_id)
+        .subquery()
+    )
+    return {
+        "pinned_titles": select(QNote.title).where(QNote.pinned).order_by(QNote.title),
+        "tagged_work": select(QNote.title)
+        .join(QNote.tags)
+        .where(QTag.name == "work")
+        .order_by(QNote.id),
+        "count_per_tag": (
+            select(QTag.name, note_count)
+            .join(QTag.notes)
+            .group_by(QTag.id)
+            .order_by(note_count.desc(), QTag.name)
+        ),
+        "popular_tags": (
+            select(QTag.name)
+            .join(QTag.notes)
+            .group_by(QTag.id)
+            .having(note_count >= 2)
+            .order_by(QTag.name)
+        ),
+        "untagged": select(QNote.title).where(~QNote.tags.any()).order_by(QNote.id),
+        "latest_per_tag": (
+            select(QTag.name, QNote.title)
+            .join(newest, newest.c.tag_id == QTag.id)
+            .join(QTag.notes)
+            .where(QNote.created_on == newest.c.newest_on)
+            .order_by(QTag.name)
+        ),
+        "unpin_old": update(QNote)
+        .where(QNote.pinned, QNote.created_on < date(2026, 11, 3))
+        .values(pinned=False),
+        "delete_drafts": delete(QNote).where(QNote.title.startswith("Draft:")),
+    }
+
+
+# <<< Lab 6.4 exercise 2
+
+
+# >>> Lab 6.4 exercise 3
+def count_statements(engine: sa.Engine, action: Callable[[Session], object]) -> tuple[int, object]:
+    """Statements sent while action(session) runs, and its result."""
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *rest: Any) -> None:
+        """before_cursor_execute listener."""
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        with Session(engine) as session:
+            result = action(session)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    return len(statements), result
+
+
+def titles_with_tags_fast(session: Session) -> list[tuple[str, list[str]]]:
+    """Same as titles_with_tags_slow, in two statements."""
+    notes = session.scalars(select(QNote).options(selectinload(QNote.tags)).order_by(QNote.id))
+    return [(note.title, [tag.name for tag in note.tags]) for note in notes]
+
+
+def strict_note(session: Session, note_id: int) -> QNote:
+    """One note whose relationships refuse to lazy-load."""
+    return session.scalars(select(QNote).options(raiseload("*")).where(QNote.id == note_id)).one()
+
+
+# <<< Lab 6.4 exercise 3
+
+
+# >>> Lab 6.4 exercise 4
+LAB_MIGRATION_HEADER = (
+    "import sqlalchemy as sa\nfrom alembic import op\n\n"
+    'revision = "{revision}"\ndown_revision = {previous}\nbranch_labels = None\ndepends_on = None\n'
+)
+
+LAB_MIGRATIONS = {
+    "0001_create_links.py": (
+        "0001",
+        None,
+        '''
+def upgrade() -> None:
+    """Create links."""
+    op.create_table(
+        "links",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("url", sa.String(500), nullable=False),
+        sa.Column("title", sa.String(200), nullable=True),
+    )
+
+
+def downgrade() -> None:
+    """Drop links."""
+    op.drop_table("links")
+''',
+    ),
+    "0002_clicks_and_unique_url.py": (
+        "0002",
+        "0001",
+        '''
+def upgrade() -> None:
+    """Add clicks and a unique URL constraint."""
+    with op.batch_alter_table("links") as batch:
+        batch.add_column(sa.Column("clicks", sa.Integer(), nullable=False, server_default="0"))
+        batch.create_unique_constraint("uq_links_url", ["url"])
+
+
+def downgrade() -> None:
+    """Remove both."""
+    with op.batch_alter_table("links") as batch:
+        batch.drop_constraint("uq_links_url", type_="unique")
+        batch.drop_column("clicks")
+''',
+    ),
+    "0003_fill_titles.py": (
+        "0003",
+        "0002",
+        '''
+links = sa.table("links", sa.column("url", sa.String()), sa.column("title", sa.String()))
+
+
+def upgrade() -> None:
+    """Data migration: missing titles become the URL; then titles are required."""
+    op.execute(links.update().where(links.c.title.is_(None)).values(title=links.c.url))
+    with op.batch_alter_table("links") as batch:
+        batch.alter_column("title", existing_type=sa.String(200), nullable=False)
+
+
+def downgrade() -> None:
+    """Titles become optional again (the copied URLs stay)."""
+    with op.batch_alter_table("links") as batch:
+        batch.alter_column("title", existing_type=sa.String(200), nullable=True)
+''',
+    ),
+}
+
+
+def write_lab_migrations(versions_dir: Path) -> None:
+    """Write 0001_create_links.py, 0002_clicks_and_unique_url.py, 0003_fill_titles.py."""
+    for filename, (revision, previous, body) in LAB_MIGRATIONS.items():
+        header = LAB_MIGRATION_HEADER.format(revision=revision, previous=repr(previous))
+        source = f'"""{filename[5:-3].replace("_", " ")}"""\n\n{header}\n{body}'
+        (versions_dir / filename).write_text(source, encoding="utf-8")
+
+
+# <<< Lab 6.4 exercise 4
+
+
+# >>> Lab 6.4 exercise 5
+def update_document(
+    session: Session, document_id: int, content: str, expected_version: int
+) -> LabDocument:
+    """Change a document if it is still at expected_version."""
+    document = session.get(LabDocument, document_id)
+    if document is None:
+        raise LookupError(f"document {document_id} not found")
+    if document.version != expected_version:
+        raise DocumentConflictError(f"document {document_id} is at version {document.version}")
+    document.content = content
+    try:
+        session.flush()
+    except StaleDataError as error:
+        raise DocumentConflictError(f"document {document_id} changed meanwhile") from error
+    return document
+
+
+class DocumentPatch(BaseModel):
+    """Body of PATCH /documents/{document_id}."""
+
+    content: str
+    version: int
+
+
+def build_documents_app(session_factory: sessionmaker[Session]) -> FastAPI:
+    """GET and PATCH /documents/{document_id} with 404 and 409 answers."""
+    app = FastAPI()
+
+    def get_document_session() -> Iterator[Session]:
+        """One transaction per request."""
+        with session_factory() as session, session.begin():
+            yield session
+
+    session_dependency = Depends(get_document_session, scope="function")  # commit before responding
+
+    def as_dict(document: LabDocument) -> dict[str, object]:
+        """The response body."""
+        return {"id": document.id, "content": document.content, "version": document.version}
+
+    @app.exception_handler(DocumentConflictError)
+    async def conflict(request: fastapi.Request, error: DocumentConflictError) -> JSONResponse:
+        """Optimistic-locking conflict → 409."""
+        return JSONResponse({"detail": "version conflict"}, status_code=status.HTTP_409_CONFLICT)
+
+    @app.get("/documents/{document_id}")
+    def read_document(document_id: int, session: Session = session_dependency) -> dict[str, object]:
+        """One document, or 404."""
+        document = session.get(LabDocument, document_id)
+        if document is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
+        return as_dict(document)
+
+    @app.patch("/documents/{document_id}")
+    def patch_document(
+        document_id: int, patch: DocumentPatch, session: Session = session_dependency
+    ) -> dict[str, object]:
+        """Update if the client's version is current."""
+        try:
+            document = update_document(session, document_id, patch.content, patch.version)
+        except LookupError as error:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found") from error
+        return as_dict(document)
+
+    return app
+
+
+# <<< Lab 6.4 exercise 5
+
+
+# >>> Lab 6.4 exercise 6
+def create_lab_indexes(engine: sa.Engine) -> None:
+    """An expression index for prefix search and a composite index for keyset paging."""
+    with engine.begin() as connection:
+        connection.execute(
+            text("CREATE INDEX ix_lab_items_title_lower ON lab_items (lower(title))")
+        )
+        connection.execute(
+            text("CREATE INDEX ix_lab_items_created_at_id ON lab_items (created_at, id)")
+        )
+
+
+def search_prefix(session: Session, prefix: str, limit: int = 20) -> list[str]:
+    """Case-insensitive prefix search as a range on lower(title)."""
+    low = prefix.lower()
+    high = low[:-1] + chr(ord(low[-1]) + 1)
+    lowered = func.lower(LabItem.title)
+    statement = (
+        select(LabItem.title)
+        .where(lowered >= low, lowered < high)
+        .order_by(lowered, LabItem.id)
+        .limit(limit)
+    )
+    return list(session.scalars(statement))
+
+
+def keyset_items(session: Session, after: tuple[datetime, int] | None, limit: int) -> list[LabItem]:
+    """Newest first; strictly before after when given."""
+    statement = select(LabItem).order_by(LabItem.created_at.desc(), LabItem.id.desc()).limit(limit)
+    if after is not None:
+        statement = statement.where(tuple_(LabItem.created_at, LabItem.id) < tuple_(*after))
+    return list(session.scalars(statement))
+
+
+# <<< Lab 6.4 exercise 6
+
+
+# ----- Lab 6.4: the notebook's check cells -----
+
+
+def lab_schema() -> dict[str, object]:
+    """Tables, nullability, the association primary key and constraint names on SQLite."""
+    engine = create_engine("sqlite://")
+    LabBase.metadata.create_all(engine)
+    inspector = sa_inspect(engine)
+    return {
+        "tables": sorted(inspector.get_table_names()),
+        "note columns": {
+            column["name"]: column["nullable"] for column in inspector.get_columns("lab_notes")
+        },
+        "link key": inspector.get_pk_constraint("lab_note_tags")["constrained_columns"],
+        "unique": [
+            constraint["name"] for constraint in inspector.get_unique_constraints("lab_tags")
+        ],
+    }
+
+
+def lab_sqlite_engine() -> sa.Engine:
+    """An in-memory SQLite database with the lab tables and foreign keys on."""
+    engine = create_engine("sqlite://")
+    event.listen(
+        engine,
+        "connect",
+        lambda dbapi_connection, _: dbapi_connection.execute("PRAGMA foreign_keys=ON"),
+    )
+    LabBase.metadata.create_all(engine)
+    return engine
+
+
+def lab_tag_scenario(bind: Any) -> dict[str, object]:
+    """Two notes sharing a tag, then deleting one note (bind: Engine or Connection)."""
+    with Session(bind) as session:
+        add_lab_note(session, "Buy tea", ["shop", "food"])
+        add_lab_note(session, "Rice", ["shop"])
+        session.expire_all()  # read back from the database, so order_by applies
+        note = session.scalars(select(LabNote).where(LabNote.title == "Buy tea")).one()
+        result: dict[str, object] = {
+            "tags": session.scalar(select(func.count()).select_from(LabTag)),
+            "names": [tag.name for tag in note.tags],
+            "body": note.body,
+            "pinned": note.pinned,
+            "has created_at": note.created_at is not None,
+        }
+        session.delete(note)
+        session.flush()
+        result["links after delete"] = session.scalar(
+            select(func.count()).select_from(lab_note_tags)
+        )
+        return result
+
+
+async def lab_scenario_on_postgres() -> object:
+    """The same scenario through an async engine (SQLite here: no container in this script)."""
+    try:
+        engine = create_async_engine(PG_URL or "sqlite+aiosqlite://")
+        async with engine.begin() as connection:
+            await connection.run_sync(LabBase.metadata.drop_all)
+            await connection.run_sync(LabBase.metadata.create_all)
+            result = await connection.run_sync(lab_tag_scenario)
+            await connection.run_sync(LabBase.metadata.drop_all)
+        await engine.dispose()
+        return result
+    except Exception as error:  # a check must never stop the run
+        return f"raised {type(error).__name__}: {error}"
+
+
+def check_exercise_6_4_1() -> None:
+    """Exercise 1 checks."""
+    expected = {
+        "tags": 2,
+        "names": ["food", "shop"],
+        "body": "",
+        "pinned": False,
+        "has created_at": True,
+        "links after delete": 1,
+    }
+    postgres_result = asyncio.run(lab_scenario_on_postgres())
+    run_checks(
+        [
+            (
+                "three tables",
+                lambda: lab_schema()["tables"],
+                ["lab_note_tags", "lab_notes", "lab_tags"],
+            ),
+            (
+                "every note column is NOT NULL",
+                lambda: lab_schema()["note columns"],
+                {"id": False, "title": False, "body": False, "pinned": False, "created_at": False},
+            ),
+            (
+                "composite key on the association table",
+                lambda: lab_schema()["link key"],
+                ["note_id", "tag_id"],
+            ),
+            ("named unique constraint", lambda: lab_schema()["unique"], ["uq_lab_tags_name"]),
+            (
+                "created_at is timezone-aware",
+                lambda: LabNote.__table__.c.created_at.type.timezone,
+                True,
+            ),
+            (
+                "tags are shared; defaults; cascade (SQLite)",
+                lambda: lab_tag_scenario(lab_sqlite_engine()),
+                expected,
+            ),
+            ("the same on PostgreSQL", lambda: postgres_result, expected),
+        ]
+    )
+
+
+def run_lab_query(key: str) -> object:
+    """Run one statement on fresh data: rows for SELECT, (rowcount, pinned titles) for DML."""
+    statement = build_eight_queries()[key]
+    engine = fresh_q_engine()
+    try:
+        with Session(engine) as session, session.begin():
+            result = session.execute(statement)
+            if not statement.is_select:  # UPDATE / DELETE
+                pinned = session.scalars(
+                    select(QNote.title).where(QNote.pinned).order_by(QNote.title)
+                ).all()
+                return result.rowcount, pinned
+            rows = [tuple(row) for row in result.all()]
+    finally:
+        engine.dispose()
+    return [row[0] for row in rows] if rows and len(rows[0]) == 1 else rows
+
+
+def check_exercise_6_4_2() -> None:
+    """Exercise 2 checks, then the SQL."""
+    run_checks(
+        [
+            ("pinned_titles", lambda: run_lab_query("pinned_titles"), ["Buy tea", "Pay rent"]),
+            ("tagged_work", lambda: run_lab_query("tagged_work"), ["Draft: plan", "Fix bug"]),
+            (
+                "count_per_tag",
+                lambda: run_lab_query("count_per_tag"),
+                [("home", 2), ("work", 2), ("bills", 1), ("food", 1), ("shop", 1)],
+            ),
+            ("popular_tags", lambda: run_lab_query("popular_tags"), ["home", "work"]),
+            ("untagged", lambda: run_lab_query("untagged"), ["Read book", "Draft: email"]),
+            (
+                "latest_per_tag",
+                lambda: run_lab_query("latest_per_tag"),
+                [
+                    ("bills", "Pay rent"),
+                    ("food", "Buy tea"),
+                    ("home", "Pay rent"),
+                    ("shop", "Buy tea"),
+                    ("work", "Fix bug"),
+                ],
+            ),
+            ("unpin_old", lambda: run_lab_query("unpin_old"), (1, ["Pay rent"])),
+            ("delete_drafts", lambda: run_lab_query("delete_drafts")[0], 2),
+        ]
+    )
+    for key, statement in build_eight_queries().items():
+        print(f"-- {key}\n{statement.compile(dialect=sqlite.dialect())}")
+
+
+def strict_tags_error() -> str:
+    """What touching the tags of a strict note raises."""
+    engine = fresh_q_engine()
+    with Session(engine) as session:
+        note = strict_note(session, 1)
+        return raised_error_name(lambda: note.tags)
+
+
+def listeners_left_behind() -> int:
+    """Listeners count_statements added and did not remove."""
+    engine = fresh_q_engine()
+    before = len(engine.dispatch.before_cursor_execute)
+    count_statements(engine, lambda session: session.get(QNote, 1))
+    return len(engine.dispatch.before_cursor_execute) - before
+
+
+def check_exercise_6_4_3() -> None:
+    """Exercise 3 checks."""
+    q_engine = fresh_q_engine()
+    run_checks(
+        [
+            (
+                "counting: get() twice is one statement",
+                lambda: count_statements(
+                    q_engine, lambda session: (session.get(QNote, 1), session.get(QNote, 1))
+                )[0],
+                1,
+            ),
+            (
+                "the slow version is 1 + 7 statements",
+                lambda: count_statements(q_engine, titles_with_tags_slow)[0],
+                8,
+            ),
+            (
+                "the fast version is at most 2",
+                lambda: count_statements(q_engine, titles_with_tags_fast)[0] <= 2,
+                True,
+            ),
+            (
+                "same result",
+                lambda: (
+                    count_statements(q_engine, titles_with_tags_fast)[1]
+                    == count_statements(q_engine, titles_with_tags_slow)[1]
+                ),
+                True,
+            ),
+            ("the listener is removed afterwards", listeners_left_behind, 0),
+            ("raiseload makes lazy loads fail", strict_tags_error, "InvalidRequestError"),
+        ]
+    )
+
+
+def lab_migration_run() -> dict[str, object]:
+    """Write the migrations, walk them up and down, and record what happened."""
+    write_lab_migrations(reset_lab_alembic())
+    report: dict[str, object] = {"chain": re.findall(r"(\S+) -> (\w+)", lab_alembic("history"))}
+    lab_alembic("upgrade", "0002")
+    engine = create_engine(f"sqlite:///{LAB_ALEMBIC_DB}")
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO links (url) VALUES ('https://a.example')"))
+    report["at 0002"] = {
+        column["name"]: column["nullable"] for column in sa_inspect(engine).get_columns("links")
+    }
+    lab_alembic("upgrade", "head")
+    with engine.connect() as connection:
+        report["rows"] = [
+            tuple(row) for row in connection.execute(text("SELECT url, title, clicks FROM links"))
+        ]
+    report["title nullable at head"] = {
+        column["name"]: column["nullable"] for column in sa_inspect(engine).get_columns("links")
+    }["title"]
+    with engine.connect() as connection:
+        report["duplicate url"] = raised_error_name(
+            lambda: connection.execute(
+                text("INSERT INTO links (url, title) VALUES ('https://a.example', 'again')")
+            )
+        )
+    lab_alembic("downgrade", "base")
+    report["tables after downgrade"] = sa_inspect(engine).get_table_names()
+    engine.dispose()
+    return report
+
+
+def check_exercise_6_4_4() -> None:
+    """Exercise 4 checks."""
+    run_checks(
+        [
+            (
+                "three revisions in a chain",
+                lambda: lab_migration_run()["chain"],
+                [("0002", "0003"), ("0001", "0002"), ("<base>", "0001")],
+            ),
+            (
+                "schema at 0002",
+                lambda: lab_migration_run()["at 0002"],
+                {"id": False, "url": False, "title": True, "clicks": False},
+            ),
+            (
+                "data migration filled the title",
+                lambda: lab_migration_run()["rows"],
+                [("https://a.example", "https://a.example", 0)],
+            ),
+            (
+                "title is NOT NULL at head",
+                lambda: lab_migration_run()["title nullable at head"],
+                False,
+            ),
+            ("url is unique", lambda: lab_migration_run()["duplicate url"], "IntegrityError"),
+            (
+                "downgrade base removes the table",
+                lambda: lab_migration_run()["tables after downgrade"],
+                ["alembic_version"],
+            ),
+        ]
+    )
+
+
+def documents_scenario() -> list[tuple[int, object]]:
+    """PATCH with the right version, again with the old one, then GET; plus a 404."""
+    with TestClient(build_documents_app(fresh_documents())) as client:
+        calls = [
+            client.patch("/documents/1", json={"content": "second draft", "version": 1}),
+            client.patch("/documents/1", json={"content": "lost edit", "version": 1}),
+            client.get("/documents/1"),
+            client.patch("/documents/9", json={"content": "x", "version": 1}),
+        ]
+        return [(response.status_code, response.json()) for response in calls]
+
+
+def documents_race() -> str:
+    """Two sessions read version 1; the first commits; the second's flush must fail."""
+    factory = fresh_documents()
+    with factory() as first, factory() as second:
+        second.get(LabDocument, 1)  # second has read version 1 too
+        update_document(first, 1, "first wins", 1)
+        first.commit()
+        return raised_error_name(lambda: update_document(second, 1, "second loses", 1))
+
+
+def check_exercise_6_4_5() -> None:
+    """Exercise 5 checks."""
+    current = (200, {"id": 1, "content": "second draft", "version": 2})
+    run_checks(
+        [
+            ("PATCH with the current version", lambda: documents_scenario()[0], current),
+            (
+                "PATCH with a stale version → 409",
+                lambda: documents_scenario()[1],
+                (409, {"detail": "version conflict"}),
+            ),
+            ("the stale edit was not saved", lambda: documents_scenario()[2], current),
+            (
+                "unknown document → 404",
+                lambda: documents_scenario()[3],
+                (404, {"detail": "document not found"}),
+            ),
+            (
+                "wrong expected version",
+                lambda: raised_error_name(lambda: update_document(fresh_documents()(), 1, "x", 7)),
+                "DocumentConflictError",
+            ),
+            ("a concurrent commit is caught at flush", documents_race, "DocumentConflictError"),
+        ]
+    )
+
+
+def last_query_plan(engine: sa.Engine, action: Callable[[Session], object]) -> str:
+    """EXPLAIN QUERY PLAN of the last SELECT that action(session) sent."""
+    sent: list[tuple[str, Any]] = []
+
+    def remember(conn: Any, cursor: Any, statement: str, parameters: Any, *rest: Any) -> None:
+        """Keep each statement with its parameters."""
+        sent.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", remember)
+    try:
+        with Session(engine) as session:
+            action(session)
+    finally:
+        event.remove(engine, "before_cursor_execute", remember)
+    statement, parameters = [
+        item for item in sent if item[0].lstrip().upper().startswith("SELECT")
+    ][-1]
+    with engine.connect() as connection:
+        return " | ".join(
+            row[-1]
+            for row in connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters)
+        )
+
+
+def indexed_items() -> tuple[sa.Engine, list[tuple[int, str, datetime]]]:
+    """A fresh engine with the indexes, and every row for brute-force answers."""
+    engine = fresh_items_engine()
+    create_lab_indexes(engine)
+    with engine.connect() as connection:
+        rows = [
+            tuple(row)
+            for row in connection.execute(select(LabItem.id, LabItem.title, LabItem.created_at))
+        ]
+    return engine, rows  # type: ignore[return-value]
+
+
+def walk_items(engine: sa.Engine, page_size: int) -> list[int]:
+    """Ids of every item, page by page through keyset_items."""
+    ids: list[int] = []
+    after = None
+    with Session(engine) as session:
+        while page := keyset_items(session, after, page_size):
+            ids += [item.id for item in page]
+            after = (page[-1].created_at, page[-1].id)
+    return ids
+
+
+def expected_prefix(rows: list[tuple[int, str, datetime]], prefix: str, limit: int) -> list[str]:
+    """The right answer, computed in Python."""
+    matching = sorted(
+        (title.lower(), item_id, title)
+        for item_id, title, _ in rows
+        if title.lower().startswith(prefix.lower())
+    )
+    return [title for _, _, title in matching[:limit]]
+
+
+def expected_order(rows: list[tuple[int, str, datetime]]) -> list[int]:
+    """Every id, newest first by (created_at, id)."""
+    return [
+        item_id for item_id, _, _ in sorted(rows, key=lambda row: (row[2], row[0]), reverse=True)
+    ]
+
+
+def prefix_search_is_right(prefix: str, limit: int) -> bool:
+    """search_prefix agrees with Python on a fresh, indexed database."""
+    engine, rows = indexed_items()
+    with Session(engine) as session:
+        return search_prefix(session, prefix, limit) == expected_prefix(rows, prefix, limit)
+
+
+def keyset_walk_is_right() -> bool:
+    """Walking keyset pages visits every id once, newest first."""
+    engine, rows = indexed_items()
+    return walk_items(engine, 700) == expected_order(rows)
+
+
+def check_exercise_6_4_6() -> None:
+    """Exercise 6 checks."""
+    run_checks(
+        [
+            ("prefix search matches Python", lambda: prefix_search_is_right("Ri", 15), True),
+            ("case does not matter", lambda: prefix_search_is_right("rUbY", 50), True),
+            (
+                "the search uses the expression index",
+                lambda: (
+                    "USING INDEX ix_lab_items_title_lower"
+                    in last_query_plan(
+                        indexed_items()[0], lambda session: search_prefix(session, "ri", 5)
+                    )
+                ),
+                True,
+            ),
+            ("keyset pages cover every item in order", keyset_walk_is_right, True),
+            (
+                "the page query uses the composite index",
+                lambda: (
+                    "ix_lab_items_created_at_id"
+                    in last_query_plan(
+                        indexed_items()[0],
+                        lambda session: keyset_items(
+                            session, (datetime(2026, 1, 1, 8, 0), 1500), 10
+                        ),
+                    )
+                ),
+                True,
+            ),
+        ]
+    )
+
+
+def check_lab_6_4() -> None:
+    """Run every Lab 6.4 check (each check prints PASS/FAIL)."""
+    for title, check in (
+        ("exercise 1", check_exercise_6_4_1),
+        ("exercise 2", check_exercise_6_4_2),
+        ("exercise 3", check_exercise_6_4_3),
+        ("exercise 4", check_exercise_6_4_4),
+        ("exercise 5", check_exercise_6_4_5),
+        ("exercise 6", check_exercise_6_4_6),
+    ):
+        print(f"--- {title}")
+        check()
+
+
 if __name__ == "__main__":
     selected = set(sys.argv[1:])
-    labs = [("Lab 6.1", check_lab_6_1), ("Lab 6.2", check_lab_6_2)]
+    labs = [
+        ("Lab 6.1", check_lab_6_1),
+        ("Lab 6.2", check_lab_6_2),
+        ("Lab 6.3", check_lab_6_3),
+        ("Lab 6.4", check_lab_6_4),
+    ]
     for lab_title, check_lab in labs:
         if selected and lab_title not in selected:
             continue

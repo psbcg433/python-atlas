@@ -1,0 +1,4 @@
+<p class="count">{{ total }} note{{ "" if total == 1 else "s" }}</p>
+<ul class="notes">
+  {% for note in notes %}{% include "_note.html" %}{% else %}<li class="empty">No notes yet.</li>{% endfor %}
+</ul>

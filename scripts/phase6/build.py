@@ -19,12 +19,24 @@ sys.path[:0] = [str(SCRIPTS_DIR), str(PHASE_DIR)]
 
 from nbformat import NotebookNode  # noqa: E402
 
-from nb_builder import md, new_notebook, save_notebook, shared_setup_cells  # noqa: E402
+from nb_builder import code, md, new_notebook, save_notebook, shared_setup_cells  # noqa: E402
 
 NOTEBOOK_TITLE = "Phase 6 — Web Development with FastAPI"
 NOTEBOOK_PATH = REPO_ROOT / "notebooks" / "phase6_web_fastapi.ipynb"
 UNIT_MODULE_NAMES = [f"unit_6_{unit_number}" for unit_number in range(1, 9)]
 PROJECT_MODULE_NAME = "project"
+NOTES_V1_HEADING = "### Notes API v1 — the project files"
+NOTES_V1_FILES = [
+    "README.md",
+    "pyproject.toml",
+    "ruff.toml",
+    "src/notes_api/__init__.py",
+    "src/notes_api/main.py",
+    "src/notes_api/schemas.py",
+    "src/notes_api/store.py",
+    "tests/conftest.py",
+    "tests/test_notes.py",
+]
 
 
 def title_cells() -> list[NotebookNode]:
@@ -126,6 +138,44 @@ def import_optional(module_name: str) -> ModuleType | None:
         return None
 
 
+def notes_v1_prune_cells() -> list[NotebookNode]:
+    """Cells that reset projects/notes_api/ to v1's file set before Unit 6.2 writes v1.
+
+    Later units add files (routers, migrations, more tests). Without this, re-running Unit 6.2
+    after them would run v3 tests against v1's conftest. The helper source lives in unit_6_3.
+    """
+    from unit_6_3 import PRUNE_HELPER_SOURCE
+
+    files = ",\n    ".join(f'"{name}"' for name in NOTES_V1_FILES)
+    return [
+        md(
+            """
+            **Re-running this section after Unit 6.3 or later?** Later units add files to
+            `projects/notes_api/` (routers, migrations, more tests). The next cell deletes every
+            file v1 does not have, so the cells below rebuild exactly v1 and its tests run
+            against v1's code; the Unit 6.3 and 6.4 sections write their versions again.
+            `.venv`, `.env` and `uv.lock` are never touched:
+            """
+        ),
+        code(
+            PRUNE_HELPER_SOURCE
+            + f"\n\nNOTES_V1_FILES = [\n    {files},\n]\n"
+            + 'print("removed:", prune_notes_project(NOTES_V1_FILES))'
+        ),
+        md("Now the project metadata, as described above:"),
+    ]
+
+
+def insert_after_heading(
+    cells: list[NotebookNode], heading: str, extra: list[NotebookNode]
+) -> list[NotebookNode]:
+    """Insert extra right after the markdown cell that starts with heading (if present)."""
+    for index, cell in enumerate(cells):
+        if cell.cell_type == "markdown" and cell.source.startswith(heading):
+            return [*cells[: index + 1], *extra, *cells[index + 1 :]]
+    return cells
+
+
 def unit_cells() -> list[NotebookNode]:
     """Collect cells from every unit module (then the project) that exists, in syllabus order."""
     collected_cells: list[NotebookNode] = []
@@ -134,6 +184,10 @@ def unit_cells() -> list[NotebookNode]:
         if unit_module is None:
             continue
         unit_cell_list = unit_module.cells()
+        if module_name == "unit_6_2":
+            unit_cell_list = insert_after_heading(
+                unit_cell_list, NOTES_V1_HEADING, notes_v1_prune_cells()
+            )
         print(f"{module_name}: {len(unit_cell_list)} cells")
         collected_cells.extend(unit_cell_list)
     return collected_cells

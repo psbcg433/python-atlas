@@ -1,18 +1,30 @@
-"""The Notes API application.
+"""The Notes API application factory.
 
-Unit 6.2 version: path operations, Pydantic schemas, response models, status codes, errors and
-OpenAPI metadata. Later units add dependency injection and routers (6.3), a database (6.4),
-authentication (6.5), background jobs and caching (6.6), observability (6.7) and deployment (6.8).
+Unit 6.4 version: create_app() wires settings, error handlers, middleware, the lifespan (now
+with a database engine) and the routers. Later units add authentication (6.5), background
+jobs and caching (6.6), observability (6.7) and deployment (6.8).
+
+Serve it with `uvicorn notes_api.main:app` (module-level app) or
+`uvicorn --factory notes_api.main:create_app` (a fresh app per process).
 """
 
-from typing import Annotated, Any
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Path, Query, Response, status
+from fastapi import APIRouter, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.routing import APIRoute
+from fastapi.staticfiles import StaticFiles
 
 from notes_api import __version__
-from notes_api.schemas import ErrorMessage, NoteCreate, NoteFilters, NotePage, NoteRead, NoteUpdate
-from notes_api.store import Note, NoteNotFoundError, NoteStore
+from notes_api.core.config import Settings, get_settings
+from notes_api.core.errors import install_error_handlers
+from notes_api.core.lifespan import lifespan
+from notes_api.core.middleware import REQUEST_ID_HEADER, RequestIdMiddleware, TimingMiddleware
+from notes_api.routers import admin, health, notes, pages
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+API_PREFIX = "/api/v1"
 
 
 def operation_id(route: APIRoute) -> str:
@@ -20,82 +32,49 @@ def operation_id(route: APIRoute) -> str:
     return route.name
 
 
-app = FastAPI(
-    title="Notes API",
-    version=__version__,
-    summary="Create, search and organize notes.",
-    description="Built step by step in Phase 6 of the course. Timestamps are UTC, ISO 8601.",
-    openapi_tags=[
-        {"name": "notes", "description": "Create, read, update and delete notes."},
-        {"name": "health", "description": "Liveness probe for load balancers and tests."},
-    ],
-    generate_unique_id_function=operation_id,
-)
-
-notes_store = NoteStore()  # module-level for now; Unit 6.3 turns it into a dependency
-
-NoteId = Annotated[int, Path(ge=1, description="The note's id.")]
-NOT_FOUND: dict[int | str, dict[str, Any]] = {
-    404: {"model": ErrorMessage, "description": "No note has this id."}
-}
+def install_middleware(app: FastAPI, settings: Settings) -> None:
+    """Add middleware; the last one added is the outermost (it sees the request first)."""
+    app.add_middleware(TimingMiddleware)
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=["Content-Type", "X-API-Key", REQUEST_ID_HEADER],
+        expose_headers=[REQUEST_ID_HEADER, "Location", "Server-Timing"],
+        max_age=600,
+    )
+    app.add_middleware(RequestIdMiddleware)
 
 
-def find_note(note_id: int) -> Note:
-    """The stored note, or an HTTP 404."""
-    try:
-        return notes_store.get(note_id)
-    except NoteNotFoundError as error:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """Build a fully wired app; tests pass their own Settings, servers use the environment."""
+    settings = settings or get_settings()
+    app = FastAPI(
+        title=settings.app_name,
+        version=__version__,
+        summary="Create, search and organize notes.",
+        description="Built step by step in Phase 6 of the course. Errors are RFC 9457 problems.",
+        debug=settings.debug,
+        lifespan=lifespan,
+        generate_unique_id_function=operation_id,
+        openapi_tags=[
+            {"name": "notes", "description": "Create, read, update and delete notes."},
+            {"name": "admin", "description": "Bulk operations; need the X-API-Key header."},
+            {"name": "health", "description": "Liveness probe for load balancers and tests."},
+        ],
+    )
+    app.state.settings = settings
+    install_error_handlers(app)
+    install_middleware(app, settings)
+    api_router = APIRouter(prefix=API_PREFIX)
+    api_router.include_router(notes.router)
+    api_router.include_router(admin.router)
+    app.include_router(health.router)
+    app.include_router(api_router)
+    app.include_router(pages.router)
+    app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
+    return app
 
 
-@app.get("/health", tags=["health"])
-async def health() -> dict[str, str]:
-    """Liveness probe."""
-    return {"status": "ok"}
-
-
-@app.post("/notes", response_model=NoteRead, status_code=status.HTTP_201_CREATED, tags=["notes"])
-async def create_note(note: NoteCreate, response: Response) -> Note:
-    """Create a note; the Location header points at it."""
-    created = notes_store.add(note)
-    response.headers["Location"] = app.url_path_for("get_note", note_id=str(created.id))
-    return created
-
-
-@app.get("/notes", response_model=NotePage, tags=["notes"])
-async def list_notes(filters: Annotated[NoteFilters, Query()]) -> dict[str, object]:
-    """Search, filter, sort and paginate notes."""
-    notes, total = notes_store.search(filters)
-    return {"items": notes, "total": total, "limit": filters.limit, "offset": filters.offset}
-
-
-@app.get("/notes/{note_id}", response_model=NoteRead, responses=NOT_FOUND, tags=["notes"])
-async def get_note(note_id: NoteId) -> Note:
-    """Fetch one note."""
-    return find_note(note_id)
-
-
-@app.put("/notes/{note_id}", response_model=NoteRead, responses=NOT_FOUND, tags=["notes"])
-async def replace_note(note_id: NoteId, note: NoteCreate) -> Note:
-    """Replace every field of a note (omitted fields get their defaults)."""
-    find_note(note_id)
-    return notes_store.replace(note_id, note)
-
-
-@app.patch("/notes/{note_id}", response_model=NoteRead, responses=NOT_FOUND, tags=["notes"])
-async def update_note(note_id: NoteId, changes: NoteUpdate) -> Note:
-    """Change only the fields sent in the body."""
-    find_note(note_id)
-    return notes_store.update(note_id, changes)
-
-
-@app.delete(
-    "/notes/{note_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    responses=NOT_FOUND,
-    tags=["notes"],
-)
-async def delete_note(note_id: NoteId) -> None:
-    """Delete a note."""
-    find_note(note_id)
-    notes_store.delete(note_id)
+app = create_app()

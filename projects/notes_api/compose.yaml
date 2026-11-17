@@ -1,0 +1,21 @@
+# Local PostgreSQL for the Notes API:  docker compose up -d --wait   (stop: docker compose down)
+# The password is for local development only; real deployments read secrets from the platform.
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: notes
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notes}
+      POSTGRES_DB: notes
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - notes-db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notes -d notes"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  notes-db:

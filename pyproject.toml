@@ -5,7 +5,9 @@ description = "Notebook-based Python engineering course: language core, CPython 
 requires-python = ">=3.15"
 dependencies = [
     "aiofiles>=25.1.0",
+    "alembic>=1.20.1",
     "anyio>=4.15.1",
+    "asyncpg>=0.32.0",
     "attrs>=26.1.0",
     "beautifulsoup4>=4.15.0",
     "boto3>=1.43.126",
@@ -31,8 +33,10 @@ dependencies = [
     "python-dateutil>=2.9.0.post0",
     "python-dotenv>=1.2.4",
     "pyyaml>=6.0.3",
+    "redis>=8.1.0",
     "requests>=2.34.2",
     "rich>=15.0.0",
+    "sqlalchemy[asyncio]>=2.1.9",
     "tenacity>=9.2.1",
     "typer>=0.28.0",
     "uvloop>=0.23.0 ; sys_platform != 'win32'",
@@ -40,6 +44,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "aiosqlite>=0.22.1",
     "hypothesis>=6.170.15",
     "line-profiler>=5.1.0",
     "memray>=1.20.0 ; sys_platform != 'win32'",
@@ -50,9 +55,11 @@ dev = [
     "pyright>=1.1.414",
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",
+    "respx>=0.23.1",
     "ruff>=0.17.3",
     "scalene>=2.4.0",
     "snakeviz>=2.2.2",
+    "testcontainers>=4.15.0",
 ]
 
 [tool.ruff]

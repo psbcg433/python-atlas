@@ -110,5 +110,5 @@ uv run python exercises/solutions/phase0_solutions.py
 | 3 | `phase3_python_internals.ipynb` | Done (project: [`projects/pyinspect/`](projects/pyinspect/)) | — |
 | 4 | `phase4_professional_python.ipynb` | Done (project: [`projects/log-analyzer/`](projects/log-analyzer/), CI in `.github/workflows/log-analyzer.yml`) | — |
 | 5 | `phase5_concurrency_performance.ipynb` | Done (project: [`projects/sales-report/`](projects/sales-report/), 128× faster at 1M rows) | — |
-| 6 | `phase6_web_fastapi.ipynb` | In progress: Units 6.1–6.2 (app: [`projects/notes_api/`](projects/notes_api/), Notes API v1) | — |
+| 6 | `phase6_web_fastapi.ipynb` | In progress: Units 6.1–6.4 (app: [`projects/notes_api/`](projects/notes_api/), Notes API v3: layered FastAPI app on PostgreSQL with Alembic) | — |
 | — | `capstone_task_tracker.ipynb` | Not started | — |

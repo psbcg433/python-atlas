@@ -1,0 +1,7 @@
+<li class="note{{ ' pinned' if note.pinned }}" id="note-{{ note.id }}">
+  <strong>{{ note.title }}</strong>
+  {% for tag in note.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+  <p>{{ note.body }}</p>
+  <button hx-post="{{ url_for('toggle_pin', note_id=note.id) }}" hx-target="#note-{{ note.id }}"
+          hx-swap="outerHTML">{{ "Unpin" if note.pinned else "Pin" }}</button>
+</li>

@@ -1,8 +1,8 @@
 """Request and response schemas for the Notes API (Pydantic v2).
 
 One schema per direction: NoteCreate (POST/PUT body), NoteUpdate (PATCH body, every field
-optional), NoteRead (responses, with server-owned fields), NoteFilters (query parameters) and
-NotePage (one page of results).
+optional), NoteRead (responses, with server-owned fields) and NoteFilters (query parameters).
+Page envelopes live in pagination.py, error bodies in core/errors.py.
 """
 
 import re
@@ -71,12 +71,17 @@ class NoteCreate(BaseModel):
 class NoteUpdate(BaseModel):
     """Body of PATCH /notes/{note_id}: only the fields being changed."""
 
-    model_config = ConfigDict(extra="forbid", json_schema_extra={"examples": [{"pinned": True}]})
+    model_config = ConfigDict(
+        extra="forbid", json_schema_extra={"examples": [{"pinned": True, "version": 1}]}
+    )
 
     title: Title | None = None
     body: Body | None = None
     tags: Tags | None = None
     pinned: bool | None = None
+    version: Annotated[
+        int | None, Field(ge=1, description="The version you read; a mismatch is a 409.")
+    ] = None
 
     @field_validator("tags")
     @classmethod
@@ -103,6 +108,7 @@ class NoteRead(BaseModel):
     body: str
     tags: list[str]
     pinned: bool
+    version: int
     created_at: datetime
     updated_at: datetime
 
@@ -126,16 +132,27 @@ class NoteFilters(BaseModel):
     offset: Annotated[int, Field(ge=0)] = 0
 
 
-class NotePage(BaseModel):
-    """One page of notes, plus what a client needs to ask for the next one."""
+class FeedParams(BaseModel):
+    """Query parameters of GET /notes/feed: keyset (cursor) pagination, newest first."""
 
-    items: list[NoteRead]
-    total: int
-    limit: int
-    offset: int
+    model_config = ConfigDict(extra="forbid")
+
+    cursor: Annotated[str | None, Field(description="next_cursor from the previous page.")] = None
+    limit: Annotated[int, Field(ge=1, le=100)] = 20
 
 
-class ErrorMessage(BaseModel):
-    """Body of 404 responses (and every HTTPException)."""
+class LinkPreview(BaseModel):
+    """The title of one link found in a note's body (or why it could not be fetched)."""
 
-    detail: str
+    url: str
+    status_code: int | None = None
+    title: str | None = None
+    error: str | None = None
+
+
+class ImportReport(BaseModel):
+    """Result of POST /admin/import."""
+
+    filename: str
+    imported: int
+    ids: list[int]

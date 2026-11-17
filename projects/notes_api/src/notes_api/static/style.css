@@ -1,0 +1,7 @@
+body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 42rem; padding: 1rem; }
+.new-note { display: grid; gap: 0.5rem; margin-bottom: 1rem; }
+.notes { list-style: none; padding: 0; }
+.note { border: 1px solid #ccc; border-radius: 0.5rem; margin: 0.5rem 0; padding: 0.5rem 1rem; }
+.note.pinned { border-color: #c80; background: #fff8e8; }
+.tag { background: #eef; border-radius: 0.25rem; font-size: 0.8rem; margin-left: 0.25rem; padding: 0 0.3rem; }
+.error { color: #b00; margin: 0; }

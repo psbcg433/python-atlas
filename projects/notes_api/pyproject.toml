@@ -1,16 +1,23 @@
 [project]
 name = "notes-api"
-version = "0.1.0"
+version = "0.3.0"
 description = "The Phase 6 Notes API: a FastAPI service built step by step from Unit 6.2 to 6.8."
 readme = "README.md"
 requires-python = ">=3.15"
 dependencies = [
     "fastapi[standard]>=0.163.1",
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
+    "pydantic-settings>=2.16.2",
+    "sqlalchemy[asyncio]>=2.1.9",
 ]
 
 [dependency-groups]
 dev = [
+    "aiosqlite>=0.22.1",
     "pytest>=9.2.0",
+    "respx>=0.23.1",
+    "testcontainers>=4.15.0",
 ]
 
 [build-system]
@@ -21,3 +28,5 @@ build-backend = "uv_build"
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
+markers = ["postgres: needs Docker; runs against PostgreSQL in a testcontainer"]
+filterwarnings = ["ignore::DeprecationWarning:testcontainers.*"]
