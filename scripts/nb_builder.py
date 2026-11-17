@@ -52,6 +52,35 @@ def predict_cells(snippet: str, answer: str, proof: str) -> list[NotebookNode]:
     ]
 
 
+def writefile_cells(source: str, parts: list[tuple[str, str]]) -> list[NotebookNode]:
+    """Write one module with several ``%%writefile`` cells, each preceded by its own explanation.
+
+    The first cell creates the file and the others append to it (``%%writefile -a``). Each
+    continuation starts with two blank lines (one when it starts inside a class, at an indented
+    method), so the file is byte-identical to a single-cell version.
+
+    Args:
+        source: The whole cell text: a ``%%writefile <path>`` line followed by the module.
+        parts: ``(first line of the part, markdown for it)`` in file order. The first part's line
+            is ignored (it starts at the top); each later line must start a statement that is
+            preceded by blank lines (a top-level definition, or a method inside a class).
+    """
+    magic_line, module_text = _clean(source).split("\n", 1)
+    path = magic_line.removeprefix("%%writefile").strip()
+    starts = [0] + [module_text.index("\n" + first_line) + 1 for first_line, _ in parts[1:]]
+    cells: list[NotebookNode] = []
+    for number, (_, explanation) in enumerate(parts):
+        end = starts[number + 1] if number + 1 < len(starts) else len(module_text)
+        chunk = module_text[starts[number] : end].strip("\n")
+        if number == 0:
+            text = f"%%writefile {path}\n{chunk}"
+        else:
+            blank_lines = "\n" if parts[number][0].startswith(" ") else "\n\n"
+            text = f"%%writefile -a {path}\n{blank_lines}{chunk}"
+        cells += [md(explanation), nbformat.v4.new_code_cell(text)]
+    return cells
+
+
 SHARED_SETUP_SOURCE = '''
 import inspect
 import os

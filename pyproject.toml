@@ -5,10 +5,12 @@ description = "Notebook-based Python engineering course: language core, CPython 
 requires-python = ">=3.15"
 dependencies = [
     "aiofiles>=25.1.0",
+    "anyio>=4.15.1",
     "attrs>=26.1.0",
     "beautifulsoup4>=4.15.0",
     "boto3>=1.43.126",
     "cachetools>=8.0.0",
+    "fastapi[standard]>=0.163.1",
     "httpx>=0.28.1",
     "ipykernel>=7.4.0",
     "jinja2>=3.1.6",

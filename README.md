@@ -50,7 +50,7 @@ every chapter.
 ├── uv.lock               # exact dependency versions and hashes
 ├── notebooks/            # one .ipynb per phase
 ├── notes/                # textbook-style study notes: notes/phaseN/
-├── projects/             # code that outgrows a notebook: pyinspect/ (Phase 3), log-analyzer/ (Phase 4), sales-report/ (Phase 5), FastAPI apps later
+├── projects/             # code that outgrows a notebook: pyinspect/ (Phase 3), log-analyzer/ (Phase 4), sales-report/ (Phase 5), notes_api/ (Phase 6)
 ├── exercises/solutions/  # lab reference solutions: phaseN_solutions.py
 └── scripts/              # notebook build scripts: nb_builder.py, phaseN/build.py, phaseN/unit_N_M.py
 ```
@@ -110,5 +110,5 @@ uv run python exercises/solutions/phase0_solutions.py
 | 3 | `phase3_python_internals.ipynb` | Done (project: [`projects/pyinspect/`](projects/pyinspect/)) | — |
 | 4 | `phase4_professional_python.ipynb` | Done (project: [`projects/log-analyzer/`](projects/log-analyzer/), CI in `.github/workflows/log-analyzer.yml`) | — |
 | 5 | `phase5_concurrency_performance.ipynb` | Done (project: [`projects/sales-report/`](projects/sales-report/), 128× faster at 1M rows) | — |
-| 6 | `phase6_web_fastapi.ipynb` | Not started | — |
+| 6 | `phase6_web_fastapi.ipynb` | In progress: Units 6.1–6.2 (app: [`projects/notes_api/`](projects/notes_api/), Notes API v1) | — |
 | — | `capstone_task_tracker.ipynb` | Not started | — |

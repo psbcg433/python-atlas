@@ -1,0 +1,3 @@
+# Extends the course configuration; notes_api (src/) and the tests are first-party imports.
+extend = "../../pyproject.toml"
+src = ["src", "tests"]

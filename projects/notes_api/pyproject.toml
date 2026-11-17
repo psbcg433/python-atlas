@@ -1,0 +1,23 @@
+[project]
+name = "notes-api"
+version = "0.1.0"
+description = "The Phase 6 Notes API: a FastAPI service built step by step from Unit 6.2 to 6.8."
+readme = "README.md"
+requires-python = ">=3.15"
+dependencies = [
+    "fastapi[standard]>=0.163.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
