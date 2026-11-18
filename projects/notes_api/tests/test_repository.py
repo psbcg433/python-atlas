@@ -13,7 +13,7 @@ from notes_api.core.config import Settings
 from notes_api.db import create_engine_from_settings, make_session_factory
 from notes_api.exceptions import VersionConflictError
 from notes_api.models import Note, Tag
-from notes_api.repositories import SqlNoteRepository
+from notes_api.repositories import SqlNoteRepository, SqlUserRepository
 from notes_api.schemas import NoteCreate
 
 pytestmark = pytest.mark.anyio
@@ -30,9 +30,14 @@ async def session_factory(settings: Settings) -> AsyncIterator[async_sessionmake
 
 
 async def add_note(factory: async_sessionmaker[AsyncSession], **fields: object) -> int:
-    """Create and commit one note; return its id."""
+    """Create and commit one note (owned by a user created on first use); return its id."""
     async with factory() as session, session.begin():
-        note = await SqlNoteRepository(session).add(NoteCreate(title="Tea", **fields), NOW)
+        users = SqlUserRepository(session)
+        owner = await users.user_by_email("owner@example.com")
+        owner = owner or await users.add_user("owner@example.com", None, "user")
+        note = await SqlNoteRepository(session).add(
+            NoteCreate(title="Tea", **fields), NOW, owner.id
+        )
         return note.id
 
 

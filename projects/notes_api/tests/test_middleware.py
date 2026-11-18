@@ -70,9 +70,24 @@ def test_simple_cors_request_exposes_headers(client: TestClient) -> None:
 
 
 def test_middleware_order(app: FastAPI) -> None:
-    """Outermost first: request id, CORS, GZip, timing (the last one added runs first)."""
+    """Outermost first: request id, security headers, CORS, GZip, timing."""
     names = [middleware.cls.__name__ for middleware in app.user_middleware]
-    assert names == ["RequestIdMiddleware", "CORSMiddleware", "GZipMiddleware", "TimingMiddleware"]
+    assert names == [
+        "RequestIdMiddleware",
+        "SecurityHeadersMiddleware",
+        "CORSMiddleware",
+        "GZipMiddleware",
+        "TimingMiddleware",
+    ]
     assert {RequestIdMiddleware, TimingMiddleware} <= {
         middleware.cls for middleware in app.user_middleware
     }
+
+
+def test_security_headers(client: TestClient) -> None:
+    """HSTS, nosniff, frame denial and a CSP on API responses; the docs get their own CSP."""
+    headers = client.get("/health").headers
+    assert headers["strict-transport-security"].startswith("max-age=31536000")
+    assert (headers["x-content-type-options"], headers["x-frame-options"]) == ("nosniff", "DENY")
+    assert "frame-ancestors 'none'" in headers["content-security-policy"]
+    assert "cdn.jsdelivr.net" in client.get("/docs").headers["content-security-policy"]

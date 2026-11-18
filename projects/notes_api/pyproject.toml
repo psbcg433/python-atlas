@@ -1,20 +1,25 @@
 [project]
 name = "notes-api"
-version = "0.3.0"
+version = "0.5.0"
 description = "The Phase 6 Notes API: a FastAPI service built step by step from Unit 6.2 to 6.8."
 readme = "README.md"
 requires-python = ">=3.15"
 dependencies = [
     "fastapi[standard]>=0.163.1",
     "alembic>=1.20.1",
+    "arq>=0.25.0",
     "asyncpg>=0.32.0",
+    "pwdlib[argon2]>=0.4.2",
     "pydantic-settings>=2.16.2",
+    "pyjwt[crypto]>=2.15.1",
+    "redis>=8.1.0",
     "sqlalchemy[asyncio]>=2.1.9",
 ]
 
 [dependency-groups]
 dev = [
     "aiosqlite>=0.22.1",
+    "fakeredis>=2.40.0",
     "pytest>=9.2.0",
     "respx>=0.23.1",
     "testcontainers>=4.15.0",
@@ -24,9 +29,17 @@ dev = [
 requires = ["uv_build>=0.13,<0.14"]
 build-backend = "uv_build"
 
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
-markers = ["postgres: needs Docker; runs against PostgreSQL in a testcontainer"]
-filterwarnings = ["ignore::DeprecationWarning:testcontainers.*"]
+markers = [
+    "postgres: needs Docker; runs against PostgreSQL in a testcontainer",
+    "redis: needs Docker; runs against Redis and the ARQ worker in a testcontainer",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:testcontainers.*",
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:arq.*",
+    "ignore:Call to deprecated close:DeprecationWarning",
+]

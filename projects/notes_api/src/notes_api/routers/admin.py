@@ -1,18 +1,29 @@
-"""/api/v1/admin: bulk import (file upload), export and wipe. Every route needs X-API-Key."""
+"""/api/v1/admin: bulk import (file upload), export and wipe. Admin role + admin scope."""
 
+import time
 from http import HTTPStatus
 
-from fastapi import APIRouter, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 
-from notes_api.dependencies import ApiKeyDep, NoteServiceDep, SettingsDep
+from notes_api.dependencies import (
+    NoteCacheDep,
+    QueueDep,
+    RepositoryDep,
+    SessionDep,
+    SettingsDep,
+    WriterServiceDep,
+    require_admin,
+)
 from notes_api.exceptions import UploadRejectedError
+from notes_api.models import OutboxEvent
 from notes_api.schemas import ImportReport, NoteFilters, NoteRead
 from notes_api.services import parse_import
 
 ALLOWED_UPLOADS = {".json": {"application/json"}, ".csv": {"text/csv", "application/vnd.ms-excel"}}
 
-router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[ApiKeyDep])
+router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
 
 async def read_upload(upload: UploadFile, max_bytes: int) -> bytes:
@@ -33,27 +44,65 @@ async def read_upload(upload: UploadFile, max_bytes: int) -> bytes:
 
 @router.post("/import", response_model=ImportReport, status_code=status.HTTP_201_CREATED)
 async def import_notes(
-    file: UploadFile, service: NoteServiceDep, settings: SettingsDep
+    file: UploadFile, service: WriterServiceDep, settings: SettingsDep
 ) -> ImportReport:
-    """Create notes from an uploaded .json list or .csv file (all or nothing)."""
+    """Create notes (owned by the admin) from an uploaded .json list or .csv file."""
     content = await read_upload(file, settings.max_upload_bytes)
     notes = parse_import(file.filename or "", content)
     created = await service.import_notes(notes)
-    return ImportReport(
-        filename=file.filename or "", imported=len(created), ids=[note.id for note in created]
-    )
+    ids = [note.id for note in created]
+    return ImportReport(filename=file.filename or "", imported=len(created), ids=ids)
 
 
 @router.get("/export")
-async def export_notes(service: NoteServiceDep) -> JSONResponse:
-    """Every note as a downloadable JSON file."""
-    notes, _total = await service.search(NoteFilters(limit=100, sort="created_at"))
+async def export_notes(repository: RepositoryDep) -> JSONResponse:
+    """Every user's notes as a downloadable JSON file."""
+    notes, _total = await repository.search(NoteFilters(limit=100, sort="created_at"), None)
     payload = [NoteRead.model_validate(note).model_dump(mode="json") for note in notes]
     headers = {"Content-Disposition": 'attachment; filename="notes.json"'}
     return JSONResponse(payload, headers=headers)
 
 
 @router.delete("/notes")
-async def delete_all_notes(service: NoteServiceDep) -> dict[str, int]:
-    """Remove every note."""
-    return {"deleted": await service.delete_all()}
+async def delete_all_notes(repository: RepositoryDep) -> dict[str, int]:
+    """Remove every note of every user."""
+    return {"deleted": await repository.delete_all()}
+
+
+@router.get("/cache-stats")
+async def cache_stats(cache: NoteCacheDep) -> dict[str, float]:
+    """Note-cache hits, misses and hit rate."""
+    return await cache.stats()
+
+
+@router.get("/webhooks/dead")
+async def dead_webhooks(session: SessionDep) -> list[dict[str, object]]:
+    """The dead-letter list: events whose webhook failed on every attempt."""
+    statement = (
+        select(OutboxEvent).where(OutboxEvent.webhook_status == "dead").order_by(OutboxEvent.id)
+    )
+    events = await session.scalars(statement)
+    return [
+        {
+            "id": event.id,
+            "type": event.event_type,
+            "attempts": event.webhook_attempts,
+            "error": event.last_error,
+        }
+        for event in events
+    ]
+
+
+@router.post("/webhooks/dead/{event_id}/retry", status_code=status.HTTP_202_ACCEPTED)
+async def retry_dead_webhook(
+    event_id: int, session: SessionDep, queue: QueueDep
+) -> dict[str, object]:
+    """Send a dead-lettered event again (after the receiver was fixed)."""
+    event = await session.get(OutboxEvent, event_id)
+    if event is None or event.webhook_status != "dead":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no dead webhook for event {event_id}")
+    event.webhook_status, event.webhook_attempts = "pending", 0
+    await queue.enqueue_job(
+        "deliver_webhook", event_id, _job_id=f"webhook:{event_id}:retry:{time.time_ns()}"
+    )
+    return {"id": event_id, "status": "pending"}

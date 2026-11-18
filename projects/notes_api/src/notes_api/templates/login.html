@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Log in{% endblock %}
+{% block content %}
+<h1>Log in</h1>
+<form method="post" action="{{ url_for('login_form') }}" class="new-note">
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input name="email" type="email" placeholder="Email" value="{{ email }}" autocomplete="username">
+  <input name="password" type="password" placeholder="Password" autocomplete="current-password">
+  <button type="submit">Log in</button>
+</form>
+{% endblock %}

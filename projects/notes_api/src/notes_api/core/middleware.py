@@ -67,3 +67,48 @@ class TimingMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_timing)
+
+
+API_CSP = (
+    "default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self'; "
+    "img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+)
+DOCS_CSP = (  # Swagger UI and ReDoc load their scripts and styles from a CDN
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+    "img-src 'self' data: https://fastapi.tiangolo.com; font-src https://fonts.gstatic.com; "
+    "frame-ancestors 'none'"
+)
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",  # HTTPS from now on
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+}
+
+
+class SecurityHeadersMiddleware:
+    """Pure ASGI: HSTS, CSP and friends on every HTTP response (OWASP API8)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Wrap the next ASGI app."""
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Add the headers when the response starts (unless the app set them itself)."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        is_docs = scope["path"].startswith(("/docs", "/redoc"))
+
+        async def send_with_headers(message: Message) -> None:
+            """Set the security headers on the response start message."""
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in SECURITY_HEADERS.items():
+                    headers.setdefault(name, value)
+                headers.setdefault("Content-Security-Policy", DOCS_CSP if is_docs else API_CSP)
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)

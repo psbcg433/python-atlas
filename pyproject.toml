@@ -7,6 +7,7 @@ dependencies = [
     "aiofiles>=25.1.0",
     "alembic>=1.20.1",
     "anyio>=4.15.1",
+    "arq>=0.25.0",
     "asyncpg>=0.32.0",
     "attrs>=26.1.0",
     "beautifulsoup4>=4.15.0",
@@ -28,8 +29,10 @@ dependencies = [
     "pandas>=3.1.1",
     "pillow>=13.0.0",
     "polars>=2.1.0",
+    "pwdlib[argon2]>=0.4.2",
     "pydantic>=2.14.3",
     "pydantic-settings>=2.16.2",
+    "pyjwt[crypto]>=2.15.1",
     "python-dateutil>=2.9.0.post0",
     "python-dotenv>=1.2.4",
     "pyyaml>=6.0.3",
@@ -45,6 +48,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "aiosqlite>=0.22.1",
+    "fakeredis>=2.40.0",
     "hypothesis>=6.170.15",
     "line-profiler>=5.1.0",
     "memray>=1.20.0 ; sys_platform != 'win32'",

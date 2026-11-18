@@ -1,8 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Notes</h1>
+<header class="bar">
+  <h1>Notes</h1>
+  <form method="post" action="{{ url_for('logout_form') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <span>{{ user.email }}</span> <button type="submit">Log out</button>
+  </form>
+</header>
 <form method="post" action="{{ url_for('create_from_form') }}" class="new-note">
   {% for error in errors %}<p class="error">{{ error }}</p>{% endfor %}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="title" placeholder="Title" value="{{ form.title or '' }}">
   <textarea name="body" placeholder="Body">{{ form.body or '' }}</textarea>
   <input name="tags" placeholder="tags, separated by spaces" value="{{ form.tags or '' }}">

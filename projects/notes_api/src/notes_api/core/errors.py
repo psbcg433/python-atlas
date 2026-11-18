@@ -66,6 +66,7 @@ async def domain_error_handler(request: Request, error: DomainError) -> JSONResp
         str(error),
         problem_type=error.problem_type,
         title=error.title,
+        headers=error.headers or None,
     )
 
 

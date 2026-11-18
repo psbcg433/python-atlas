@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
+import fakeredis
 import pytest
 import sqlalchemy as sa
 from alembic import command
@@ -18,9 +19,11 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from helpers import USER_EMAIL, auth_headers
 from notes_api.core.config import Settings
+from notes_api.dependencies import get_redis
 from notes_api.main import create_app
-from notes_api.repositories import SqlNoteRepository
+from notes_api.repositories import SqlNoteRepository, SqlUserRepository
 from notes_api.schemas import NoteCreate
 
 pytestmark = pytest.mark.postgres
@@ -68,7 +71,9 @@ def empty_url(postgres_url: str) -> str:
         """TRUNCATE all tables."""
         engine = create_async_engine(postgres_url)
         async with engine.begin() as connection:
-            await connection.execute(sa.text("TRUNCATE notes, tags RESTART IDENTITY CASCADE"))
+            await connection.execute(
+                sa.text("TRUNCATE notes, tags, users RESTART IDENTITY CASCADE")
+            )
         await engine.dispose()
 
     asyncio.run(truncate())
@@ -85,10 +90,15 @@ def test_api_round_trip_on_postgres(empty_url: str) -> None:
     settings = Settings(
         _env_file=None,
         environment="test",
-        api_key=SecretStr(secrets.token_urlsafe(16)),
+        jwt_secret=SecretStr(secrets.token_urlsafe(32)),
+        password_time_cost=1,
+        password_memory_kib=64,
         database_url=SecretStr(empty_url),
     )
-    with TestClient(create_app(settings)) as client:
+    app = create_app(settings)
+    app.dependency_overrides[get_redis] = lambda: fakeredis.FakeAsyncRedis(decode_responses=True)
+    with TestClient(app) as client:
+        client.headers.update(auth_headers(client, USER_EMAIL))
         for title in ("Buy Tea", "Steep the tea", "Call Ravi"):
             assert (
                 client.post("/api/v1/notes", json={"title": title, "tags": ["x"]}).status_code
@@ -135,12 +145,14 @@ def test_concurrent_new_tag_is_absorbed_by_the_savepoint(empty_url: str) -> None
         engine = create_async_engine(empty_url)
         factory = async_sessionmaker(engine, expire_on_commit=False)
         first_flushed = asyncio.Event()
+        async with factory() as session, session.begin():
+            owner = await SqlUserRepository(session).add_user("racer@example.com", None, "user")
 
         async def first() -> list[str]:
             """Insert the tag, hold the transaction open for a moment, then commit."""
             async with factory() as session, session.begin():
                 note = await SqlNoteRepository(session).add(
-                    NoteCreate(title="A", tags=["race"]), now
+                    NoteCreate(title="A", tags=["race"]), now, owner.id
                 )
                 first_flushed.set()
                 await asyncio.sleep(0.3)  # the second transaction blocks on the unique index
@@ -151,7 +163,7 @@ def test_concurrent_new_tag_is_absorbed_by_the_savepoint(empty_url: str) -> None
             await first_flushed.wait()
             async with session_factory() as session, session.begin():
                 note = await SqlNoteRepository(session).add(
-                    NoteCreate(title="B", tags=["race"]), now
+                    NoteCreate(title="B", tags=["race"]), now, owner.id
                 )
                 return list(note.tags)
 

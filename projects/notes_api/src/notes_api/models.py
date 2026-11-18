@@ -1,9 +1,9 @@
-"""SQLAlchemy 2.0 typed models: notes and tags (many-to-many), with optimistic locking."""
+"""SQLAlchemy 2.0 typed models: users, their notes and tags, refresh tokens and API keys."""
 
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Column, ForeignKey, Index, String, Table, Text, false, func, text
+from sqlalchemy import Column, ForeignKey, Index, String, Table, Text, false, func, text, true
 from sqlalchemy.ext.associationproxy import AssociationProxy, association_proxy
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -28,6 +28,77 @@ note_tags = Table(
     Column("note_id", ForeignKey("notes.id", ondelete="CASCADE"), primary_key=True),
     Column("tag_id", ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
 )
+
+
+class User(TimestampMixin, Base):
+    """An account. password_hash is None for users who only sign in with a third party."""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(20), server_default="user")
+    is_active: Mapped[bool] = mapped_column(server_default=true())
+    oidc_subject: Mapped[str | None] = mapped_column(String(255), unique=True)  # "issuer|sub"
+    webhook_url: Mapped[str | None] = mapped_column(String(500))
+    webhook_secret: Mapped[str | None] = mapped_column(String(64))  # needed to sign: not hashed
+
+    def __repr__(self) -> str:
+        """Never show the hash."""
+        return f"User(id={self.id!r}, email={self.email!r}, role={self.role!r})"
+
+
+class RefreshToken(Base):
+    """One opaque refresh token (only its SHA-256 is stored); a family shares one login."""
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    family_id: Mapped[str] = mapped_column(String(32), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    scopes: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime]
+    used_at: Mapped[datetime | None]  # set when it was exchanged (rotation)
+    revoked_at: Mapped[datetime | None]  # set at logout or when reuse was detected
+
+
+class ApiKey(TimestampMixin, Base):
+    """A personal API key: shown once, stored as a SHA-256, limited to some scopes."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    prefix: Mapped[str] = mapped_column(String(16))  # shown in lists, so users can tell keys apart
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    scopes: Mapped[str] = mapped_column(String(200))
+    last_used_at: Mapped[datetime | None]
+    revoked_at: Mapped[datetime | None]
+
+
+class OutboxEvent(Base):
+    """A domain event written in the same transaction as the change (transactional outbox).
+
+    The relay worker publishes it (Redis pub/sub) and hands webhooks to the queue; webhook
+    attempts are counted here, and an event that keeps failing ends up 'dead'.
+    """
+
+    __tablename__ = "outbox_events"
+    __table_args__ = (Index("ix_outbox_events_published_at_id", "published_at", "id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    event_type: Mapped[str] = mapped_column(String(50))
+    payload: Mapped[str] = mapped_column(Text)  # JSON
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    published_at: Mapped[datetime | None]  # set by the relay
+    webhook_status: Mapped[str] = mapped_column(String(20), server_default="none")
+    webhook_attempts: Mapped[int] = mapped_column(server_default=text("0"))
+    last_error: Mapped[str | None] = mapped_column(Text)
 
 
 class Tag(Base):
@@ -60,6 +131,7 @@ class Note(TimestampMixin, Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     title: Mapped[str] = mapped_column(String(200))
     body: Mapped[str] = mapped_column(Text, server_default="")
     pinned: Mapped[bool] = mapped_column(server_default=false())

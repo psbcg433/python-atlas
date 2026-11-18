@@ -8,71 +8,91 @@ Phase 6 of the course (`notebooks/phase6_web_fastapi.ipynb`); the notebook write
 | v1 | 6.2 | CRUD path operations, Pydantic v2 schemas, filtering and pagination, OpenAPI |
 | v2 | 6.3 | `create_app()` factory, routers under `/api/v1`, settings, dependency injection, middleware, CORS, Problem Details errors, lifespan HTTP client, uploads, cursor pagination, HTML pages |
 | v3 | 6.4 | PostgreSQL with async SQLAlchemy 2.0 (typed models, many-to-many tags), a session per request, Alembic migrations, optimistic locking (409), trigram search, keyset pagination on an index |
+| v4 | 6.5 | users (Argon2id), JWT access tokens with scopes and roles, rotating refresh tokens with reuse detection, logout and revocation, owner-only notes, hashed API keys, Redis login rate limiting, cookie login with CSRF for the pages, OpenID Connect login, SSRF-safe link previews, security headers, log redaction |
+| v5 | 6.6 | an ARQ worker: transactional outbox relay, signed webhooks with retries and a dead-letter list, exports with SSE progress, scheduled clean-up with locks; a WebSocket feed fanned out through Redis pub/sub; ETags, 304 and Cache-Control; Redis cache-aside with stampede protection and hit-rate stats; a welcome email from BackgroundTasks |
 
 ## Run
 
 ```bash
 cd projects/notes_api
-cp .env.example .env                          # then put a real NOTES_API_KEY in .env
-docker compose up -d --wait                   # PostgreSQL 18 on 127.0.0.1:5432
+cp .env.example .env                          # then set NOTES_JWT_SECRET (and the rest) in .env
+docker compose up -d --wait                   # PostgreSQL 18 and Redis 7.4 on 127.0.0.1
 uv run alembic upgrade head                   # create the tables
 uv run uvicorn notes_api.main:app --reload    # http://127.0.0.1:8000/ and /docs
-uv run pytest                                 # SQLite tests + PostgreSQL tests (needs Docker)
-uv run pytest -m "not postgres"               # only the fast SQLite tests
+uv run python -m notes_api.worker             # the ARQ worker (second terminal)
+uv run pytest                                 # fast tests + PostgreSQL / Redis tests (Docker)
+uv run pytest -m "not postgres and not redis" # only the fast tests (SQLite, fakeredis)
 docker compose down                           # add -v to delete the data volume
 ```
 
-New migration after changing `models.py`: `uv run alembic revision --autogenerate -m "..."`,
-review the file in `alembic/versions/`, then `uv run alembic upgrade head`.
+Local plain HTTP: set `NOTES_COOKIE_SECURE=false`, or the browser will not send the session
+cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
 
 
 ## Endpoints
 
-| Method | Path | Success | Notes |
+| Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| `GET` | `/health` | 200 | liveness probe |
-| `GET` | `/health/ready` | 200 | readiness: runs `SELECT 1` (503 without a database) |
-| `POST` | `/api/v1/notes` | 201 | `Location` header; body `NoteCreate` |
-| `GET` | `/api/v1/notes` | 200 | `q`, `tag` (repeatable), `pinned`, `sort`, `limit` (1-100), `offset` → `Page[NoteRead]` |
-| `GET` | `/api/v1/notes/feed` | 200 | newest first; `limit`, `cursor` → `CursorPage[NoteRead]` |
-| `GET` | `/api/v1/notes/{note_id}` | 200 | 404 problem if unknown |
-| `PUT` | `/api/v1/notes/{note_id}` | 200 | replaces every field |
-| `PATCH` | `/api/v1/notes/{note_id}` | 200 | only the fields sent; explicit `null` is rejected; optional `version` → 409 if stale |
-| `DELETE` | `/api/v1/notes/{note_id}` | 204 | |
-| `GET` | `/api/v1/notes/{note_id}/links` | 200 | titles of the links in the body |
-| `POST` | `/api/v1/admin/import` | 201 | `X-API-Key`; multipart `.json` / `.csv` file |
-| `GET` | `/api/v1/admin/export` | 200 | `X-API-Key`; JSON download |
-| `DELETE` | `/api/v1/admin/notes` | 200 | `X-API-Key`; removes every note |
-| `GET` | `/` | 200 | HTML page (Jinja2 + HTMX); `POST /notes` form, `POST /notes/{id}/pin` |
+| `GET` | `/health`, `/health/ready` | none | liveness; readiness runs `SELECT 1` |
+| `POST` | `/api/v1/auth/register` | none | 201; rate limited; never accepts a role |
+| `POST` | `/api/v1/auth/token` | none | OAuth2 password form (`username` = email, optional `scope`); rate limited (429 + `Retry-After`) |
+| `POST` | `/api/v1/auth/refresh` | refresh token | rotation: each refresh token works once; reuse revokes the family |
+| `POST` | `/api/v1/auth/logout` | refresh token (+ bearer) | revokes the family and denies the access token |
+| `GET` | `/api/v1/auth/oauth/login`, `/oauth/callback` | none | OpenID Connect (Authorization Code + PKCE); 404 unless configured |
+| `GET` | `/api/v1/users/me` | bearer or key | the current user |
+| `POST/GET/DELETE` | `/api/v1/users/me/api-keys[/{id}]` | bearer | keys are shown once, stored as SHA-256, limited to scopes |
+| `POST/GET` | `/api/v1/notes` | `notes:write` / `notes:read` | only the caller's notes |
+| `GET` | `/api/v1/notes/feed` | `notes:read` | keyset pagination |
+| `GET/PUT/PATCH/DELETE` | `/api/v1/notes/{note_id}` | `notes:read` / `notes:write` | someone else's note is a 404; PATCH `version` → 409 if stale |
+| `GET` | `/api/v1/notes/{note_id}/links` | `notes:read` | link titles; private addresses are never fetched |
+| `GET/PUT/DELETE` | `/api/v1/users/me/webhook` | bearer | a public URL; PUT returns the signing secret once |
+| `POST` | `/api/v1/exports` | any user | 202 + `Location`; an ARQ job builds the export |
+| `GET` | `/api/v1/exports/{id}`, `/download`, `/events` | owner | status, JSON file, `text/event-stream` progress (`Last-Event-ID`) |
+| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth |
+| `POST/GET/DELETE` | `/api/v1/admin/import`, `/export`, `/notes` | admin role + `admin` scope | bulk operations |
+| `GET/POST` | `/api/v1/admin/cache-stats`, `/webhooks/dead[/{id}/retry]` | admin | cache hit rate; dead-letter list and replay |
+| `GET/POST` | `/login`, `/logout`, `/`, `/notes`, `/notes/{id}/pin` | session cookie + CSRF token | HTML (Jinja2 + HTMX) |
 
-Errors are `application/problem+json` (RFC 9457) with `type`, `title`, `status`, `detail`,
-`instance` and `request_id`. Every response carries `X-Request-ID` and `Server-Timing`.
+Credentials: `Authorization: Bearer <access token>` or `X-API-Key: nk_...`. Errors are
+`application/problem+json` (RFC 9457). Every response carries `X-Request-ID`,
+`Server-Timing` and security headers (HSTS, CSP, `X-Content-Type-Options`, `X-Frame-Options`).
+`GET /api/v1/notes/{id}` sends `ETag` and `Cache-Control: private, no-cache` and answers
+`If-None-Match` with 304. Webhooks carry `X-Notes-Event-Id` and
+`X-Notes-Signature: t=<unix time>,v1=<HMAC-SHA256 of "t.body">`.
 
 
 ## Layout
 
 ```text
 src/notes_api/
-├── main.py           # create_app(): settings, handlers, middleware, lifespan, routers
-├── core/             # config.py, errors.py, middleware.py, lifespan.py
-├── routers/          # health.py, notes.py, admin.py, pages.py  (HTTP only)
-├── dependencies.py   # Annotated aliases: NoteServiceDep, SettingsDep, ApiKeyDep, ...
-├── services.py       # NoteService, parse_import, LinkPreviewer  (business logic)
-├── repositories.py   # NoteRepository Protocol + SqlNoteRepository (storage)
-├── models.py         # SQLAlchemy models: Note, Tag, note_tags
+├── main.py           # create_app(): settings, security, handlers, middleware, routers
+├── core/             # config.py, errors.py, middleware.py, lifespan.py, logging.py (redaction)
+├── routers/          # health, auth, users, notes, exports, realtime, admin, pages
+├── dependencies.py   # principal / scopes / roles, sessions, Redis, services as Annotated aliases
+├── auth.py           # AuthService: register, login, rotate, logout, API keys, OIDC accounts
+├── oauth.py          # OidcClient: Authorization Code + PKCE, ID-token verification
+├── security.py       # Argon2id hasher, TokenService (PyJWT), Principal, scopes
+├── ratelimit.py      # FixedWindowRateLimiter on Redis
+├── worker.py         # ARQ tasks (relay, webhooks, exports, purge) + run_worker()
+├── events.py         # outbox events, Redis channels, webhook signatures
+├── cache.py          # NoteCache: cache-aside, TTL jitter, stampede lock, stats
+├── exports.py        # export progress in Redis Streams, SSE formatting
+├── mailer.py         # Mailer protocol, LogMailer, the welcome email
+├── services.py       # NoteService (owner-scoped), parse_import, LinkPreviewer (SSRF-safe)
+├── repositories.py   # NoteRepository / SqlNoteRepository, SqlUserRepository
+├── models.py         # User, RefreshToken, ApiKey, OutboxEvent, Note, Tag, note_tags
 ├── db.py             # Base (naming convention), UTCDateTime, engine, session factory
 ├── exceptions.py     # DomainError and subclasses (no FastAPI)
 ├── schemas.py        # Pydantic request/response models
 ├── pagination.py     # Page[T], CursorPage[T], cursors
-├── templates/        # Jinja2 templates
+├── templates/        # Jinja2 templates (login, notes)
 └── static/           # CSS
-alembic/              # env.py (async) + versions/0001-0003
-alembic.ini
-compose.yaml          # local PostgreSQL
-tests/                # pytest + TestClient, one app and one SQLite file per test;
-                      # test_postgres.py runs on PostgreSQL in a testcontainer
+alembic/              # env.py (async) + versions/0001-0006
+compose.yaml          # local PostgreSQL and Redis
+tests/                # pytest: one app, SQLite file and fakeredis per test;
+                      # test_postgres.py / test_redis_worker.py use testcontainers
 ```
 
 Dependencies point inwards: routers → services → repositories → models. Nothing in
-`services.py`, `repositories.py`, `models.py`, `db.py` or `exceptions.py` imports FastAPI;
-`core/errors.py` maps domain exceptions to HTTP responses.
+`services.py`, `auth.py`, `security.py`, `repositories.py`, `models.py`, `db.py` or
+`exceptions.py` imports FastAPI; `core/errors.py` maps domain exceptions to HTTP responses.

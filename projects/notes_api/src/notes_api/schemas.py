@@ -13,7 +13,9 @@ from pydantic import (
     AfterValidator,
     BaseModel,
     ConfigDict,
+    EmailStr,
     Field,
+    HttpUrl,
     StringConstraints,
     computed_field,
     field_validator,
@@ -156,3 +158,87 @@ class ImportReport(BaseModel):
     filename: str
     imported: int
     ids: list[int]
+
+
+ScopeName = Literal["notes:read", "notes:write", "admin"]
+
+
+class UserCreate(BaseModel):
+    """Body of POST /auth/register. The role is never accepted from clients (OWASP API3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+    password: Annotated[str, Field(min_length=12, max_length=128)]
+
+
+class UserRead(BaseModel):
+    """A user as the API shows it: no password hash, no internal flags."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    role: str
+    created_at: datetime
+
+
+class TokenPair(BaseModel):
+    """The OAuth 2.0 token response (RFC 6749 section 5.1) plus our refresh token."""
+
+    access_token: str
+    refresh_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    scope: str
+
+
+class RefreshRequest(BaseModel):
+    """Body of POST /auth/refresh and /auth/logout."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    refresh_token: Annotated[str, Field(min_length=10, max_length=200)]
+
+
+class ApiKeyCreate(BaseModel):
+    """Body of POST /users/me/api-keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+    scopes: Annotated[list[ScopeName], Field(min_length=1)] = ["notes:read"]
+
+
+class ApiKeyRead(BaseModel):
+    """An API key without its secret."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    prefix: str
+    scopes: list[str]
+    created_at: datetime
+    last_used_at: datetime | None
+    revoked_at: datetime | None
+
+    @field_validator("scopes", mode="before")
+    @classmethod
+    def split_scopes(cls, value: object) -> object:
+        """The database stores scopes space-separated."""
+        return value.split() if isinstance(value, str) else value
+
+
+class ApiKeyCreated(ApiKeyRead):
+    """The response to creating a key: the only time the full key is shown."""
+
+    key: str
+
+
+class WebhookSettings(BaseModel):
+    """Body of PUT /users/me/webhook."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: HttpUrl

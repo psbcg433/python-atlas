@@ -5,3 +5,4 @@ body { font-family: system-ui, sans-serif; margin: 0 auto; max-width: 42rem; pad
 .note.pinned { border-color: #c80; background: #fff8e8; }
 .tag { background: #eef; border-radius: 0.25rem; font-size: 0.8rem; margin-left: 0.25rem; padding: 0 0.3rem; }
 .error { color: #b00; margin: 0; }
+.bar { align-items: center; display: flex; justify-content: space-between; }

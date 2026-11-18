@@ -1,20 +1,20 @@
-"""Storage behind a Protocol: the service depends on NoteRepository, not on a database.
+"""Storage behind Protocols: services depend on NoteRepository / UserRepository, not on SQL.
 
-Unit 6.3 shipped an in-memory implementation; Unit 6.4 replaces it with SqlNoteRepository,
-which has the same methods, so the service and the routers barely change.
+Unit 6.3 shipped an in-memory note repository; Unit 6.4 replaced it with SqlNoteRepository;
+Unit 6.5 scopes notes to their owner and adds SqlUserRepository (users, refresh tokens, keys).
 """
 
 from datetime import datetime
 from typing import Any, Protocol
 
-from sqlalchemy import Select, delete, func, or_, select, tuple_
+from sqlalchemy import Select, delete, func, or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.exc import StaleDataError
 
 from notes_api.exceptions import VersionConflictError
-from notes_api.models import Note, Tag
+from notes_api.models import ApiKey, Note, OutboxEvent, RefreshToken, Tag, User
 from notes_api.pagination import CursorKey
 from notes_api.schemas import NoteCreate, NoteFilters
 
@@ -22,20 +22,20 @@ from notes_api.schemas import NoteCreate, NoteFilters
 class NoteRepository(Protocol):
     """What the service needs from storage."""
 
-    async def add(self, data: NoteCreate, now: datetime) -> Note:
-        """Store a new note and return it with its id."""
+    async def add(self, data: NoteCreate, now: datetime, owner_id: int) -> Note:
+        """Store a new note for owner_id and return it with its id."""
         ...
 
     async def get(self, note_id: int) -> Note | None:
         """The note with this id, or None."""
         ...
 
-    async def search(self, filters: NoteFilters) -> tuple[list[Note], int]:
-        """One page of matching notes and the total number of matches."""
+    async def search(self, filters: NoteFilters, owner_id: int | None) -> tuple[list[Note], int]:
+        """One page of matching notes (of owner_id, or everyone's when None) and the total."""
         ...
 
-    async def feed(self, limit: int, after: CursorKey | None) -> list[Note]:
-        """Up to limit notes, newest first, strictly older than the key after."""
+    async def feed(self, limit: int, after: CursorKey | None, owner_id: int) -> list[Note]:
+        """Up to limit of owner_id's notes, newest first, strictly older than the key after."""
         ...
 
     async def update(self, note: Note, changes: dict[str, Any], now: datetime) -> Note:
@@ -48,6 +48,10 @@ class NoteRepository(Protocol):
 
     async def delete_all(self) -> int:
         """Remove every note; return how many there were."""
+        ...
+
+    async def add_event(self, event: OutboxEvent) -> None:
+        """Store an outbox event in the current transaction."""
         ...
 
 
@@ -89,9 +93,10 @@ class SqlNoteRepository:
         except StaleDataError as error:
             raise VersionConflictError(note_id) from error
 
-    async def add(self, data: NoteCreate, now: datetime) -> Note:
+    async def add(self, data: NoteCreate, now: datetime, owner_id: int) -> Note:
         """INSERT the note and its tag links; flush so the id is known."""
-        note = Note(**data.model_dump(exclude={"tags"}), created_at=now, updated_at=now)
+        fields = data.model_dump(exclude={"tags"})
+        note = Note(**fields, owner_id=owner_id, created_at=now, updated_at=now)
         note.tag_objects = await self._tags(data.tags)
         self.session.add(note)
         await self.session.flush()
@@ -101,9 +106,11 @@ class SqlNoteRepository:
         """One note with its tags."""
         return await self.session.scalar(self._select().where(Note.id == note_id))
 
-    async def search(self, filters: NoteFilters) -> tuple[list[Note], int]:
+    async def search(self, filters: NoteFilters, owner_id: int | None) -> tuple[list[Note], int]:
         """WHERE for the filters, COUNT for the total, ORDER BY + LIMIT/OFFSET for the page."""
         conditions = [Note.tag_objects.any(Tag.name == name) for name in filters.tag]
+        if owner_id is not None:
+            conditions.append(Note.owner_id == owner_id)
         if filters.pinned is not None:
             conditions.append(Note.pinned == filters.pinned)
         if filters.q:
@@ -124,9 +131,10 @@ class SqlNoteRepository:
         notes = await self.session.scalars(page.offset(filters.offset).limit(filters.limit))
         return list(notes), total or 0
 
-    async def feed(self, limit: int, after: CursorKey | None) -> list[Note]:
+    async def feed(self, limit: int, after: CursorKey | None, owner_id: int) -> list[Note]:
         """Keyset page: WHERE (created_at, id) < (:created_at, :id) on an index, no OFFSET."""
-        statement = self._select().order_by(Note.created_at.desc(), Note.id.desc())
+        statement = self._select().where(Note.owner_id == owner_id)
+        statement = statement.order_by(Note.created_at.desc(), Note.id.desc())
         if after is not None:
             statement = statement.where(tuple_(Note.created_at, Note.id) < tuple_(*after))
         return list(await self.session.scalars(statement.limit(limit)))
@@ -153,3 +161,91 @@ class SqlNoteRepository:
         result = await self.session.execute(delete(Note))
         await self.session.execute(delete(Tag))
         return result.rowcount
+
+    async def add_event(self, event: OutboxEvent) -> None:
+        """Same session, same transaction: the event exists if and only if the change does."""
+        self.session.add(event)
+        await self.session.flush()
+
+
+class UserRepository(Protocol):
+    """What the auth service needs from storage."""
+
+    async def add_user(self, email: str, password_hash: str | None, role: str) -> User:
+        """Store a new user (IntegrityError if the email exists)."""
+        ...
+
+    async def user_by_id(self, user_id: int) -> User | None:
+        """The user, or None."""
+        ...
+
+    async def user_by_email(self, email: str) -> User | None:
+        """The user with this email (case-insensitive), or None."""
+        ...
+
+
+class SqlUserRepository:
+    """Users, refresh tokens and API keys on the request's session."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        """Work inside the request's session."""
+        self.session = session
+
+    async def add_user(
+        self, email: str, password_hash: str | None, role: str, oidc_subject: str | None = None
+    ) -> User:
+        """INSERT a user; a duplicate email raises IntegrityError at the flush."""
+        user = User(email=email.lower(), password_hash=password_hash, role=role)
+        user.oidc_subject = oidc_subject
+        self.session.add(user)
+        await self.session.flush()
+        return user
+
+    async def user_by_id(self, user_id: int) -> User | None:
+        """Primary-key lookup (identity map first)."""
+        return await self.session.get(User, user_id)
+
+    async def user_by_email(self, email: str) -> User | None:
+        """Emails are stored lower-cased."""
+        return await self.session.scalar(select(User).where(User.email == email.lower()))
+
+    async def user_by_oidc_subject(self, subject: str) -> User | None:
+        """The user linked to a third-party identity."""
+        return await self.session.scalar(select(User).where(User.oidc_subject == subject))
+
+    async def add_refresh_token(self, token: RefreshToken) -> None:
+        """Store a refresh token row."""
+        self.session.add(token)
+        await self.session.flush()
+
+    async def refresh_token_by_hash(self, token_hash: str) -> RefreshToken | None:
+        """Look a refresh token up by its SHA-256."""
+        return await self.session.scalar(
+            select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+        )
+
+    async def revoke_family(self, family_id: str, now: datetime) -> int:
+        """Revoke every token of one login; returns how many were still active."""
+        result = await self.session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.family_id == family_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+        return result.rowcount
+
+    async def add_api_key(self, key: ApiKey) -> ApiKey:
+        """Store an API key row."""
+        self.session.add(key)
+        await self.session.flush()
+        return key
+
+    async def api_key_by_hash(self, key_hash: str) -> ApiKey | None:
+        """An active (not revoked) key by its SHA-256."""
+        return await self.session.scalar(
+            select(ApiKey).where(ApiKey.key_hash == key_hash, ApiKey.revoked_at.is_(None))
+        )
+
+    async def api_keys_of(self, user_id: int) -> list[ApiKey]:
+        """A user's keys, newest first (revoked ones included)."""
+        statement = select(ApiKey).where(ApiKey.user_id == user_id).order_by(ApiKey.id.desc())
+        return list(await self.session.scalars(statement))

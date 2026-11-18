@@ -1,4 +1,4 @@
-# Local PostgreSQL for the Notes API:  docker compose up -d --wait   (stop: docker compose down)
+# Local PostgreSQL and Redis for the Notes API:  docker compose up -d --wait   (stop: docker compose down)
 # The password is for local development only; real deployments read secrets from the platform.
 services:
   db:
@@ -13,6 +13,16 @@ services:
       - notes-db:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U notes -d notes"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7.4
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 15

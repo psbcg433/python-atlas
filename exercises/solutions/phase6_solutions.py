@@ -17,15 +17,20 @@ import binascii
 import contextlib
 import contextvars
 import dataclasses
+import hashlib
+import hmac
 import http.client
 import inspect
 import json
+import logging
+import math
 import os
 import random
 import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -34,6 +39,7 @@ import time
 import urllib.parse
 import uuid
 import wsgiref.util
+from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
@@ -42,14 +48,37 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from wsgiref.validate import validator
 
+import fakeredis
 import fastapi
 import httpx
+import jwt
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Response, UploadFile, status
+from arq.connections import ArqRedis
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+    Security,
+    UploadFile,
+    WebSocket,
+    status,
+)
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from fastapi.security import APIKeyHeader
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import (
+    APIKeyHeader,
+    OAuth2PasswordBearer,
+    OAuth2PasswordRequestForm,
+    SecurityScopes,
+)
 from fastapi.testclient import TestClient
+from fastapi.websockets import WebSocketDisconnect
+from pwdlib import PasswordHash
+from pwdlib.hashers.argon2 import Argon2Hasher
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -3621,6 +3650,1502 @@ def check_lab_6_4() -> None:
         check()
 
 
+# ---------------------------------------------------------------------------- Lab 6.5
+# Given code from the notebook (Lab 6.5 setup).
+
+
+def fast_hasher() -> PasswordHash:
+    """Argon2id with deliberately cheap parameters, for demos that hash many passwords."""
+    return PasswordHash((Argon2Hasher(time_cost=1, memory_cost=64, parallelism=1),))
+
+
+LAB_SECRET = secrets.token_urlsafe(32)  # generated per run
+lab_hasher = fast_hasher()
+SCOPE_USERS = {"rita": "reader", "eddie": "editor", "ada": "admin"}
+ROLE_SCOPES = {
+    "reader": {"notes:read"},
+    "editor": {"notes:read", "notes:write"},
+    "admin": {"notes:read", "notes:write", "admin"},
+}
+LAB_LOGIN_USERS = {"asha@example.com": lab_hasher.hash("a-long-passphrase")}
+
+
+def lab_scope_token(username: str, scopes: set[str]) -> str:
+    """A 15-minute HS256 token for a SCOPE_USERS user with the requested scopes."""
+    now = datetime.now(UTC)
+    claims = {"sub": username, "role": SCOPE_USERS[username], "scope": " ".join(sorted(scopes))}
+    return jwt.encode(
+        claims | {"iat": now, "exp": now + timedelta(minutes=15)}, LAB_SECRET, algorithm="HS256"
+    )
+
+
+class SettableClock:
+    """A clock for tests: call it for the time, advance() it by hand."""
+
+    def __init__(self, start: float = 1_800_000_000.0) -> None:
+        """Start at a fixed Unix time."""
+        self.now = start
+
+    def __call__(self) -> float:
+        """The current (fake) time."""
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move time forward."""
+        self.now += seconds
+
+
+class LabListHandler(logging.Handler):
+    """Keep formatted log lines in a list."""
+
+    def __init__(self) -> None:
+        """Start empty."""
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Store the formatted record."""
+        self.lines.append(self.format(record))
+
+
+def make_owner_check(
+    documents: dict[int, dict[str, object]], vulnerable_routes: frozenset[str]
+) -> Callable[[int, str, str], dict[str, object]]:
+    """owned(document_id, user, route): the document if user may use it through route, else 404."""
+
+    def owned(document_id: int, user: str, route: str) -> dict[str, object]:
+        """Look up and authorize (routes in vulnerable_routes forget the owner check)."""
+        document = documents.get(document_id)
+        if document is None or (document["owner"] != user and route not in vulnerable_routes):
+            raise HTTPException(404, "document not found")
+        return document
+
+    return owned
+
+
+def build_doc_api(vulnerable_routes: frozenset[str] = frozenset()) -> FastAPI:
+    """Documents owned by users (X-User header); vulnerable_routes skip the owner check."""
+    documents: dict[int, dict[str, object]] = {}
+    owned, doc_app = make_owner_check(documents, vulnerable_routes), FastAPI()
+    User = Annotated[str, Depends(APIKeyHeader(name="X-User"))]
+
+    @doc_app.post("/documents", status_code=201)
+    def create_doc(body: dict[str, str], user: User) -> dict[str, object]:
+        """Create a document owned by the caller."""
+        document = {"id": len(documents) + 1, "owner": user, "title": body.get("title", "")}
+        documents[document["id"]] = document
+        return document
+
+    @doc_app.get("/documents")
+    def list_docs(user: User) -> list[dict[str, object]]:
+        """The caller's documents (everyone's when the list route is vulnerable)."""
+        leaky = "GET /documents" in vulnerable_routes
+        return [doc for doc in documents.values() if leaky or doc["owner"] == user]
+
+    @doc_app.get("/documents/{document_id}")
+    def read_doc(document_id: int, user: User) -> dict[str, object]:
+        """One document."""
+        return owned(document_id, user, "GET /documents/{id}")
+
+    @doc_app.patch("/documents/{document_id}")
+    def rename_doc(document_id: int, body: dict[str, str], user: User) -> dict[str, object]:
+        """Change the title."""
+        document = owned(document_id, user, "PATCH /documents/{id}")
+        document["title"] = body.get("title", document["title"])
+        return document
+
+    @doc_app.delete("/documents/{document_id}", status_code=204)
+    def delete_doc(document_id: int, user: User) -> None:
+        """Delete a document."""
+        documents.pop(owned(document_id, user, "DELETE /documents/{id}")["id"])
+
+    return doc_app
+
+
+# >>> Lab 6.5 exercise 1
+def b64url_encode(data: bytes) -> str:
+    """URL-safe base64 without padding."""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def b64url_decode(text: str) -> bytes:
+    """Decode URL-safe base64, restoring the padding."""
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def hand_jwt_encode(claims: dict[str, Any], secret: str) -> str:
+    """An HS256 JWT built by hand."""
+    compact = {"separators": (",", ":")}
+    header = b64url_encode(json.dumps({"alg": "HS256", "typ": "JWT"}, **compact).encode())
+    payload = b64url_encode(json.dumps(claims, **compact).encode())
+    signature = hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()
+    return f"{header}.{payload}.{b64url_encode(signature)}"
+
+
+def hand_jwt_decode(token: str, secret: str) -> dict[str, Any]:
+    """Verify an HS256 JWT by hand; ValueError when anything is wrong."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("a JWT has three parts")
+    header_part, payload_part, signature_part = parts
+    header = json.loads(b64url_decode(header_part))  # JSON and base64 errors are ValueErrors
+    claims = json.loads(b64url_decode(payload_part))
+    if header.get("alg") != "HS256":
+        raise ValueError("only HS256 is accepted")
+    signed = f"{header_part}.{payload_part}".encode()
+    expected = b64url_encode(hmac.new(secret.encode(), signed, hashlib.sha256).digest())
+    if not hmac.compare_digest(expected, signature_part):
+        raise ValueError("signature does not match")
+    if "exp" in claims and claims["exp"] <= time.time():
+        raise ValueError("token expired")
+    return claims
+
+
+def pyjwt_encode(claims: dict[str, Any], secret: str) -> str:
+    """The same token with PyJWT."""
+    return jwt.encode(claims, secret, algorithm="HS256")
+
+
+def pyjwt_decode(token: str, secret: str) -> dict[str, Any]:
+    """Verify with PyJWT, HS256 only."""
+    return jwt.decode(token, secret, algorithms=["HS256"])
+
+
+# <<< Lab 6.5 exercise 1
+
+
+# >>> Lab 6.5 exercise 2
+def build_auth_app() -> FastAPI:
+    """Register, token, me, refresh and logout, in memory."""
+    users: dict[str, dict[str, Any]] = {}  # e-mail -> {"id", "email", "hash"}
+    refresh_records: dict[str, dict[str, Any]] = {}  # SHA-256 of the token -> its state
+    denied_jtis: set[str] = set()
+    bearer_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+    auth_app = FastAPI()
+
+    class Account(BaseModel):
+        """Body of POST /register."""
+
+        email: EmailStr
+        password: str = Field(min_length=12)
+
+    class RefreshBody(BaseModel):
+        """Body of POST /refresh and /logout."""
+
+        refresh_token: str
+
+    def digest(raw_token: str) -> str:
+        """What is stored for a refresh token."""
+        return hashlib.sha256(raw_token.encode()).hexdigest()
+
+    def token_pair(user_id: int, family: str | None = None) -> dict[str, str]:
+        """A new access token and refresh token (the same family when rotating)."""
+        expires = datetime.now(UTC) + timedelta(minutes=15)
+        claims = {"sub": str(user_id), "exp": expires, "jti": secrets.token_hex(8)}
+        raw_refresh = secrets.token_urlsafe(32)
+        refresh_records[digest(raw_refresh)] = {
+            "user_id": user_id,
+            "family": family or secrets.token_hex(8),
+            "used": False,
+            "revoked": False,
+        }
+        access = jwt.encode(claims, LAB_SECRET, algorithm="HS256")
+        return {"access_token": access, "refresh_token": raw_refresh, "token_type": "bearer"}
+
+    def revoke_family(family: str) -> None:
+        """Revoke every refresh token of a family."""
+        for record in refresh_records.values():
+            if record["family"] == family:
+                record["revoked"] = True
+
+    def current_claims(token: Annotated[str, Depends(bearer_scheme)]) -> dict[str, Any]:
+        """Verified, non-revoked access-token claims, or 401."""
+        challenge = {"WWW-Authenticate": "Bearer"}
+        try:
+            options = {"require": ["exp", "sub", "jti"]}
+            claims = jwt.decode(token, LAB_SECRET, algorithms=["HS256"], options=options)
+        except jwt.InvalidTokenError as error:
+            raise HTTPException(401, "invalid token", headers=challenge) from error
+        if claims["jti"] in denied_jtis:
+            raise HTTPException(401, "token revoked", headers=challenge)
+        return claims
+
+    @auth_app.post("/register", status_code=201)
+    def register(account: Account) -> dict[str, object]:
+        """Create an account."""
+        if account.email in users:
+            raise HTTPException(409, "e-mail already registered")
+        user_id = len(users) + 1
+        users[account.email] = {
+            "id": user_id,
+            "email": account.email,
+            "hash": lab_hasher.hash(account.password),
+        }
+        return {"id": user_id, "email": account.email}
+
+    @auth_app.post("/token")
+    def token(form: Annotated[OAuth2PasswordRequestForm, Depends()]) -> dict[str, str]:
+        """Password login."""
+        user = users.get(form.username)
+        if user is None or not lab_hasher.verify(form.password, user["hash"]):
+            raise HTTPException(401, "wrong e-mail or password")
+        return token_pair(user["id"])
+
+    @auth_app.get("/me")
+    def me(claims: Annotated[dict[str, Any], Depends(current_claims)]) -> dict[str, object]:
+        """The caller."""
+        user = next(user for user in users.values() if user["id"] == int(claims["sub"]))
+        return {"id": user["id"], "email": user["email"]}
+
+    @auth_app.post("/refresh")
+    def refresh(body: RefreshBody) -> dict[str, str]:
+        """Rotate a refresh token; a reused one revokes its family."""
+        record = refresh_records.get(digest(body.refresh_token))
+        if record is None or record["revoked"]:
+            raise HTTPException(401, "invalid refresh token")
+        if record["used"]:
+            revoke_family(record["family"])
+            raise HTTPException(401, "refresh token reuse detected")
+        record["used"] = True
+        return token_pair(record["user_id"], record["family"])
+
+    @auth_app.post("/logout", status_code=204)
+    def logout(
+        body: RefreshBody, claims: Annotated[dict[str, Any], Depends(current_claims)]
+    ) -> None:
+        """Revoke the refresh token's family and deny the access token."""
+        record = refresh_records.get(digest(body.refresh_token))
+        if record is not None and record["user_id"] == int(claims["sub"]):
+            revoke_family(record["family"])
+        denied_jtis.add(claims["jti"])
+
+    return auth_app
+
+
+# <<< Lab 6.5 exercise 2
+
+
+# >>> Lab 6.5 exercise 3
+lab_scope_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+
+def get_lab_principal(
+    security_scopes: SecurityScopes, token: Annotated[str, Depends(lab_scope_scheme)]
+) -> dict[str, object]:
+    """Authenticate (401), then check the required scopes (403)."""
+    challenge = {"WWW-Authenticate": f'Bearer scope="{security_scopes.scope_str}"'}
+    try:
+        claims = jwt.decode(token, LAB_SECRET, algorithms=["HS256"])
+    except jwt.InvalidTokenError as error:
+        raise HTTPException(401, "invalid token", headers=challenge) from error
+    role = claims.get("role", "")
+    scopes = set(claims.get("scope", "").split()) & ROLE_SCOPES.get(role, set())
+    missing = set(security_scopes.scopes) - scopes
+    if missing:
+        detail = f"missing scope(s): {' '.join(sorted(missing))}"
+        raise HTTPException(403, detail, headers=challenge)
+    return {"user": claims["sub"], "role": role, "scopes": scopes}
+
+
+def build_scoped_lab_app() -> FastAPI:
+    """GET/POST /notes and DELETE /admin/notes with scopes and a role check."""
+    scoped_lab_app = FastAPI()
+    Principal = dict[str, object]
+
+    def require_admin_role(principal: Annotated[Principal, Security(get_lab_principal)]) -> None:
+        """The role check, run before the route's own scope check."""
+        if principal["role"] != "admin":
+            raise HTTPException(403, "admin role required")
+
+    @scoped_lab_app.get("/notes")
+    def list_notes(
+        principal: Annotated[Principal, Security(get_lab_principal, scopes=["notes:read"])],
+    ) -> dict[str, object]:
+        """Needs notes:read."""
+        return {"user": principal["user"]}
+
+    @scoped_lab_app.post("/notes", status_code=201)
+    def create_note(
+        principal: Annotated[Principal, Security(get_lab_principal, scopes=["notes:write"])],
+    ) -> dict[str, object]:
+        """Needs notes:write."""
+        return {"user": principal["user"]}
+
+    @scoped_lab_app.delete("/admin/notes", dependencies=[Depends(require_admin_role)])
+    def wipe_notes(
+        principal: Annotated[Principal, Security(get_lab_principal, scopes=["admin"])],
+    ) -> dict[str, object]:
+        """Admin role, then the admin scope."""
+        return {"wiped_by": principal["user"]}
+
+    return scoped_lab_app
+
+
+# <<< Lab 6.5 exercise 3
+
+
+# >>> Lab 6.5 exercise 4
+def find_bola(app: FastAPI) -> list[str]:
+    """Routes through which one user reaches another user's document."""
+    alice, mallory = {"X-User": "alice"}, {"X-User": "mallory"}
+    leaks = []
+    with TestClient(app) as client:
+        created = client.post("/documents", json={"title": "alice's secret"}, headers=alice)
+        document_id = created.json()["id"]
+        path = f"/documents/{document_id}"
+        if client.get(path, headers=mallory).is_success:
+            leaks.append("GET /documents/{id}")
+        if client.patch(path, json={"title": "pwned"}, headers=mallory).is_success:
+            leaks.append("PATCH /documents/{id}")
+        listed = client.get("/documents", headers=mallory).json()
+        if any(document["id"] == document_id for document in listed):
+            leaks.append("GET /documents")
+        if client.delete(path, headers=mallory).is_success:  # last: it destroys the evidence
+            leaks.append("DELETE /documents/{id}")
+    return sorted(leaks)
+
+
+# <<< Lab 6.5 exercise 4
+
+
+# >>> Lab 6.5 exercise 5
+class LoginRateLimiter:
+    """Fixed-window attempt counter in Redis."""
+
+    def __init__(
+        self, redis_client: Any, limit: int, window_seconds: int, clock: Callable[[], float]
+    ) -> None:
+        """Keep the settings."""
+        self.redis = redis_client
+        self.limit = limit
+        self.window = window_seconds
+        self.clock = clock
+
+    async def hit(self, key: str) -> tuple[bool, int]:
+        """Count one attempt; return (allowed, retry_after seconds)."""
+        now = self.clock()
+        window_key = f"login-limit:{key}:{int(now // self.window)}"
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.incr(window_key)
+            pipe.expire(window_key, self.window)
+            count, _ = await pipe.execute()
+        retry_after = max(1, math.ceil(self.window - now % self.window))
+        return count <= self.limit, retry_after
+
+
+def build_rate_limited_login(limiter: LoginRateLimiter) -> FastAPI:
+    """POST /login with attempt limits."""
+    login_app = FastAPI()
+
+    @login_app.post("/login")
+    async def login(
+        request: fastapi.Request, form: Annotated[OAuth2PasswordRequestForm, Depends()]
+    ) -> dict[str, bool]:
+        """Count the attempt first, then check the password."""
+        address = request.client.host if request.client else "unknown"
+        username = form.username.lower()
+        allowed, retry_after = await limiter.hit(f"{address}:{username}")
+        if not allowed:
+            headers = {"Retry-After": str(retry_after)}
+            raise HTTPException(429, "too many login attempts", headers=headers)
+        stored_hash = LAB_LOGIN_USERS.get(username)
+        if stored_hash is None or not lab_hasher.verify(form.password, stored_hash):
+            raise HTTPException(401, "wrong e-mail or password")
+        return {"ok": True}
+
+    return login_app
+
+
+# <<< Lab 6.5 exercise 5
+
+
+# >>> Lab 6.5 exercise 6
+class RedactingFilter(logging.Filter):
+    """Remove secrets from log records before any handler sees them."""
+
+    KEYS = r"password|secret|token|api_key|refresh_token"
+    BEARER = re.compile(r"(?i)\b(bearer\s+)[^\s,;&'\"]+")
+    QUOTED = re.compile(rf"""(?i)(["'](?:{KEYS})["']\s*:\s*)(["'])(.*?)\2""")
+    PLAIN = re.compile(rf"(?i)\b((?:{KEYS})\s*[:=]\s*)([^\s,;&'\"]+)")
+    JWT = re.compile(r"eyJ[\w-]+\.[\w-]+\.[\w-]+")
+    API_KEY = re.compile(r"\bnk_[A-Za-z0-9_-]{20,}")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Redact the formatted message in place; always keep the record."""
+        message = record.getMessage()
+        message = self.BEARER.sub(r"\1[REDACTED]", message)
+        message = self.QUOTED.sub(r"\1\2[REDACTED]\2", message)
+        message = self.PLAIN.sub(r"\1[REDACTED]", message)
+        message = self.JWT.sub("[REDACTED]", message)
+        message = self.API_KEY.sub("nk_[REDACTED]", message)
+        record.msg, record.args = message, None
+        return True
+
+
+# <<< Lab 6.5 exercise 6
+
+
+# Check helpers (the notebook's check cells).
+
+
+def forged(header: dict[str, str], claims: dict[str, Any], signature: str = "") -> str:
+    """A token with any header and claims and the given signature part."""
+    parts = (header, claims)
+    encoded = [base64.urlsafe_b64encode(json.dumps(part).encode()).rstrip(b"=") for part in parts]
+    return ".".join(part.decode() for part in encoded) + "." + signature
+
+
+def tampered_hand_token() -> str:
+    """A valid hand-made token whose payload was swapped afterwards."""
+    header, _, signature = hand_jwt_encode({"sub": "1", "role": "user"}, LAB_SECRET).split(".")
+    evil_claims = json.dumps({"sub": "1", "role": "admin"}).encode()
+    evil_payload = base64.urlsafe_b64encode(evil_claims).rstrip(b"=").decode()
+    return f"{header}.{evil_payload}.{signature}"
+
+
+def check_exercise_6_5_1() -> None:
+    """Exercise 1 checks."""
+    later = int(time.time()) + 600
+    hand_header = lambda: json.loads(  # noqa: E731
+        b64url_decode(hand_jwt_encode({"sub": "1"}, LAB_SECRET).split(".")[0])
+    )
+    run_checks(
+        [
+            ("b64url_encode drops padding", lambda: b64url_encode(b"\xfb\xff"), "-_8"),
+            ("b64url_decode restores it", lambda: b64url_decode("-_8"), b"\xfb\xff"),
+            ("header of a hand token", hand_header, {"alg": "HS256", "typ": "JWT"}),
+            (
+                "PyJWT accepts a hand token",
+                lambda: jwt.decode(
+                    hand_jwt_encode({"sub": "1", "exp": later}, LAB_SECRET),
+                    LAB_SECRET,
+                    algorithms=["HS256"],
+                ),
+                {"sub": "1", "exp": later},
+            ),
+            (
+                "hand decoder accepts a PyJWT token",
+                lambda: hand_jwt_decode(
+                    jwt.encode({"sub": "2"}, LAB_SECRET, algorithm="HS256"), LAB_SECRET
+                ),
+                {"sub": "2"},
+            ),
+            (
+                "tampered payload",
+                lambda: raised_error_name(
+                    lambda: hand_jwt_decode(tampered_hand_token(), LAB_SECRET)
+                ),
+                "ValueError",
+            ),
+            (
+                "alg none",
+                lambda: raised_error_name(
+                    lambda: hand_jwt_decode(forged({"alg": "none"}, {"sub": "1"}), LAB_SECRET)
+                ),
+                "ValueError",
+            ),
+            (
+                "wrong secret",
+                lambda: raised_error_name(
+                    lambda: hand_jwt_decode(
+                        hand_jwt_encode({"sub": "1"}, "other-secret"), LAB_SECRET
+                    )
+                ),
+                "ValueError",
+            ),
+            (
+                "expired",
+                lambda: raised_error_name(
+                    lambda: hand_jwt_decode(hand_jwt_encode({"exp": 1_000}, LAB_SECRET), LAB_SECRET)
+                ),
+                "ValueError",
+            ),
+            (
+                "not three parts",
+                lambda: raised_error_name(lambda: hand_jwt_decode("abc.def", LAB_SECRET)),
+                "ValueError",
+            ),
+            (
+                "PyJWT round trip",
+                lambda: pyjwt_decode(pyjwt_encode({"sub": "3"}, LAB_SECRET), LAB_SECRET),
+                {"sub": "3"},
+            ),
+            (
+                "PyJWT refuses HS512",
+                lambda: raised_error_name(
+                    lambda: pyjwt_decode(
+                        jwt.encode({"sub": "4"}, LAB_SECRET * 2, algorithm="HS512"), LAB_SECRET * 2
+                    )
+                ),
+                "InvalidAlgorithmError",
+            ),
+            (
+                "hand token == PyJWT token for the same claims?",
+                lambda: (
+                    hand_jwt_decode(pyjwt_encode({"a": 1}, LAB_SECRET), LAB_SECRET)
+                    == jwt.decode(
+                        hand_jwt_encode({"a": 1}, LAB_SECRET), LAB_SECRET, algorithms=["HS256"]
+                    )
+                ),
+                True,
+            ),
+        ]
+    )
+
+
+def logout_steps(client: TestClient, account: dict[str, str]) -> dict[str, object]:
+    """Log in, log out, then use both tokens."""
+    login_form = {"username": account["email"], "password": account["password"]}
+    pair = client.post("/token", data=login_form).json()
+    bearer = {"Authorization": f"Bearer {pair['access_token']}"}
+    refresh_body = {"refresh_token": pair["refresh_token"]}
+    return {
+        "logout": client.post("/logout", json=refresh_body, headers=bearer).status_code,
+        "me after logout": client.get("/me", headers=bearer).status_code,
+        "refresh after logout": client.post("/refresh", json=refresh_body).status_code,
+    }
+
+
+def auth_scenario() -> dict[str, object]:
+    """Every step of the lifecycle against a fresh app."""
+    results: dict[str, object] = {}
+    with TestClient(build_auth_app()) as client:
+        account = {"email": "asha@example.com", "password": "a-long-passphrase"}
+        registered = client.post("/register", json=account)
+        results["register"] = (registered.status_code, sorted(registered.json()))
+        results["duplicate"] = client.post("/register", json=account).status_code
+        short = {"email": "b@example.com", "password": "short"}
+        results["short password"] = client.post("/register", json=short).status_code
+        wrong = {"username": account["email"], "password": "nope"}
+        results["wrong password"] = client.post("/token", data=wrong).status_code
+        login_form = {"username": account["email"], "password": account["password"]}
+        pair = client.post("/token", data=login_form).json()
+        results["pair keys"] = sorted(pair)
+        bearer = {"Authorization": f"Bearer {pair['access_token']}"}
+        results["me"] = client.get("/me", headers=bearer).json().get("email")
+        results["me without token"] = client.get("/me").status_code
+        claims = jwt.decode(pair["access_token"], LAB_SECRET, algorithms=["HS256"])
+        results["jti claim"] = "jti" in claims
+        first_body = {"refresh_token": pair["refresh_token"]}
+        second = client.post("/refresh", json=first_body).json()
+        results["refresh gives new tokens"] = second.get("refresh_token") not in (
+            None,
+            pair["refresh_token"],
+        )
+        results["reuse"] = client.post("/refresh", json=first_body).status_code
+        newest_body = {"refresh_token": second.get("refresh_token")}
+        results["newest after reuse"] = client.post("/refresh", json=newest_body).status_code
+        results.update(logout_steps(client, account))
+    return results
+
+
+def fresh_apps_are_independent() -> bool:
+    """Two apps do not share users."""
+    account = {"email": "solo@example.com", "password": "a-long-passphrase"}
+    with TestClient(build_auth_app()) as first, TestClient(build_auth_app()) as second:
+        statuses = (
+            first.post("/register", json=account).status_code,
+            second.post("/register", json=account).status_code,
+        )
+    return statuses == (201, 201)
+
+
+def check_exercise_6_5_2() -> None:
+    """Exercise 2 checks."""
+    results: dict[str, object] = {}
+    with contextlib.suppress(Exception):
+        results = auth_scenario()
+    run_checks(
+        [
+            (
+                "register: 201 with id and email",
+                lambda: results["register"],
+                (201, ["email", "id"]),
+            ),
+            ("duplicate e-mail: 409", lambda: results["duplicate"], 409),
+            ("short password: 422", lambda: results["short password"], 422),
+            ("wrong password: 401", lambda: results["wrong password"], 401),
+            (
+                "token pair",
+                lambda: results["pair keys"],
+                ["access_token", "refresh_token", "token_type"],
+            ),
+            ("me", lambda: results["me"], "asha@example.com"),
+            ("me without a token: 401", lambda: results["me without token"], 401),
+            ("access token has a jti", lambda: results["jti claim"], True),
+            ("refresh rotates", lambda: results["refresh gives new tokens"], True),
+            ("reused refresh token: 401", lambda: results["reuse"], 401),
+            ("reuse revoked the family", lambda: results["newest after reuse"], 401),
+            ("logout: 204", lambda: results["logout"], 204),
+            ("access token dead after logout", lambda: results["me after logout"], 401),
+            ("refresh token dead after logout", lambda: results["refresh after logout"], 401),
+            ("each app has its own storage", fresh_apps_are_independent, True),
+        ]
+    )
+
+
+SCOPE_TABLE = [
+    # (user or None, token scopes, method, path, expected status)
+    (None, set(), "GET", "/notes", 401),
+    ("rita", {"notes:read"}, "GET", "/notes", 200),
+    ("rita", {"notes:read"}, "POST", "/notes", 403),
+    ("rita", {"notes:read", "notes:write"}, "POST", "/notes", 403),  # more than the role has
+    ("eddie", {"notes:read", "notes:write"}, "POST", "/notes", 201),
+    ("eddie", {"notes:read"}, "POST", "/notes", 403),  # the token was limited
+    ("eddie", {"notes:read", "notes:write", "admin"}, "DELETE", "/admin/notes", 403),  # role
+    ("ada", {"notes:read"}, "DELETE", "/admin/notes", 403),  # role ok, scope missing
+    ("ada", {"admin"}, "DELETE", "/admin/notes", 200),
+]
+
+
+def scope_statuses() -> list[int]:
+    """The status of every row of SCOPE_TABLE."""
+    statuses = []
+    with TestClient(build_scoped_lab_app()) as client:
+        for user, scopes, method, path, _ in SCOPE_TABLE:
+            headers = {"Authorization": f"Bearer {lab_scope_token(user, scopes)}"} if user else {}
+            statuses.append(client.request(method, path, headers=headers).status_code)
+    return statuses
+
+
+def scope_details() -> dict[str, object]:
+    """The WWW-Authenticate header of a 401, a bad token, and the role message."""
+    admin_claiming = lab_scope_token("eddie", {"notes:read", "notes:write", "admin"})
+    with TestClient(build_scoped_lab_app()) as client:
+        bad = client.post("/notes", headers={"Authorization": "Bearer not-a-token"})
+        role = client.delete("/admin/notes", headers={"Authorization": f"Bearer {admin_claiming}"})
+        return {
+            "bad token": bad.status_code,
+            "header": bad.headers.get("www-authenticate"),
+            "role": role.json(),
+        }
+
+
+def check_exercise_6_5_3() -> None:
+    """Exercise 3 checks."""
+    rita = {"Authorization": f"Bearer {lab_scope_token('rita', {'notes:read'})}"}
+    run_checks(
+        [
+            ("status table", scope_statuses, [row[-1] for row in SCOPE_TABLE]),
+            ("an invalid token is a 401", lambda: scope_details()["bad token"], 401),
+            (
+                "401 names the required scope",
+                lambda: scope_details()["header"],
+                'Bearer scope="notes:write"',
+            ),
+            ("role message", lambda: scope_details()["role"], {"detail": "admin role required"}),
+            (
+                "GET /notes names the user",
+                lambda: TestClient(build_scoped_lab_app()).get("/notes", headers=rita).json(),
+                {"user": "rita"},
+            ),
+        ]
+    )
+
+
+ALL_DOC_ROUTES = [
+    "DELETE /documents/{id}",
+    "GET /documents",
+    "GET /documents/{id}",
+    "PATCH /documents/{id}",
+]
+
+
+def check_exercise_6_5_4() -> None:
+    """Exercise 4 checks."""
+    run_checks(
+        [
+            ("safe app: no findings", lambda: find_bola(build_doc_api()), []),
+            (
+                "leaky read",
+                lambda: find_bola(build_doc_api(frozenset({"GET /documents/{id}"}))),
+                ["GET /documents/{id}"],
+            ),
+            (
+                "leaky update",
+                lambda: find_bola(build_doc_api(frozenset({"PATCH /documents/{id}"}))),
+                ["PATCH /documents/{id}"],
+            ),
+            (
+                "leaky list",
+                lambda: find_bola(build_doc_api(frozenset({"GET /documents"}))),
+                ["GET /documents"],
+            ),
+            (
+                "leaky delete",
+                lambda: find_bola(build_doc_api(frozenset({"DELETE /documents/{id}"}))),
+                ["DELETE /documents/{id}"],
+            ),
+            (
+                "everything leaks",
+                lambda: find_bola(build_doc_api(frozenset(ALL_DOC_ROUTES))),
+                ALL_DOC_ROUTES,
+            ),
+        ]
+    )
+
+
+async def limiter_scenario() -> dict[str, object]:
+    """Six hits, a second key, then the next window."""
+    clock = SettableClock(1_800_000_010.0)  # 10 s into a 60 s window
+    limiter = LoginRateLimiter(fakeredis.FakeAsyncRedis(decode_responses=True), 5, 60, clock)
+    hits = [await limiter.hit("1.2.3.4:asha") for _ in range(6)]
+    other_key = await limiter.hit("1.2.3.4:ravi")
+    clock.advance(50)
+    return {"hits": hits, "other key": other_key, "next window": await limiter.hit("1.2.3.4:asha")}
+
+
+def login_statuses() -> dict[str, object]:
+    """Five wrong passwords, then the right one, then another user."""
+    redis_client = fakeredis.FakeAsyncRedis(decode_responses=True)
+    limiter = LoginRateLimiter(redis_client, 5, 60, SettableClock())
+    wrong_form = {"username": "Asha@example.com", "password": "x"}
+    right_form = {"username": "asha@example.com", "password": "a-long-passphrase"}
+    with TestClient(build_rate_limited_login(limiter)) as client:
+        wrong = [client.post("/login", data=wrong_form).status_code for _ in range(5)]
+        blocked = client.post("/login", data=right_form)
+        other_form = {"username": "ravi@example.com", "password": "x"}
+        other = client.post("/login", data=other_form).status_code
+        return {
+            "wrong": wrong,
+            "blocked": blocked.status_code,
+            "retry": blocked.headers.get("retry-after"),
+            "other": other,
+        }
+
+
+def check_exercise_6_5_5() -> None:
+    """Exercise 5 checks."""
+    results: dict[str, object] = {}
+    with contextlib.suppress(Exception):
+        results = asyncio.run(limiter_scenario())
+    run_checks(
+        [
+            (
+                "five allowed, the sixth refused",
+                lambda: [allowed for allowed, _ in results["hits"]],
+                [True] * 5 + [False],
+            ),
+            ("retry_after counts down to the window end", lambda: results["hits"][-1][1], 50),
+            ("keys are independent", lambda: results["other key"], (True, 50)),
+            ("next window starts fresh", lambda: results["next window"], (True, 60)),
+            ("wrong passwords: 401 five times", lambda: login_statuses()["wrong"], [401] * 5),
+            ("then 429, even with the right password", lambda: login_statuses()["blocked"], 429),
+            ("Retry-After header", lambda: login_statuses()["retry"], "60"),
+            ("another username is not blocked", lambda: login_statuses()["other"], 401),
+        ]
+    )
+
+
+def redacted(message: str, *args: object) -> str:
+    """Log one record through RedactingFilter; return the formatted line."""
+    logger = logging.getLogger("lab65.redaction")
+    logger.propagate = False
+    handler = LabListHandler()
+    logger.handlers[:] = [handler]
+    logger.filters[:] = [RedactingFilter()]
+    logger.warning(message, *args)
+    return handler.lines[-1] if handler.lines else "<record dropped>"
+
+
+def check_exercise_6_5_6() -> None:
+    """Exercise 6 checks."""
+    sample_jwt = jwt.encode({"sub": "1"}, "k" * 32, algorithm="HS256")
+    sample_key = "nk_" + "A1b2C3d4E5f6G7h8I9j0K_-z"
+    json_body = 'body {"email": "a@x.org", "password": "p w d"}'
+    run_checks(
+        [
+            (
+                "bearer token",
+                lambda: redacted("header Authorization: Bearer abc.def.ghi"),
+                "header Authorization: Bearer [REDACTED]",
+            ),
+            (
+                "bearer in an argument",
+                lambda: redacted("auth=%s", "bearer xyz"),
+                "auth=bearer [REDACTED]",
+            ),
+            (
+                "key=value",
+                lambda: redacted("login password=hunter2 user=asha"),
+                "login password=[REDACTED] user=asha",
+            ),
+            ("key: value", lambda: redacted("Secret: s3cr3t; ok"), "Secret: [REDACTED]; ok"),
+            (
+                "JSON field",
+                lambda: redacted(json_body),
+                'body {"email": "a@x.org", "password": "[REDACTED]"}',
+            ),
+            (
+                "dict argument",
+                lambda: redacted("payload %s", {"refresh_token": "abc123"}),
+                "payload {'refresh_token': '[REDACTED]'}",
+            ),
+            (
+                "query string",
+                lambda: redacted("GET /cb?code=1&token=zzz&state=2"),
+                "GET /cb?code=1&token=[REDACTED]&state=2",
+            ),
+            (
+                "bare JWT",
+                lambda: redacted("got %s from the client", sample_jwt),
+                "got [REDACTED] from the client",
+            ),
+            ("API key", lambda: redacted("key %s used", sample_key), "key nk_[REDACTED] used"),
+            ("short nk_ word kept", lambda: redacted("nk_short stays"), "nk_short stays"),
+            (
+                "innocent text unchanged",
+                lambda: redacted("user %s created note %d", "asha", 7),
+                "user asha created note 7",
+            ),
+        ]
+    )
+
+
+def check_lab_6_5() -> None:
+    """Run every Lab 6.5 check (each check prints PASS/FAIL)."""
+    for title, check in (
+        ("exercise 1", check_exercise_6_5_1),
+        ("exercise 2", check_exercise_6_5_2),
+        ("exercise 3", check_exercise_6_5_3),
+        ("exercise 4", check_exercise_6_5_4),
+        ("exercise 5", check_exercise_6_5_5),
+        ("exercise 6", check_exercise_6_5_6),
+    ):
+        print(f"--- {title}")
+        check()
+
+
+# ---------------------------------------------------------------------------- Lab 6.6
+# Given code from the notebook (setup and Lab 6.6). The real-worker check of exercise 1 needs
+# the notebook's Redis container, so this file runs only the fakeredis checks (REDIS_URL = None).
+
+REDIS_URL: str | None = None
+
+
+def format_sse(
+    data: object, *, event_name: str | None = None, event_id: str | int | None = None
+) -> str:
+    """One Server-Sent Events message: optional id and event lines, JSON data, a blank line."""
+    lines = []
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    if event_name is not None:
+        lines.append(f"event: {event_name}")
+    lines.append(f"data: {json.dumps(data)}")
+    return "\n".join(lines) + "\n\n"
+
+
+def fake_queue() -> ArqRedis:
+    """An ARQ client on an in-memory Redis (enough to enqueue and inspect jobs)."""
+    return ArqRedis(connection_pool=fakeredis.FakeAsyncRedis().connection_pool)
+
+
+def fresh_outbox_db() -> sqlite3.Connection:
+    """An in-memory database with orders and an outbox (autocommit: use BEGIN/COMMIT yourself)."""
+    db = sqlite3.connect(":memory:", isolation_level=None)
+    db.executescript("""
+        CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT NOT NULL, quantity INTEGER NOT NULL);
+        CREATE TABLE outbox (
+            id INTEGER PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            published_at TEXT
+        );
+    """)
+    return db
+
+
+def parse_sse(text: str) -> list[dict[str, object]]:
+    """Split an event stream into events: {"id", "event", "data"} (data parsed as JSON)."""
+    events = []
+    for block in text.strip().split("\n\n"):
+        lines = block.splitlines()
+        fields = dict(
+            line.split(": ", 1) for line in lines if ": " in line and not line.startswith(":")
+        )
+        if "data" in fields:
+            events.append(
+                {
+                    "id": fields.get("id"),
+                    "event": fields.get("event", "message"),
+                    "data": json.loads(fields["data"]),
+                }
+            )
+    return events
+
+
+# >>> Lab 6.6 exercise 1
+async def send_note_notification(
+    ctx: dict[str, Any], note_id: int, title: str, recipient: str
+) -> str:
+    """Send the notification once per note."""
+    first_time = await ctx["redis"].set(f"notified:{note_id}", "1", nx=True, ex=86_400)
+    if not first_time:
+        return "duplicate"
+    await ctx["redis"].rpush("lab66:sent", f"{recipient}: new note '{title}'")
+    return "sent"
+
+
+async def queue_note_notification(
+    pool: ArqRedis, note_id: int, title: str, recipient: str
+) -> str | None:
+    """Enqueue the notification job (once per note)."""
+    job = await pool.enqueue_job(
+        "send_note_notification", note_id, title, recipient, _job_id=f"notify:{note_id}"
+    )
+    return job.job_id if job is not None else None
+
+
+# <<< Lab 6.6 exercise 1
+
+
+# >>> Lab 6.6 exercise 2
+def build_live_app() -> FastAPI:
+    """Rooms of WebSocket clients with join, message and leave events."""
+    live_app = FastAPI()
+    rooms: dict[str, set[WebSocket]] = defaultdict(set)
+
+    async def broadcast(room: str, message: dict[str, object]) -> None:
+        """Send to every socket in the room."""
+        for member in list(rooms[room]):
+            await member.send_json(message)
+
+    @live_app.websocket("/ws/{room}")
+    async def live_room(websocket: WebSocket, room: str) -> None:
+        """Join with a name, then broadcast messages; announce leaving."""
+        await websocket.accept()
+        first = await websocket.receive_json()
+        name = first.get("name") if isinstance(first, dict) else None
+        if not isinstance(name, str) or not name:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="send a name first")
+            return
+        rooms[room].add(websocket)
+        await broadcast(room, {"event": "joined", "name": name})
+        try:
+            while True:
+                message = await websocket.receive_json()
+                text = str(message.get("text", ""))
+                await broadcast(room, {"event": "message", "name": name, "text": text})
+        except WebSocketDisconnect:
+            rooms[room].discard(websocket)
+            await broadcast(room, {"event": "left", "name": name})
+
+    return live_app
+
+
+# <<< Lab 6.6 exercise 2
+
+
+# >>> Lab 6.6 exercise 3
+async def export_progress(total: int, after: int) -> AsyncIterator[str]:
+    """Progress events after the given id, then a done event."""
+    for done in range(after + 1, total + 1):
+        await asyncio.sleep(0)  # a real export would do work here
+        yield format_sse({"done": done, "total": total}, event_name="progress", event_id=done)
+    yield format_sse({"total": total}, event_name="done")
+
+
+def build_export_app() -> FastAPI:
+    """GET /exports/{total}/events as Server-Sent Events."""
+    export_app = FastAPI()
+
+    @export_app.get("/exports/{total}/events")
+    async def export_events(
+        total: int, last_event_id: Annotated[str | None, Header()] = None
+    ) -> StreamingResponse:
+        """Stream progress, resuming after Last-Event-ID."""
+        after = int(last_event_id) if last_event_id else 0
+        return StreamingResponse(
+            export_progress(total, after),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    return export_app
+
+
+# <<< Lab 6.6 exercise 3
+
+
+# >>> Lab 6.6 exercise 4
+class CachedLoader:
+    """Cache-aside with hit/miss counters in Redis."""
+
+    def __init__(
+        self,
+        redis_client: Any,
+        loader: Callable[[str], Awaitable[object]],
+        ttl: int,
+        namespace: str,
+    ) -> None:
+        """Keep the collaborators."""
+        self.redis = redis_client
+        self.loader = loader
+        self.ttl = ttl
+        self.namespace = namespace
+
+    async def get(self, key: str) -> object:
+        """The cached value, loading it on a miss."""
+        cached = await self.redis.get(f"{self.namespace}:{key}")
+        if cached is not None:
+            await self.redis.hincrby(f"{self.namespace}:stats", "hits", 1)
+            return json.loads(cached)
+        await self.redis.hincrby(f"{self.namespace}:stats", "misses", 1)
+        value = await self.loader(key)
+        await self.redis.set(f"{self.namespace}:{key}", json.dumps(value), ex=self.ttl)
+        return value
+
+    async def invalidate(self, key: str) -> None:
+        """Forget one key."""
+        await self.redis.delete(f"{self.namespace}:{key}")
+
+    async def stats(self) -> dict[str, object]:
+        """Hits, misses and the hit rate."""
+        counters = await self.redis.hgetall(f"{self.namespace}:stats")
+        hits, misses = int(counters.get("hits", 0)), int(counters.get("misses", 0))
+        rate = round(hits / (hits + misses), 2) if hits + misses else 0.0
+        return {"hits": hits, "misses": misses, "hit_rate": rate}
+
+
+# <<< Lab 6.6 exercise 4
+
+
+# >>> Lab 6.6 exercise 5
+def build_etag_app() -> FastAPI:
+    """Items with ETags, 304 revalidation and If-Match updates."""
+    items: dict[int, dict[str, object]] = {1: {"id": 1, "name": "tea", "version": 1}}
+    etag_app = FastAPI()
+
+    class Rename(BaseModel):
+        """Body of PUT /items/{item_id}."""
+
+        name: str
+
+    def etag_of(item: dict[str, object]) -> str:
+        """Strong validator from the id and version."""
+        return f'"{item["id"]}-{item["version"]}"'
+
+    def matches(header: str | None, etag: str) -> bool:
+        """True if a conditional header lists this ETag (or '*')."""
+        tags = {tag.strip().removeprefix("W/") for tag in (header or "").split(",") if tag.strip()}
+        return etag in tags or "*" in tags
+
+    def item_or_404(item_id: int) -> dict[str, object]:
+        """The item or a 404."""
+        if item_id not in items:
+            raise HTTPException(404, "item not found")
+        return items[item_id]
+
+    @etag_app.get("/items/{item_id}")
+    def read_item(item_id: int, if_none_match: Annotated[str | None, Header()] = None) -> Response:
+        """200 with an ETag, or 304 when the client's copy is current."""
+        item = item_or_404(item_id)
+        headers = {"ETag": etag_of(item), "Cache-Control": "private, no-cache"}
+        if matches(if_none_match, headers["ETag"]):
+            return Response(status_code=304, headers=headers)
+        return JSONResponse(item, headers=headers)
+
+    @etag_app.put("/items/{item_id}")
+    def rename_item(
+        item_id: int, body: Rename, if_match: Annotated[str | None, Header()] = None
+    ) -> Response:
+        """Optimistic concurrency: the client must send the ETag it read."""
+        item = item_or_404(item_id)
+        if if_match is None:
+            raise HTTPException(428, "send If-Match with the ETag you read")
+        if not matches(if_match, etag_of(item)):
+            raise HTTPException(412, "the item changed since you read it")
+        item.update(name=body.name, version=int(item["version"]) + 1)
+        return JSONResponse(item, headers={"ETag": etag_of(item)})
+
+    return etag_app
+
+
+# <<< Lab 6.6 exercise 5
+
+
+# >>> Lab 6.6 exercise 6
+def place_order(db: sqlite3.Connection, item: str, quantity: int) -> int:
+    """Write the order and its event atomically."""
+    db.execute("BEGIN")
+    try:
+        if quantity < 1:
+            raise ValueError("quantity must be at least 1")
+        order_id = db.execute(
+            "INSERT INTO orders (item, quantity) VALUES (?, ?)", (item, quantity)
+        ).lastrowid
+        payload = json.dumps({"order_id": order_id, "item": item, "quantity": quantity})
+        db.execute(
+            "INSERT INTO outbox (event_type, payload) VALUES ('order.placed', ?)", (payload,)
+        )
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return order_id
+
+
+def relay_outbox(
+    db: sqlite3.Connection, publish: Callable[[dict[str, object]], None], batch_size: int = 100
+) -> int:
+    """Publish unpublished events in order; stop at the first failure."""
+    rows = db.execute(
+        "SELECT id, event_type, payload FROM outbox WHERE published_at IS NULL ORDER BY id LIMIT ?",
+        (batch_size,),
+    ).fetchall()
+    published = 0
+    for event_id, event_type, payload in rows:
+        try:
+            publish({"id": event_id, "type": event_type, **json.loads(payload)})
+        except Exception:
+            break  # the row stays unpublished; the next run retries it first
+        db.execute(
+            "UPDATE outbox SET published_at = ? WHERE id = ?",
+            (datetime.now(UTC).isoformat(), event_id),
+        )
+        published += 1
+    return published
+
+
+# <<< Lab 6.6 exercise 6
+
+
+# Check helpers (the notebook's check cells).
+
+
+async def notification_scenario() -> dict[str, object]:
+    """Enqueue twice, inspect the queue, run the task twice with a fake ctx."""
+    pool = fake_queue()
+    job_ids = [await queue_note_notification(pool, 7, "Tea", "asha@example.com") for _ in range(2)]
+    queued = [(job.function, job.args) for job in await pool.queued_jobs()]
+    ctx = {"redis": pool, "job_id": "notify:7", "job_try": 1}
+    runs = [await send_note_notification(ctx, 7, "Tea", "asha@example.com") for _ in range(2)]
+    sent = [item.decode() for item in await pool.lrange("lab66:sent", 0, -1)]
+    ttl = await pool.ttl("notified:7")
+    return {"job ids": job_ids, "queued": queued, "runs": runs, "sent": sent, "ttl": ttl}
+
+
+def check_exercise_6_6_1() -> None:
+    """Exercise 1 checks (the real-worker check needs the notebook's Redis container)."""
+    results: dict[str, object] = {}
+    with contextlib.suppress(Exception):
+        results = asyncio.run(notification_scenario())
+    run_checks(
+        [
+            ("enqueued once", lambda: results["job ids"], ["notify:7", None]),
+            (
+                "the queued job",
+                lambda: results["queued"],
+                [("send_note_notification", (7, "Tea", "asha@example.com"))],
+            ),
+            (
+                "task runs once, then sees a duplicate",
+                lambda: results["runs"],
+                ["sent", "duplicate"],
+            ),
+            ("one message", lambda: results["sent"], ["asha@example.com: new note 'Tea'"]),
+            ("the marker expires within a day", lambda: 0 < results["ttl"] <= 86_400, True),
+        ]
+    )
+
+
+def live_scenario() -> dict[str, object]:
+    """Join, talk, isolate rooms, leave."""
+    results: dict[str, object] = {}
+    with TestClient(build_live_app()) as client:
+        with client.websocket_connect("/ws/tea") as asha:
+            asha.send_json({"name": "asha"})
+            results["asha joined"] = asha.receive_json()
+            with (
+                client.websocket_connect("/ws/tea") as ravi,
+                client.websocket_connect("/ws/rice") as zoe,
+            ):
+                ravi.send_json({"name": "ravi"})
+                results["join seen by both"] = [asha.receive_json(), ravi.receive_json()]
+                zoe.send_json({"name": "zoe"})
+                zoe.receive_json()
+                asha.send_json({"text": "kettle is on"})
+                results["message seen by both"] = [asha.receive_json(), ravi.receive_json()]
+                zoe.send_json({"text": "rice is ready"})
+                results["other room"] = zoe.receive_json()
+            results["leave"] = asha.receive_json()
+        with client.websocket_connect("/ws/tea") as nameless:
+            nameless.send_json({"text": "no name"})
+            try:
+                nameless.receive_json()
+                results["no name"] = "not closed"
+            except WebSocketDisconnect as closed:
+                results["no name"] = closed.code
+    return results
+
+
+def check_exercise_6_6_2() -> None:
+    """Exercise 2 checks."""
+    results: dict[str, object] = {}
+    with contextlib.suppress(Exception):
+        results = live_scenario()
+    message = {"event": "message", "name": "asha", "text": "kettle is on"}
+    run_checks(
+        [
+            (
+                "joined (to the newcomer)",
+                lambda: results["asha joined"],
+                {"event": "joined", "name": "asha"},
+            ),
+            (
+                "joined (to everyone)",
+                lambda: results["join seen by both"],
+                [{"event": "joined", "name": "ravi"}] * 2,
+            ),
+            ("broadcast", lambda: results["message seen by both"], [message] * 2),
+            (
+                "rooms are separate",
+                lambda: results["other room"],
+                {"event": "message", "name": "zoe", "text": "rice is ready"},
+            ),
+            ("leaving is announced", lambda: results["leave"], {"event": "left", "name": "ravi"}),
+            ("no name: closed with 1008", lambda: results["no name"], 1008),
+        ]
+    )
+
+
+def export_events(
+    total: int, last_event_id: str | None = None
+) -> tuple[str, str, list[dict[str, object]]]:
+    """Content type, cache header and parsed events of one stream."""
+    headers = {"Last-Event-ID": last_event_id} if last_event_id else {}
+    with TestClient(build_export_app()) as client:
+        response = client.get(f"/exports/{total}/events", headers=headers)
+        content_type = response.headers["content-type"].split(";")[0]
+        return content_type, response.headers.get("cache-control"), parse_sse(response.text)
+
+
+async def raw_progress() -> str:
+    """The generator's exact text for total=2, after=1."""
+    return "".join([chunk async for chunk in export_progress(2, 1)])
+
+
+def check_exercise_6_6_3() -> None:
+    """Exercise 3 checks."""
+    raw = "not run"
+    with contextlib.suppress(Exception):
+        raw = asyncio.run(raw_progress())
+    expected_raw = (
+        'id: 2\nevent: progress\ndata: {"done": 2, "total": 2}\n\n'
+        'event: done\ndata: {"total": 2}\n\n'
+    )
+    all_events = [
+        ("1", "progress", {"done": 1, "total": 3}),
+        ("2", "progress", {"done": 2, "total": 3}),
+        ("3", "progress", {"done": 3, "total": 3}),
+        (None, "done", {"total": 3}),
+    ]
+    run_checks(
+        [
+            ("exact event text", lambda: raw, expected_raw),
+            (
+                "content type and cache header",
+                lambda: export_events(3)[:2],
+                ("text/event-stream", "no-cache"),
+            ),
+            (
+                "all events",
+                lambda: [
+                    (event["id"], event["event"], event["data"]) for event in export_events(3)[2]
+                ],
+                all_events,
+            ),
+            (
+                "resume after Last-Event-ID 2",
+                lambda: [event["id"] for event in export_events(4, "2")[2]],
+                ["3", "4", None],
+            ),
+            (
+                "resume at the end",
+                lambda: [event["event"] for event in export_events(4, "4")[2]],
+                ["done"],
+            ),
+        ]
+    )
+
+
+async def caching_scenario() -> dict[str, object]:
+    """Ten reads of four keys, an invalidation, a second namespace."""
+    redis_client = fakeredis.FakeAsyncRedis(decode_responses=True)
+    loads: list[str] = []
+
+    async def loader(key: str) -> dict[str, str]:
+        """The slow source, counting calls."""
+        loads.append(key)
+        return {"key": key, "value": key.upper()}
+
+    cache = CachedLoader(redis_client, loader, ttl=30, namespace="lab66:notes")
+    values = [await cache.get(key) for key in ["a", "b", "a", "c", "a", "b", "d", "a", "b", "c"]]
+    results = {
+        "values": values[:2],
+        "loads": list(loads),
+        "stats": await cache.stats(),
+        "ttl": await redis_client.ttl("lab66:notes:a"),
+        "stored": await redis_client.get("lab66:notes:a"),
+    }
+    await cache.invalidate("a")
+    await cache.get("a")
+    results["after invalidate"] = (len(loads), (await cache.stats())["misses"])
+    other = CachedLoader(redis_client, loader, ttl=30, namespace="lab66:other")
+    results["other namespace"] = await other.stats()
+    return results
+
+
+def check_exercise_6_6_4() -> None:
+    """Exercise 4 checks."""
+    results: dict[str, object] = {}
+    with contextlib.suppress(Exception):
+        results = asyncio.run(caching_scenario())
+    run_checks(
+        [
+            (
+                "values come back",
+                lambda: results["values"],
+                [{"key": "a", "value": "A"}, {"key": "b", "value": "B"}],
+            ),
+            ("the loader runs once per key", lambda: results["loads"], ["a", "b", "c", "d"]),
+            (
+                "measured hit rate",
+                lambda: results["stats"],
+                {"hits": 6, "misses": 4, "hit_rate": 0.6},
+            ),
+            ("stored as JSON", lambda: json.loads(results["stored"]), {"key": "a", "value": "A"}),
+            ("with the TTL", lambda: 0 < results["ttl"] <= 30, True),
+            ("invalidate forces a reload", lambda: results["after invalidate"], (5, 5)),
+            (
+                "namespaces keep separate stats",
+                lambda: results["other namespace"],
+                {"hits": 0, "misses": 0, "hit_rate": 0.0},
+            ),
+        ]
+    )
+
+
+def etag_scenario() -> dict[str, object]:
+    """Revalidate, update with and without the right precondition."""
+    with TestClient(build_etag_app()) as client:
+        first = client.get("/items/1")
+        etag = first.headers.get("etag")
+        not_modified = client.get("/items/1", headers={"If-None-Match": f'"0-0", W/{etag}'})
+        updated = client.put("/items/1", json={"name": "chai"}, headers={"If-Match": etag})
+        stale = client.put("/items/1", json={"name": "x"}, headers={"If-Match": '"1-0"'})
+        return {
+            "first": (first.status_code, etag, first.headers.get("cache-control"), first.json()),
+            "304": (
+                not_modified.status_code,
+                not_modified.headers.get("etag"),
+                not_modified.content,
+            ),
+            "star": client.get("/items/1", headers={"If-None-Match": "*"}).status_code,
+            "no If-Match": client.put("/items/1", json={"name": "chai"}).status_code,
+            "stale If-Match": stale.status_code,
+            "update": (updated.status_code, updated.headers.get("etag"), updated.json()),
+            "old ETag now": client.get("/items/1", headers={"If-None-Match": etag}).status_code,
+            "missing": client.get("/items/99").status_code,
+        }
+
+
+def check_exercise_6_6_5() -> None:
+    """Exercise 5 checks."""
+    results: dict[str, object] = {}
+    with contextlib.suppress(Exception):
+        results = etag_scenario()
+    tea = {"id": 1, "name": "tea", "version": 1}
+    run_checks(
+        [
+            (
+                "200 with validators",
+                lambda: results["first"],
+                (200, '"1-1"', "private, no-cache", tea),
+            ),
+            ("304 from a list with a weak tag", lambda: results["304"], (304, '"1-1"', b"")),
+            ("* matches", lambda: results["star"], 304),
+            ("PUT without If-Match: 428", lambda: results["no If-Match"], 428),
+            ("PUT with a stale ETag: 412", lambda: results["stale If-Match"], 412),
+            (
+                "PUT with the current ETag",
+                lambda: results["update"],
+                (200, '"1-2"', {"id": 1, "name": "chai", "version": 2}),
+            ),
+            ("the old ETag no longer matches", lambda: results["old ETag now"], 200),
+            ("unknown item: 404", lambda: results["missing"], 404),
+        ]
+    )
+
+
+def outbox_scenario() -> dict[str, object]:
+    """Orders, a failed one, relays with a flaky and a working publisher."""
+    db = fresh_outbox_db()
+    place_order(db, "tea", 2)
+    place_order(db, "rice", 1)
+    bad = raised_error_name(lambda: place_order(db, "milk", 0))
+    rows = (
+        db.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
+        db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],
+    )
+    place_order(db, "milk", 3)
+    delivered: list[dict[str, object]] = []
+
+    def flaky_publish(event: dict[str, object]) -> None:
+        """Fail on the second event."""
+        if len(delivered) == 1:
+            raise ConnectionError("broker down")
+        delivered.append(event)
+
+    runs = [
+        relay_outbox(db, flaky_publish),
+        relay_outbox(db, delivered.append, batch_size=1),
+        relay_outbox(db, delivered.append),
+        relay_outbox(db, delivered.append),
+    ]
+    return {"bad order": bad, "rows after bad order": rows, "runs": runs, "delivered": delivered}
+
+
+def check_exercise_6_6_6() -> None:
+    """Exercise 6 checks."""
+    results: dict[str, object] = {}
+    with contextlib.suppress(Exception):
+        results = outbox_scenario()
+    first_event = {"id": 1, "type": "order.placed", "order_id": 1, "item": "tea", "quantity": 2}
+    run_checks(
+        [
+            ("quantity 0 is a ValueError", lambda: results["bad order"], "ValueError"),
+            ("... and wrote nothing", lambda: results["rows after bad order"], (2, 2)),
+            (
+                "relay counts: flaky, batch of 1, rest, nothing left",
+                lambda: results["runs"],
+                [1, 1, 1, 0],
+            ),
+            (
+                "events in order, none twice",
+                lambda: [(event["id"], event["item"]) for event in results["delivered"]],
+                [(1, "tea"), (2, "rice"), (3, "milk")],
+            ),
+            ("event shape", lambda: results["delivered"][0], first_event),
+        ]
+    )
+
+
+def check_lab_6_6() -> None:
+    """Run every Lab 6.6 check (each check prints PASS/FAIL)."""
+    for title, check in (
+        ("exercise 1", check_exercise_6_6_1),
+        ("exercise 2", check_exercise_6_6_2),
+        ("exercise 3", check_exercise_6_6_3),
+        ("exercise 4", check_exercise_6_6_4),
+        ("exercise 5", check_exercise_6_6_5),
+        ("exercise 6", check_exercise_6_6_6),
+    ):
+        print(f"--- {title}")
+        check()
+
+
 if __name__ == "__main__":
     selected = set(sys.argv[1:])
     labs = [
@@ -3628,6 +5153,8 @@ if __name__ == "__main__":
         ("Lab 6.2", check_lab_6_2),
         ("Lab 6.3", check_lab_6_3),
         ("Lab 6.4", check_lab_6_4),
+        ("Lab 6.5", check_lab_6_5),
+        ("Lab 6.6", check_lab_6_6),
     ]
     for lab_title, check_lab in labs:
         if selected and lab_title not in selected:
