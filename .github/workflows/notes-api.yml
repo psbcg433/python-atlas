@@ -1,18 +1,21 @@
 # CI/CD for the Notes API (projects/notes_api/).
 #
 #   lint ─┐
-#   types ├─> build image (+ smoke test) ─> scan ─> push to GHCR ─> deploy (tags only)
+#   types ├─> build image (+ smoke test) ─> scan ─> push to GHCR ─> deploy (main only)
 #   test ─┘   (test: PostgreSQL and Redis as service containers)
 #
-# Pushes go to ghcr.io/<owner>/notes-api for the main branch and for tags notes-api-v*; only a
-# tag deploys, through the "production" environment (configure required reviewers there).
+# Every push and pull request runs the checks. A push to main (or a manual run on main) also
+# pushes ghcr.io/<owner>/notes-api:<commit sha> (+ :latest) and deploys exactly that image:
+# rsync the Compose files to the server, run deploy/production/rollout.sh <sha> over SSH
+# (backup, migrations, zero-downtime swap), then smoke-test over HTTPS and roll back if it fails.
+# The deploy job is skipped until the NOTES_HOST repository variable exists.
+# Secrets of the "production" environment: DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS (see DEPLOY.md).
 # Actions are pinned to commit SHAs; the comment names the release.
 name: notes-api
 
 on:
   push:
     branches: ["**"]
-    tags: ["notes-api-v*"]
     paths: ["projects/notes_api/**", ".github/workflows/notes-api.yml"]
   pull_request:
     paths: ["projects/notes_api/**", ".github/workflows/notes-api.yml"]
@@ -23,10 +26,10 @@ permissions:
 
 concurrency:
   group: notes-api-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }} # never cancel a deploy half-way
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/notes-api
+  IMAGE: ghcr.io/${{ github.repository_owner }}/notes-api # the owner must be lowercase
 
 defaults:
   run:
@@ -94,7 +97,7 @@ jobs:
           docker run --detach --name smoke --publish 8000:8000 \
             --env NOTES_ENVIRONMENT=test --env NOTES_CHECK_MIGRATIONS=false \
             --env NOTES_DATABASE_URL=sqlite+aiosqlite:////tmp/smoke.db "$IMAGE:$GITHUB_SHA"
-          for attempt in $(seq 30); do curl --fail --silent localhost:8000/health/live && exit 0; sleep 1; done
+          for _ in $(seq 30); do curl --fail --silent localhost:8000/health/live && exit 0; sleep 1; done
           docker logs smoke; exit 1
       - run: docker save "$IMAGE:$GITHUB_SHA" | gzip > image.tar.gz
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -118,32 +121,62 @@ jobs:
 
   push:
     needs: scan
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/notes-api-v'))
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions: { contents: read, packages: write }
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with: { name: notes-api-image, path: projects/notes_api }
       - run: gunzip -c image.tar.gz | docker load
-      - name: Push the commit tag, plus the version tag (tags) or latest (main)
+      - name: Push the commit tag and latest
         env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
         run: |
           echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          extra="latest"
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then extra="${GITHUB_REF_NAME#notes-api-v}"; fi
-          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:$extra"
-          docker push "$IMAGE:$GITHUB_SHA" && docker push "$IMAGE:$extra"
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
+          docker push "$IMAGE:$GITHUB_SHA" && docker push "$IMAGE:latest"
 
   deploy:
     needs: push
-    if: startsWith(github.ref, 'refs/tags/notes-api-v')
+    if: vars.NOTES_HOST != ''
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: { contents: read, packages: read }
     environment: { name: production, url: "https://${{ vars.NOTES_HOST }}" }
+    concurrency: { group: notes-api-production, cancel-in-progress: false } # one deploy at a time
+    env: { HOST: "${{ vars.NOTES_HOST }}" }
     steps:
-      - name: Migrate, then replace the containers one service at a time
-        env: { SSH_KEY: "${{ secrets.DEPLOY_SSH_KEY }}", HOST: "${{ vars.NOTES_HOST }}" }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: SSH key and the server's host key (secrets of the production environment)
+        env: { SSH_KEY: "${{ secrets.DEPLOY_SSH_KEY }}", KNOWN_HOSTS: "${{ secrets.DEPLOY_KNOWN_HOSTS }}" }
         run: |
-          install -m 600 /dev/null ~/.ssh_key && printf '%s\n' "$SSH_KEY" > ~/.ssh_key
-          ssh -i ~/.ssh_key -o StrictHostKeyChecking=accept-new "deploy@$HOST" \
-            "cd /srv/notes && export TAG=${GITHUB_REF_NAME#notes-api-v} && docker compose pull \
-             && docker compose run --rm migrate && docker compose up -d --no-deps --wait api worker"
+          install -d -m 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key && printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host notes-prod\n  HostName %s\n  User deploy\n  IdentityFile ~/.ssh/deploy_key\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' \
+            "$HOST" > ~/.ssh/config
+      - name: Copy the Compose files and deploy scripts to /srv/notes
+        run: rsync -az --relative compose.yaml compose.prod.yaml deploy/Caddyfile deploy/production notes-prod:/srv/notes/
+      - name: Roll out ${{ github.sha }} (backup, migrations, zero-downtime swap)
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          trap 'ssh notes-prod docker logout ghcr.io > /dev/null || true' EXIT
+          echo "$GH_TOKEN" | ssh notes-prod docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          # shellcheck disable=SC2029  # $IMAGE and $GITHUB_SHA expand on the runner on purpose
+          ssh notes-prod "NOTES_IMAGE=$IMAGE /srv/notes/deploy/production/rollout.sh $GITHUB_SHA"
+
+      - name: Smoke test over HTTPS
+        id: smoke
+        run: |
+          for attempt in $(seq 20); do
+            curl --fail --silent --show-error --max-time 5 "https://$HOST/health/ready" && break
+            if [[ $attempt == 20 ]]; then exit 1; fi
+            sleep 3
+          done
+          curl --fail --silent --show-error "https://$HOST/health/startup"
+          redirect=$(curl --silent --output /dev/null --write-out '%{http_code}' "http://$HOST/health/live")
+          if [[ $redirect != 308 ]]; then echo "HTTP answered $redirect, expected 308"; exit 1; fi
+          curl --silent --head "https://$HOST/health/live" | grep -i '^strict-transport-security'
+          echo "Deployed \`${GITHUB_SHA::12}\` to https://$HOST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Roll back to the previous release
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: ssh notes-prod "SKIP_PULL=1 /srv/notes/deploy/production/rollout.sh rollback"

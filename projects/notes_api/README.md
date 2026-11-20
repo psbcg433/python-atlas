@@ -62,6 +62,25 @@ systemd unit and a Cloud Run service; `Procfile` covers Heroku-style platforms. 
 `.github/workflows/notes-api.yml`.
 
 
+## Production
+
+The production setup runs this stack on one Hetzner Cloud server with Docker Compose:
+Caddy (automatic HTTPS from Let's Encrypt, HSTS), two API replicas, the worker, PostgreSQL,
+Redis, Prometheus and Grafana. Every push to `main` that passes lint, types, tests, the image
+build and the scans is deployed by `.github/workflows/notes-api.yml` with
+`deploy/production/rollout.sh`: backup, migrations, then a zero-downtime swap of the replicas,
+an HTTPS smoke test and an automatic rollback if it fails. `notes-api-uptime.yml` checks the
+live API and its certificate every 15 minutes.
+
+| File | Purpose |
+| --- | --- |
+| [`DEPLOY.md`](DEPLOY.md) | the runbook: server, secrets, first deploy, HTTPS checks, monitoring, rollback |
+| [`LOAD_TEST.md`](LOAD_TEST.md) | the Locust scenario, the targets (p95 < 200 ms, < 1% errors, >= 100 req/s) and the results |
+| `compose.prod.yaml` | production overrides merged over `compose.yaml` |
+| `deploy/production/` | Caddyfile, Prometheus and alert rules, Grafana provisioning, `bootstrap.sh`, `rollout.sh`, `backup.sh`, `dc` |
+| `load/report.py` | turns a Locust CSV into the results section of `LOAD_TEST.md` |
+
+
 ## Endpoints
 
 | Method | Path | Auth | Notes |

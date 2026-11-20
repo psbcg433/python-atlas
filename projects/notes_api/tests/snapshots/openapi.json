@@ -760,7 +760,7 @@
     "description": "Built step by step in Phase 6 of the course. Errors are RFC 9457 problems.",
     "summary": "Create, search and organize notes.",
     "title": "Notes API",
-    "version": "0.7.0"
+    "version": "1.0.0"
   },
   "openapi": "3.1.0",
   "paths": {

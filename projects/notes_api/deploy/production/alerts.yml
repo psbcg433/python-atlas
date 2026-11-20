@@ -1,0 +1,29 @@
+# Alert rules for the Notes API, evaluated by Prometheus every 15 s. Firing alerts show on
+# Prometheus' Alerts page and on the Grafana dashboard; the uptime workflow is what e-mails you.
+groups:
+  - name: notes-api
+    rules:
+      - alert: NotesApiDown
+        expr: absent(up{job="notes-api"} == 1)
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: No Notes API replica has answered a scrape for 2 minutes.
+
+      - alert: NotesApiHighErrorRate
+        expr: |
+          sum(rate(notes_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(notes_http_requests_total[5m])), 1e-9) > 0.01
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: More than 1% of requests failed with a 5xx status for 5 minutes.
+
+      - alert: NotesApiSlowP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(notes_http_request_duration_seconds_bucket[5m]))) > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: The 95th percentile latency has been above 200 ms for 10 minutes.

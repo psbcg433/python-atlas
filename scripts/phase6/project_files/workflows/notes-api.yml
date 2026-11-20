@@ -1,0 +1,182 @@
+# CI/CD for the Notes API (projects/notes_api/).
+#
+#   lint ─┐
+#   types ├─> build image (+ smoke test) ─> scan ─> push to GHCR ─> deploy (main only)
+#   test ─┘   (test: PostgreSQL and Redis as service containers)
+#
+# Every push and pull request runs the checks. A push to main (or a manual run on main) also
+# pushes ghcr.io/<owner>/notes-api:<commit sha> (+ :latest) and deploys exactly that image:
+# rsync the Compose files to the server, run deploy/production/rollout.sh <sha> over SSH
+# (backup, migrations, zero-downtime swap), then smoke-test over HTTPS and roll back if it fails.
+# The deploy job is skipped until the NOTES_HOST repository variable exists.
+# Secrets of the "production" environment: DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS (see DEPLOY.md).
+# Actions are pinned to commit SHAs; the comment names the release.
+name: notes-api
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["projects/notes_api/**", ".github/workflows/notes-api.yml"]
+  pull_request:
+    paths: ["projects/notes_api/**", ".github/workflows/notes-api.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notes-api-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }} # never cancel a deploy half-way
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/notes-api # the owner must be lowercase
+
+defaults:
+  run:
+    working-directory: projects/notes_api
+
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: { python-version: "3.15", enable-cache: true, cache-dependency-glob: projects/notes_api/uv.lock }
+      - run: uv sync --frozen
+      - run: uv run ruff check . && uv run ruff format --check .
+
+  types:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: { python-version: "3.15", enable-cache: true, cache-dependency-glob: projects/notes_api/uv.lock }
+      - run: uv sync --frozen
+      - run: uv run mypy # files and the typing-debt list are in pyproject.toml
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env: { POSTGRES_USER: notes, POSTGRES_PASSWORD: notes, POSTGRES_DB: notes_test } # CI only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U notes -d notes_test"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+      redis:
+        image: redis:7.4
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 3s --health-retries 15
+    env:
+      NOTES_TEST_DATABASE_URL: postgresql+asyncpg://notes:notes@localhost:5432/notes_test
+      NOTES_TEST_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: { python-version: "3.15", enable-cache: true, cache-dependency-glob: projects/notes_api/uv.lock }
+      - run: uv sync --frozen
+      - run: uv run pytest -p no:cacheprovider -rs --junitxml=test-results.xml
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: notes-api-test-results, path: projects/notes_api/test-results.xml }
+
+  build:
+    needs: [lint, types, test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the image
+        run: docker build --tag "$IMAGE:$GITHUB_SHA" .
+      - name: Report the image size
+        run: docker image inspect "$IMAGE:$GITHUB_SHA" --format 'size={{.Size}}' >> "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test (the container starts and answers its liveness probe)
+        run: |
+          docker run --detach --name smoke --publish 8000:8000 \
+            --env NOTES_ENVIRONMENT=test --env NOTES_CHECK_MIGRATIONS=false \
+            --env NOTES_DATABASE_URL=sqlite+aiosqlite:////tmp/smoke.db "$IMAGE:$GITHUB_SHA"
+          for _ in $(seq 30); do curl --fail --silent localhost:8000/health/live && exit 0; sleep 1; done
+          docker logs smoke; exit 1
+      - run: docker save "$IMAGE:$GITHUB_SHA" | gzip > image.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: notes-api-image, path: projects/notes_api/image.tar.gz, retention-days: 3 }
+
+  scan:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: notes-api-image, path: projects/notes_api }
+      - run: gunzip -c image.tar.gz | docker load
+      - name: Vulnerabilities in the image (OS packages and Python wheels)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.1 \
+            image --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed "$IMAGE:$GITHUB_SHA"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Known vulnerabilities in the locked dependencies
+        run: uv export --frozen --no-dev --no-hashes > requirements.txt && uvx pip-audit -r requirements.txt
+
+  push:
+    needs: scan
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: notes-api-image, path: projects/notes_api }
+      - run: gunzip -c image.tar.gz | docker load
+      - name: Push the commit tag and latest
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
+          docker push "$IMAGE:$GITHUB_SHA" && docker push "$IMAGE:latest"
+
+  deploy:
+    needs: push
+    if: vars.NOTES_HOST != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: { contents: read, packages: read }
+    environment: { name: production, url: "https://${{ vars.NOTES_HOST }}" }
+    concurrency: { group: notes-api-production, cancel-in-progress: false } # one deploy at a time
+    env: { HOST: "${{ vars.NOTES_HOST }}" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: SSH key and the server's host key (secrets of the production environment)
+        env: { SSH_KEY: "${{ secrets.DEPLOY_SSH_KEY }}", KNOWN_HOSTS: "${{ secrets.DEPLOY_KNOWN_HOSTS }}" }
+        run: |
+          install -d -m 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key && printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf 'Host notes-prod\n  HostName %s\n  User deploy\n  IdentityFile ~/.ssh/deploy_key\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' \
+            "$HOST" > ~/.ssh/config
+      - name: Copy the Compose files and deploy scripts to /srv/notes
+        run: rsync -az --relative compose.yaml compose.prod.yaml deploy/Caddyfile deploy/production notes-prod:/srv/notes/
+      - name: Roll out ${{ github.sha }} (backup, migrations, zero-downtime swap)
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          trap 'ssh notes-prod docker logout ghcr.io > /dev/null || true' EXIT
+          echo "$GH_TOKEN" | ssh notes-prod docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          # shellcheck disable=SC2029  # $IMAGE and $GITHUB_SHA expand on the runner on purpose
+          ssh notes-prod "NOTES_IMAGE=$IMAGE /srv/notes/deploy/production/rollout.sh $GITHUB_SHA"
+
+      - name: Smoke test over HTTPS
+        id: smoke
+        run: |
+          for attempt in $(seq 20); do
+            curl --fail --silent --show-error --max-time 5 "https://$HOST/health/ready" && break
+            if [[ $attempt == 20 ]]; then exit 1; fi
+            sleep 3
+          done
+          curl --fail --silent --show-error "https://$HOST/health/startup"
+          redirect=$(curl --silent --output /dev/null --write-out '%{http_code}' "http://$HOST/health/live")
+          if [[ $redirect != 308 ]]; then echo "HTTP answered $redirect, expected 308"; exit 1; fi
+          curl --silent --head "https://$HOST/health/live" | grep -i '^strict-transport-security'
+          echo "Deployed \`${GITHUB_SHA::12}\` to https://$HOST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Roll back to the previous release
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: ssh notes-prod "SKIP_PULL=1 /srv/notes/deploy/production/rollout.sh rollback"

@@ -1,0 +1,10 @@
+# Grafana dashboard provider: load every JSON dashboard in /etc/grafana/dashboards.
+apiVersion: 1
+providers:
+  - name: notes-api
+    folder: Notes API
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

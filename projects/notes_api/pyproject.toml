@@ -1,6 +1,6 @@
 [project]
 name = "notes-api"
-version = "0.7.0"
+version = "1.0.0"
 description = "The Phase 6 Notes API: a FastAPI service built step by step from Unit 6.2 to 6.8."
 readme = "README.md"
 requires-python = ">=3.15"

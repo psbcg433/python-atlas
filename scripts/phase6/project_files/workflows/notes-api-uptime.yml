@@ -1,0 +1,41 @@
+# Uptime check for the deployed Notes API. Every 15 minutes GitHub runs this job; it fails, and
+# GitHub e-mails you, when https://<NOTES_HOST> is down or not ready, or when its certificate
+# expires within 14 days. Skipped until the NOTES_HOST repository variable exists.
+# GitHub may start scheduled runs late, and disables them after 60 days without repository
+# activity (re-enable them on the Actions tab).
+name: notes-api-uptime
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *" # off the hour: scheduled runs start late at :00
+  workflow_dispatch:
+
+permissions: {}
+
+
+jobs:
+  check:
+    if: vars.NOTES_HOST != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env: { HOST: "${{ vars.NOTES_HOST }}" }
+    steps:
+      - name: Ready over HTTPS (3 attempts, 20 s apart)
+        run: |
+          for _ in 1 2 3; do
+            if body=$(curl --fail --silent --show-error --max-time 10 "https://$HOST/health/ready"); then
+              echo "ready: $body"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::https://$HOST/health/ready failed 3 times"
+          exit 1
+      - name: Certificate valid for at least 14 more days
+        run: |
+          certificate=$(openssl s_client -connect "$HOST:443" -servername "$HOST" < /dev/null 2> /dev/null)
+          openssl x509 -noout -issuer -enddate <<< "$certificate"
+          if ! openssl x509 -noout -checkend $((14 * 24 * 3600)) <<< "$certificate"; then
+            echo "::error::the certificate of $HOST expires within 14 days"
+            exit 1
+          fi

@@ -1,0 +1,117 @@
+# Production overrides for the Notes API on one server, merged over compose.yaml:
+#     docker compose -f compose.yaml -f compose.prod.yaml <command>
+# Use deploy/production/dc (the same command with the env files); CI runs rollout.sh.
+# ${...} values come from /srv/notes/.env (secrets; see deploy/production/env.example) and
+# state/release.env (NOTES_IMAGE and TAG, written by rollout.sh). A missing one stops Compose
+# with the message after ":?". The !reset / !override tags need Compose 2.24.4 or newer.
+
+x-logging: &logging # every container: JSON lines on disk, rotated at 5 x 10 MB
+  driver: json-file
+  options: { max-size: 10m, max-file: "5" }
+
+x-app-environment: &app-environment # api, worker and migrate
+  NOTES_DATABASE_URL: postgresql+asyncpg://notes:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/notes
+  NOTES_DATABASE_POOL_SIZE: "5"
+  NOTES_DATABASE_MAX_OVERFLOW: "5" # 10 per process: a rollout peaks at 4 x 2 x 10 = 80 < 150
+  NOTES_ADMIN_EMAILS: ${NOTES_ADMIN_EMAILS:-[]}
+
+
+services:
+  db:
+    command: ["postgres", "-c", "max_connections=150"]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports: !reset [] # no host port; psql: deploy/production/dc exec db psql -U notes
+    shm_size: 256mb
+    logging: *logging
+
+  redis:
+    command: ["redis-server", "--appendonly", "yes"] # queued jobs survive a restart
+    ports: !reset []
+    volumes: ["redis-data:/data"]
+    logging: *logging
+
+  migrate:
+    build: !reset null # production never builds: it runs the image CI pushed
+    image: ${NOTES_IMAGE:?NOTES_IMAGE is set by rollout.sh}:${TAG:?TAG is set by rollout.sh}
+    environment: *app-environment
+    logging: *logging
+
+  api:
+    build: !reset null
+    image: ${NOTES_IMAGE:?NOTES_IMAGE is set by rollout.sh}:${TAG:?TAG is set by rollout.sh}
+    environment:
+      <<: *app-environment
+      WEB_CONCURRENCY: "2" # Uvicorn processes per container
+    deploy: { replicas: 2 } # rollout.sh adds 2 new replicas, then stops the 2 old ones
+    stop_grace_period: 30s # SIGTERM, Uvicorn finishes requests for up to 20 s, SIGKILL at 30 s
+    logging: *logging
+
+  worker:
+    build: !reset null
+    image: ${NOTES_IMAGE:?NOTES_IMAGE is set by rollout.sh}:${TAG:?TAG is set by rollout.sh}
+    environment: *app-environment
+    stop_grace_period: 30s
+    logging: *logging
+
+  proxy:
+    image: caddy:2.10
+    environment:
+      NOTES_SITE: ${NOTES_SITE:?set NOTES_SITE in .env, e.g. 203-0-113-10.sslip.io}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    ports: !override # public: the only ports open to the internet
+      - "${PUBLIC_HTTP_PORT:-80}:80"
+      - "${PUBLIC_HTTPS_PORT:-443}:443"
+      - "${PUBLIC_HTTPS_PORT:-443}:443/udp" # HTTP/3
+    volumes: # same target as compose.yaml's Caddyfile mount, so this one replaces it
+      - ./deploy/production/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-config:/config
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    ports: ["127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"] # reach it through an SSH tunnel
+    volumes:
+      - ./deploy/production/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/production/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana-oss:12.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports: ["127.0.0.1:${GRAFANA_PORT:-3000}:3000"] # SSH tunnel too
+    volumes:
+      - ./deploy/production/grafana/datasources.yml:/etc/grafana/provisioning/datasources/notes.yml:ro
+      - ./deploy/production/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/notes.yml:ro
+      - ./deploy/production/grafana/notes-api.json:/etc/grafana/dashboards/notes-api.json:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      prometheus: { condition: service_healthy }
+    restart: unless-stopped
+    logging: *logging
+
+
+volumes:
+  redis-data:
+  caddy-config:
+  prometheus-data:
+  grafana-data:

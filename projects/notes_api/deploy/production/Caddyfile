@@ -1,0 +1,50 @@
+# Caddy in production. Automatic HTTPS for NOTES_SITE: Caddy answers Let's Encrypt's challenge
+# on port 80 or 443, stores the certificate in the caddy-data volume and renews it about 30 days
+# before it expires (ZeroSSL is the fallback issuer). HTTP is redirected to HTTPS (308).
+{
+	email {$ACME_EMAIL}
+	admin localhost:2019
+}
+
+# Where requests go. Normally every running "api" container, found through Docker's DNS and
+# re-resolved every second. rollout.sh switches to a fixed list (only the new replicas) with
+#   caddy reload, NOTES_UPSTREAM_MODE=static, NOTES_UPSTREAMS="<name>:8000 ..."
+# while it drains and stops the old ones, then reloads with the defaults again.
+(upstreams-dynamic) {
+	dynamic a api 8000 {
+		refresh 1s
+	}
+}
+
+(upstreams-static) {
+	to {$NOTES_UPSTREAMS}
+}
+
+
+{$NOTES_SITE} {
+	encode zstd gzip
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+	header /static/* Cache-Control "public, max-age=86400"
+
+	@internal path /metrics /metrics/*
+	respond @internal 404 # Prometheus scrapes the replicas directly, inside the network
+
+	reverse_proxy {
+		import upstreams-{$NOTES_UPSTREAM_MODE:dynamic}
+		lb_policy round_robin
+		lb_try_duration 5s # a replica that refuses the connection (being replaced): try another
+		lb_try_interval 250ms
+		fail_duration 10s # and skip it for 10 s
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

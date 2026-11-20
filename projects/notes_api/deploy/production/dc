@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# docker compose with the production files and env files. Examples:
+#   deploy/production/dc ps
+#   deploy/production/dc logs --since 1h api
+#   deploy/production/dc exec db psql -U notes
+set -euo pipefail
+source "$(dirname "$0")/lib.sh"
+exec "${compose[@]}" "$@"

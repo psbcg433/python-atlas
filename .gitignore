@@ -13,3 +13,7 @@ __pycache__/
 notebooks/_scratch/
 .hypothesis/
 .secrets/
+
+# Notes API: deploy state (rehearsal or server copies) and load-test CSVs
+projects/notes_api/state/
+projects/notes_api/load/results/

@@ -218,7 +218,11 @@ async def run_worker(burst: bool = False, settings: Settings | None = None) -> N
         keep_result=WorkerSettings.keep_result,
     )
     try:
-        await worker.main()
+        await worker.async_run()  # sets worker.main_task: the task arq's SIGTERM handler cancels
+    except asyncio.CancelledError:
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            raise  # run_worker itself was cancelled (not a signal): let that propagate
     finally:
         await worker.close()
 
