@@ -16,19 +16,37 @@ from notes_api.dependencies import (
 from notes_api.exceptions import NoteNotFoundError
 from notes_api.models import Note
 from notes_api.pagination import CursorPage, Page
-from notes_api.schemas import FeedParams, LinkPreview, NoteCreate, NoteFilters, NoteRead, NoteUpdate
+from notes_api.schemas import (
+    MAX_DB_INT,
+    FeedParams,
+    LinkPreview,
+    NoteCreate,
+    NoteFilters,
+    NoteRead,
+    NoteUpdate,
+)
 
-NoteId = Annotated[int, Path(ge=1, description="The note's id.")]
-NOT_FOUND: dict[int | str, dict[str, Any]] = {
-    404: {
-        "model": ProblemDetail,
-        "description": "No note has this id.",
-        "content": {PROBLEM_JSON: {}},
-    }
+NoteId = Annotated[int, Path(ge=1, le=MAX_DB_INT, description="The note's id.")]
+
+
+def problem(description: str) -> dict[str, Any]:
+    """An OpenAPI response entry for an RFC 9457 problem."""
+    return {"model": ProblemDetail, "description": description, "content": {PROBLEM_JSON: {}}}
+
+
+NOT_FOUND: dict[int | str, dict[str, Any]] = {404: problem("No note has this id.")}
+WRITE_ERRORS: dict[int | str, dict[str, Any]] = {
+    **NOT_FOUND,
+    409: problem("Version conflict: someone changed the note; read it again."),
+}
+AUTH_ERRORS: dict[int | str, dict[str, Any]] = {
+    401: problem("Missing, invalid or expired credentials."),
+    403: problem("The token lacks the scope this operation needs."),
 }
 CACHE_CONTROL = "private, no-cache"  # browsers may keep it, but must revalidate (ETag) first
 
-router = APIRouter(prefix="/notes", tags=["notes"])  # every route needs a user (scopes below)
+# Every route needs a user (scopes below). {note_id:int}: "/notes/feed" never matches an id route.
+router = APIRouter(prefix="/notes", tags=["notes"], responses=AUTH_ERRORS)
 
 
 def etag_of(note: dict[str, Any]) -> str:
@@ -78,7 +96,11 @@ async def list_notes(
     return {"items": notes, "total": total, "limit": filters.limit, "offset": filters.offset}
 
 
-@router.get("/feed", response_model=CursorPage[NoteRead])
+@router.get(
+    "/feed",
+    response_model=CursorPage[NoteRead],
+    responses={400: problem("The cursor is not one this API issued.")},
+)
 async def notes_feed(
     params: Annotated[FeedParams, Query()], service: ReaderServiceDep
 ) -> dict[str, object]:
@@ -88,7 +110,7 @@ async def notes_feed(
 
 
 @router.get(
-    "/{note_id}",
+    "/{note_id:int}",
     response_model=NoteRead,
     responses={**NOT_FOUND, 304: {"description": "Not modified (If-None-Match matched)."}},
 )
@@ -111,7 +133,7 @@ async def get_note(
     return note
 
 
-@router.put("/{note_id}", response_model=NoteRead, responses=NOT_FOUND)
+@router.put("/{note_id:int}", response_model=NoteRead, responses=WRITE_ERRORS)
 async def replace_note(
     note_id: NoteId,
     note: NoteCreate,
@@ -127,7 +149,7 @@ async def replace_note(
     return replaced
 
 
-@router.patch("/{note_id}", response_model=NoteRead, responses=NOT_FOUND)
+@router.patch("/{note_id:int}", response_model=NoteRead, responses=WRITE_ERRORS)
 async def update_note(
     note_id: NoteId,
     changes: NoteUpdate,
@@ -143,7 +165,7 @@ async def update_note(
     return updated
 
 
-@router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT, responses=NOT_FOUND)
+@router.delete("/{note_id:int}", status_code=status.HTTP_204_NO_CONTENT, responses=NOT_FOUND)
 async def delete_note(
     note_id: NoteId,
     service: WriterServiceDep,
@@ -157,7 +179,7 @@ async def delete_note(
     after_write(background, queue, cache, note_id)
 
 
-@router.get("/{note_id}/links", response_model=list[LinkPreview], responses=NOT_FOUND)
+@router.get("/{note_id:int}/links", response_model=list[LinkPreview], responses=NOT_FOUND)
 async def note_links(
     note_id: NoteId, service: ReaderServiceDep, previewer: LinkPreviewerDep
 ) -> list[LinkPreview]:

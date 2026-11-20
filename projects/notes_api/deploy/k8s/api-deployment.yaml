@@ -1,0 +1,36 @@
+# The API: stateless replicas, replaced one at a time, never fewer ready pods than wanted.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes-api
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: notes-api } }
+  strategy: { type: RollingUpdate, rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }
+  template:
+    metadata: { labels: { app: notes-api } }
+    spec:
+      terminationGracePeriodSeconds: 30 # longer than uvicorn --timeout-graceful-shutdown 20
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: api
+          image: ghcr.io/example/notes-api:0.7.0 # CI pushes ghcr.io/<owner>/notes-api:<tag>
+          ports: [{ containerPort: 8000 }]
+          envFrom: [{ configMapRef: { name: notes-config } }, { secretRef: { name: notes-secrets } }]
+          env: [{ name: WEB_CONCURRENCY, value: "1" }] # one process per pod; scale with pods
+          resources: { requests: { cpu: 250m, memory: 256Mi }, limits: { memory: 512Mi } }
+          startupProbe: # migrations done? until then the other probes wait
+            httpGet: { path: /health/startup, port: 8000 }
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe: # database and Redis reachable? if not, no traffic (not restarted)
+            httpGet: { path: /health/ready, port: 8000 }
+            periodSeconds: 5
+          livenessProbe: # process stuck? restart it (no dependency checks here)
+            httpGet: { path: /health/live, port: 8000 }
+            periodSeconds: 10
+          lifecycle: { preStop: { sleep: { seconds: 5 } } } # endpoints update before SIGTERM
+          securityContext:
+            { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }, { name: metrics, mountPath: /tmp/prometheus }]
+      volumes: [{ name: tmp, emptyDir: {} }, { name: metrics, emptyDir: {} }]

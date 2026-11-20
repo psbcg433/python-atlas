@@ -11,3 +11,5 @@ __pycache__/
 
 # Scratch files written by notebook demos
 notebooks/_scratch/
+.hypothesis/
+.secrets/

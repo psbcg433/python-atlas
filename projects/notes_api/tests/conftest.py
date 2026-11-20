@@ -1,21 +1,40 @@
-"""Shared fixtures: each test gets its own app, SQLite file and fake Redis, and a logged-in user."""
+"""Shared fixtures: an app per test (SQLite file, fakeredis), clients, PostgreSQL and Redis."""
 
 import asyncio
+import os
 import secrets
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import fakeredis
+import httpx
 import pytest
+from alembic import command
 from arq.connections import ArqRedis
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from hypothesis import settings as hypothesis_settings
 from pydantic import SecretStr
 
-from helpers import USER_EMAIL, FakeMailer, auth_headers, create_tables, fake_resolver
+from helpers import (
+    PASSWORD,
+    POSTGRES_IMAGE,
+    REDIS_IMAGE,
+    USER_EMAIL,
+    FakeMailer,
+    auth_headers,
+    create_tables,
+    docker_available,
+    fake_resolver,
+    postgres_alembic_config,
+)
 from notes_api.core.config import Settings
 from notes_api.dependencies import get_mailer, get_queue, get_redis, get_resolver
 from notes_api.main import create_app
+
+# No example database for Hypothesis (Schemathesis uses it): every run tries the same cases.
+hypothesis_settings.register_profile("notes", database=None)
+hypothesis_settings.load_profile("notes")
 
 
 @pytest.fixture
@@ -39,6 +58,8 @@ def settings(tmp_path: Path) -> Settings:
         admin_emails=["admin@example.com"],
         login_rate_limit=10,
         cookie_secure=False,  # TestClient talks plain HTTP
+        check_migrations=False,  # the test schema comes from create_all, not Alembic
+        otel_exporter="memory",  # spans are kept on app.state.span_exporter
     )
 
 
@@ -101,3 +122,53 @@ def client(anonymous: TestClient) -> TestClient:
 def admin_headers(anonymous: TestClient) -> dict[str, str]:
     """Bearer headers of an admin (admin@example.com is in admin_emails)."""
     return auth_headers(anonymous, "admin@example.com")
+
+
+@pytest.fixture
+async def async_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """httpx.AsyncClient calling the app in this event loop (ASGITransport), with its lifespan."""
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            http.headers.update(await async_auth_headers(http, USER_EMAIL))
+            yield http
+
+
+async def async_auth_headers(http: httpx.AsyncClient, email: str) -> dict[str, str]:
+    """Register and log in through the async client; return a Bearer header."""
+    await http.post("/api/v1/auth/register", json={"email": email, "password": PASSWORD})
+    form = {"username": email, "password": PASSWORD}
+    token = (await http.post("/api/v1/auth/token", data=form)).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture(scope="session")
+def postgres_url() -> Iterator[str]:
+    """A PostgreSQL database migrated to head: the CI service, or a testcontainer."""
+    if url := os.environ.get("NOTES_TEST_DATABASE_URL"):
+        command.upgrade(postgres_alembic_config(url), "head")
+        yield url
+        return
+    if not docker_available():
+        pytest.skip("no NOTES_TEST_DATABASE_URL and Docker is not available")
+    from testcontainers.community.postgres import PostgresContainer
+
+    with PostgresContainer(POSTGRES_IMAGE, driver="asyncpg") as container:
+        url = container.get_connection_url()
+        command.upgrade(postgres_alembic_config(url), "head")
+        yield url
+
+
+@pytest.fixture(scope="session")
+def redis_url() -> Iterator[str]:
+    """A real Redis: the CI service, or a testcontainer."""
+    if url := os.environ.get("NOTES_TEST_REDIS_URL"):
+        yield url
+        return
+    if not docker_available():
+        pytest.skip("no NOTES_TEST_REDIS_URL and Docker is not available")
+    from testcontainers.community.redis import RedisContainer
+
+    with RedisContainer(REDIS_IMAGE) as container:
+        host, port = container.get_container_host_ip(), container.get_exposed_port(6379)
+        yield f"redis://{host}:{port}/0"

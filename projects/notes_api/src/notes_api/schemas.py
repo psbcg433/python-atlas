@@ -6,12 +6,14 @@ Page envelopes live in pagination.py, error bodies in core/errors.py.
 """
 
 import re
+from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     EmailStr,
     Field,
@@ -21,8 +23,10 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 MAX_TAGS = 10
+MAX_DB_INT = 2**31 - 1  # PostgreSQL INTEGER: larger ids, offsets or versions cannot exist
 
 
 def require_slug(value: str) -> str:
@@ -37,11 +41,29 @@ def unique_in_order(tags: list[str]) -> list[str]:
     return list(dict.fromkeys(tags))
 
 
-Title = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+def at_most(limit: int) -> Callable[[object], object]:
+    """A before-validator: the raw string (before stripping) obeys the documented maxLength."""
+
+    def check(value: object) -> object:
+        """Reject over-long raw strings."""
+        if isinstance(value, str) and len(value) > limit:
+            raise ValueError(f"at most {limit} characters")
+        return value
+
+    return check
+
+
+# The patterns put the rules into the OpenAPI schema (clients and Schemathesis see them):
+# a title has a non-space character; a tag is letters, digits and dashes (stored lower-case).
+Title = Annotated[
+    str,
+    BeforeValidator(at_most(200)),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=200, pattern=r"\S"),
+]
 Body = Annotated[str, Field(max_length=10_000)]
 Tag = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, to_lower=True, min_length=1, max_length=30),
+    StringConstraints(to_lower=True, min_length=1, max_length=30, pattern=r"^[A-Za-z0-9-]+$"),
     AfterValidator(require_slug),
 ]
 Tags = Annotated[list[Tag], Field(max_length=MAX_TAGS)]
@@ -53,6 +75,7 @@ class NoteCreate(BaseModel):
 
     model_config = ConfigDict(
         extra="forbid",
+        strict=True,  # JSON types as documented: "pinned": 0 is not a boolean
         json_schema_extra={
             "examples": [{"title": "Buy tea", "body": "Assam, 500 g", "tags": ["shopping"]}]
         },
@@ -74,15 +97,20 @@ class NoteUpdate(BaseModel):
     """Body of PATCH /notes/{note_id}: only the fields being changed."""
 
     model_config = ConfigDict(
-        extra="forbid", json_schema_extra={"examples": [{"pinned": True, "version": 1}]}
+        extra="forbid",
+        strict=True,
+        json_schema_extra={"examples": [{"pinned": True, "version": 1}]},
     )
 
-    title: Title | None = None
-    body: Body | None = None
-    tags: Tags | None = None
-    pinned: bool | None = None
+    # Optional but not nullable: SkipJsonSchema keeps None out of the documented schema, which
+    # must match what the validator below accepts (Schemathesis found the mismatch).
+    title: Title | SkipJsonSchema[None] = None
+    body: Body | SkipJsonSchema[None] = None
+    tags: Tags | SkipJsonSchema[None] = None
+    pinned: bool | SkipJsonSchema[None] = None
     version: Annotated[
-        int | None, Field(ge=1, description="The version you read; a mismatch is a 409.")
+        Annotated[int, Field(ge=1, le=MAX_DB_INT)] | SkipJsonSchema[None],
+        Field(description="The version you read; a mismatch is a 409."),
     ] = None
 
     @field_validator("tags")
@@ -114,7 +142,7 @@ class NoteRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    @computed_field
+    @computed_field  # type: ignore[prop-decorator]  # mypy does not model this pydantic idiom
     @property
     def word_count(self) -> int:
         """Words in the body (derived, never stored)."""
@@ -131,7 +159,7 @@ class NoteFilters(BaseModel):
     pinned: bool | None = None
     sort: SortOrder = "-created_at"
     limit: Annotated[int, Field(ge=1, le=100)] = 20
-    offset: Annotated[int, Field(ge=0)] = 0
+    offset: Annotated[int, Field(ge=0, le=MAX_DB_INT)] = 0
 
 
 class FeedParams(BaseModel):

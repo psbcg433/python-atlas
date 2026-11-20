@@ -70,10 +70,16 @@ def test_simple_cors_request_exposes_headers(client: TestClient) -> None:
 
 
 def test_middleware_order(app: FastAPI) -> None:
-    """Outermost first: request id, security headers, CORS, GZip, timing."""
+    """Outermost first: request id, access log, metrics, security headers, CORS, GZip, timing.
+
+    OpenTelemetry wraps the whole stack (it patches build_middleware_stack), outside all of them.
+    """
+    assert app._is_instrumented_by_opentelemetry  # noqa: SLF001
     names = [middleware.cls.__name__ for middleware in app.user_middleware]
     assert names == [
         "RequestIdMiddleware",
+        "AccessLogMiddleware",
+        "MetricsMiddleware",
         "SecurityHeadersMiddleware",
         "CORSMiddleware",
         "GZipMiddleware",

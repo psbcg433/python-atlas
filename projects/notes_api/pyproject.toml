@@ -1,6 +1,6 @@
 [project]
 name = "notes-api"
-version = "0.5.0"
+version = "0.7.0"
 description = "The Phase 6 Notes API: a FastAPI service built step by step from Unit 6.2 to 6.8."
 readme = "README.md"
 requires-python = ">=3.15"
@@ -14,14 +14,21 @@ dependencies = [
     "pyjwt[crypto]>=2.15.1",
     "redis>=8.1.0",
     "sqlalchemy[asyncio]>=2.1.9",
+    "structlog>=26.1.0",
+    "prometheus-client>=0.26.0",
+    "opentelemetry-sdk>=1.45.2",
+    "opentelemetry-instrumentation-fastapi>=0.66b2",
 ]
 
 [dependency-groups]
 dev = [
     "aiosqlite>=0.22.1",
     "fakeredis>=2.40.0",
+    "locust>=2.47.0",
+    "mypy>=2.4.1",
     "pytest>=9.2.0",
     "respx>=0.23.1",
+    "schemathesis>=4.33.4",
     "testcontainers>=4.15.0",
 ]
 
@@ -43,3 +50,23 @@ filterwarnings = [
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:arq.*",
     "ignore:Call to deprecated close:DeprecationWarning",
 ]
+
+
+[tool.mypy]
+python_version = "3.15"
+files = ["src/notes_api"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+# Typing debt: these modules have known errors (SQLAlchemy result types, Starlette's handler
+# signature, Redis response unions). CI type-checks everything else; remove a module from the
+# list once it passes, never add one.
+[[tool.mypy.overrides]]
+module = [
+    "notes_api.core.errors",
+    "notes_api.exports",
+    "notes_api.repositories",
+    "notes_api.routers.exports",
+    "notes_api.routers.pages",
+]
+ignore_errors = true

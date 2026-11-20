@@ -1,0 +1,28 @@
+# Google Cloud Run (Knative): gcloud run services replace deploy/cloudrun/service.yaml
+# Cloud Run scales containers on requests (to zero when idle), so the ARQ worker runs elsewhere
+# (a VM, a Kubernetes Deployment, or Cloud Run with CPU always allocated). AWS ECS/Fargate is
+# similar: a task definition with the same image, health check and secrets from Secrets Manager.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: notes-api
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1" # no cold start for the first request
+        autoscaling.knative.dev/maxScale: "10"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - image: europe-docker.pkg.dev/example/notes/notes-api:0.7.0
+          ports: [{ containerPort: 8000 }]
+          env:
+            - { name: WEB_CONCURRENCY, value: "1" }
+            - name: NOTES_JWT_SECRET
+              valueFrom: { secretKeyRef: { name: notes-jwt-secret, key: latest } }
+            - name: NOTES_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: notes-database-url, key: latest } }
+          startupProbe: { httpGet: { path: /health/startup }, periodSeconds: 2, failureThreshold: 30 }
+          livenessProbe: { httpGet: { path: /health/live }, periodSeconds: 10 }

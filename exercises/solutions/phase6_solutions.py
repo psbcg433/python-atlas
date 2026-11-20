@@ -16,11 +16,14 @@ import base64
 import binascii
 import contextlib
 import contextvars
+import csv
 import dataclasses
+import graphlib
 import hashlib
 import hmac
 import http.client
 import inspect
+import io
 import json
 import logging
 import math
@@ -29,11 +32,13 @@ import random
 import re
 import secrets
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.parse
@@ -52,7 +57,10 @@ import fakeredis
 import fastapi
 import httpx
 import jwt
+import schemathesis
 import sqlalchemy as sa
+import structlog
+import yaml
 from arq.connections import ArqRedis
 from fastapi import (
     APIRouter,
@@ -77,6 +85,14 @@ from fastapi.security import (
 )
 from fastapi.testclient import TestClient
 from fastapi.websockets import WebSocketDisconnect
+from hypothesis import HealthCheck, Verbosity, given
+from hypothesis import settings as hypothesis_settings
+from opentelemetry import propagate
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
 from pwdlib import PasswordHash
 from pwdlib.hashers.argon2 import Argon2Hasher
 from pydantic import (
@@ -5146,6 +5162,1282 @@ def check_lab_6_6() -> None:
         check()
 
 
+# ---------------------------------------------------------------------------- Lab 6.7
+# Given code from the notebook (Lab 6.7 setup).
+
+
+class CartLine(BaseModel):
+    """One line of a shopping cart."""
+
+    sku: str = Field(pattern=r"^[A-Z]{3}-[0-9]{3}$")
+    quantity: int = Field(ge=1, le=99)
+
+
+class CartSummary(BaseModel):
+    """GET /carts/{cart_id}: how many lines."""
+
+    lines: int
+
+
+def build_buggy_shop() -> FastAPI:
+    """A cart API with two contract bugs (exercise 2 finds them)."""
+    carts: dict[int, list[CartLine]] = {1: []}
+    shop = FastAPI()
+
+    @shop.post("/carts/{cart_id}/lines", status_code=201, response_model=list[CartLine])
+    def add_line(cart_id: int, line: CartLine) -> list[CartLine]:
+        """Bug 1: an unknown cart is a KeyError (500)."""
+        carts[cart_id].append(line)
+        return carts[cart_id]
+
+    @shop.get(
+        "/carts/{cart_id}",
+        responses={200: {"model": CartSummary}, 404: {"description": "No such cart"}},
+    )
+    def cart_summary(cart_id: int) -> JSONResponse:
+        """Bug 2: "lines" is sent as a string, not the documented integer."""
+        if cart_id not in carts:
+            return JSONResponse({"detail": "no such cart"}, status_code=404)
+        return JSONResponse({"lines": str(len(carts[cart_id]))})
+
+    return shop
+
+
+class LabClock:
+    """A clock that only moves when told to (exercise 4)."""
+
+    def __init__(self) -> None:
+        """Start at zero."""
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        """The current time in seconds."""
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move forward."""
+        self.now += seconds
+
+
+# >>> Lab 6.7 exercise 1
+def build_ci_workflow() -> dict[str, Any]:
+    """A workflow that tests against PostgreSQL and Redis service containers."""
+    health = "--health-interval 2s --health-timeout 3s --health-retries 15"
+    postgres = {
+        "image": "postgres:18-alpine",
+        "env": {
+            "POSTGRES_USER": "notes",
+            "POSTGRES_PASSWORD": "notes",
+            "POSTGRES_DB": "notes_test",
+        },
+        "ports": ["5432:5432"],
+        "options": f'--health-cmd "pg_isready -U notes -d notes_test" {health}',
+    }
+    redis = {
+        "image": "redis:7.4",
+        "ports": ["6379:6379"],
+        "options": f'--health-cmd "redis-cli ping" {health}',
+    }
+    steps = [
+        {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"},
+        {
+            "uses": "astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
+            "with": {"python-version": "3.15"},
+        },
+        {"run": "uv sync --frozen"},
+        {"run": "uv run pytest -p no:cacheprovider -rs"},
+    ]
+    return {
+        "name": "notes-api",
+        "on": {"push": {"branches": ["**"]}, "pull_request": {}},
+        "permissions": {"contents": "read"},
+        "defaults": {"run": {"working-directory": "projects/notes_api"}},
+        "jobs": {
+            "test": {
+                "runs-on": "ubuntu-24.04",
+                "services": {"postgres": postgres, "redis": redis},
+                "env": {
+                    "NOTES_TEST_DATABASE_URL": "postgresql+asyncpg://notes:notes@localhost:5432/notes_test",
+                    "NOTES_TEST_REDIS_URL": "redis://localhost:6379/0",
+                },
+                "steps": steps,
+            }
+        },
+    }
+
+
+# <<< Lab 6.7 exercise 1
+
+
+# >>> Lab 6.7 exercise 2
+def contract_failures(app: FastAPI, max_examples: int = 25) -> dict[str, set[str]]:
+    """Failure titles per operation."""
+
+    def titles(error: BaseException) -> set[str]:
+        """Titles inside (nested) exception groups."""
+        if isinstance(error, BaseExceptionGroup):
+            return set().union(*(titles(inner) for inner in error.exceptions))
+        return {getattr(error, "title", type(error).__name__)}
+
+    schema = schemathesis.openapi.from_dict(app.openapi())
+    failures: dict[str, set[str]] = {}
+    with TestClient(app, raise_server_exceptions=False) as client:
+        for operation in (result.ok() for result in schema.get_all_operations()):
+
+            @given(case=operation.as_strategy())
+            @hypothesis_settings(
+                max_examples=max_examples,
+                deadline=None,
+                derandomize=True,
+                database=None,
+                suppress_health_check=list(HealthCheck),
+                verbosity=Verbosity.quiet,
+            )
+            def check(case: Any) -> None:
+                """One generated request, validated against the schema."""
+                kwargs = case.as_transport_kwargs(base_url=str(client.base_url))
+                case.validate_response(client.request(**kwargs))
+
+            try:
+                check()
+            except (Exception, BaseExceptionGroup) as error:
+                failures[f"{operation.method.upper()} {operation.path}"] = titles(error)
+    return failures
+
+
+def build_fixed_shop() -> FastAPI:
+    """The cart API without its contract bugs."""
+    carts: dict[int, list[CartLine]] = {1: []}
+    shop = FastAPI()
+    not_found = {404: {"description": "No such cart"}}
+
+    @shop.post(
+        "/carts/{cart_id}/lines",
+        status_code=201,
+        response_model=list[CartLine],
+        responses=not_found,
+    )
+    def add_line(cart_id: int, line: CartLine) -> list[CartLine]:
+        """Append a line to an existing cart."""
+        if cart_id not in carts:
+            raise HTTPException(404, "no such cart")
+        carts[cart_id].append(line)
+        return carts[cart_id]
+
+    @shop.get("/carts/{cart_id}", response_model=CartSummary, responses=not_found)
+    def cart_summary(cart_id: int) -> CartSummary:
+        """How many lines a cart has."""
+        if cart_id not in carts:
+            raise HTTPException(404, "no such cart")
+        return CartSummary(lines=len(carts[cart_id]))
+
+    return shop
+
+
+# <<< Lab 6.7 exercise 2
+
+
+# >>> Lab 6.7 exercise 3
+def configure_lab_logging(stream: io.StringIO) -> None:
+    """structlog: JSON lines to stream, with context variables and the level."""
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.JSONRenderer(),
+        ],
+        logger_factory=structlog.PrintLoggerFactory(file=stream),
+        cache_logger_on_first_use=False,
+    )
+
+
+def build_logged_app() -> FastAPI:
+    """An app whose log lines share the request id."""
+    logged_app = FastAPI()
+
+    @logged_app.middleware("http")
+    async def request_context(request: fastapi.Request, call_next: Callable[..., Any]) -> Any:
+        """Bind the request id and log one line per request."""
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        method, path = request.method, request.url.path
+        structlog.contextvars.bind_contextvars(request_id=request_id, method=method, path=path)
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            structlog.get_logger().info(
+                "request finished", status=response.status_code, duration_ms=duration_ms
+            )
+        finally:
+            structlog.contextvars.clear_contextvars()
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    @logged_app.post("/notes", status_code=201)
+    async def create_note() -> dict[str, int]:
+        """A log line from inside the handler."""
+        structlog.get_logger().info("note created", note_id=1)
+        return {"id": 1}
+
+    return logged_app
+
+
+# <<< Lab 6.7 exercise 3
+
+
+# >>> Lab 6.7 exercise 4
+def build_metrics_app(registry: CollectorRegistry, clock: LabClock) -> FastAPI:
+    """Measure every request with clock into registry."""
+    buckets = (0.05, 0.1, 0.25, 0.5, 1.0)
+    latency = Histogram(
+        "lab_request_duration_seconds", "Latency.", ["route"], buckets=buckets, registry=registry
+    )
+    requests_total = Counter(
+        "lab_requests_total", "Requests.", ["route", "status"], registry=registry
+    )
+    metrics_app = FastAPI()
+
+    @metrics_app.middleware("http")
+    async def measure(request: fastapi.Request, call_next: Callable[..., Any]) -> Any:
+        """Observe duration and count, labelled by route template."""
+        if request.url.path == "/metrics":
+            return await call_next(request)
+        started = clock()
+        response = await call_next(request)
+        route = request.scope.get("route")
+        template = getattr(route, "path_format", "unmatched")
+        latency.labels(template).observe(clock() - started)
+        requests_total.labels(template, str(response.status_code)).inc()
+        return response
+
+    @metrics_app.get("/work/{ms}")
+    async def work(ms: int) -> dict[str, int]:
+        """Pretend to work for ms milliseconds."""
+        clock.advance(ms / 1000)
+        return {"ms": ms}
+
+    @metrics_app.get("/metrics")
+    async def metrics() -> Response:
+        """The registry in Prometheus text format."""
+        return Response(generate_latest(registry), media_type="text/plain")
+
+    return metrics_app
+
+
+def bucket_counts(registry: CollectorRegistry, route: str) -> list[tuple[float, int]]:
+    """Cumulative bucket counts of one route."""
+    counts = []
+    for metric in registry.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_bucket") and sample.labels.get("route") == route:
+                counts.append((float(sample.labels["le"]), int(sample.value)))
+    return sorted(counts)
+
+
+def estimate_quantile(quantile: float, buckets: list[tuple[float, int]]) -> float:
+    """The quantile estimated from cumulative buckets."""
+    finite = [(bound, count) for bound, count in buckets if math.isfinite(bound)]
+    total = buckets[-1][1]
+    rank, lower_bound, lower_count = quantile * total, 0.0, 0
+    for upper_bound, count in finite:
+        if count >= rank:
+            share = (rank - lower_count) / (count - lower_count)
+            return lower_bound + (upper_bound - lower_bound) * share
+        lower_bound, lower_count = upper_bound, count
+    return finite[-1][0]
+
+
+# <<< Lab 6.7 exercise 4
+
+
+# >>> Lab 6.7 exercise 5
+def build_traced_app(provider: TracerProvider) -> FastAPI:
+    """An instrumented app with one manual child span."""
+    traced_app = FastAPI()
+    tracer = provider.get_tracer("lab")
+
+    @traced_app.get("/notes/{note_id}")
+    async def read_note(note_id: int) -> dict[str, int]:
+        """Load a note inside a child span."""
+        with tracer.start_as_current_span("db.load_note") as span:
+            span.set_attribute("note.id", note_id)
+        return {"id": note_id}
+
+    FastAPIInstrumentor.instrument_app(traced_app, tracer_provider=provider)
+    return traced_app
+
+
+def outgoing_headers() -> dict[str, str]:
+    """Trace context for an outgoing request."""
+    headers: dict[str, str] = {}
+    propagate.inject(headers)
+    return headers
+
+
+# <<< Lab 6.7 exercise 5
+
+
+# >>> Lab 6.7 exercise 6
+def build_probe_app(
+    checks: dict[str, Callable[[], Awaitable[None]]], state: dict[str, bool]
+) -> FastAPI:
+    """Liveness, readiness and startup probes."""
+    probe_app = FastAPI()
+
+    async def run_check(check: Callable[[], Awaitable[None]]) -> str:
+        """ok, timeout or failed: <ExceptionName>."""
+        try:
+            await asyncio.wait_for(check(), timeout=0.5)
+        except TimeoutError:
+            return "timeout"
+        except Exception as error:
+            return f"failed: {type(error).__name__}"
+        return "ok"
+
+    @probe_app.get("/health/live")
+    async def live() -> dict[str, str]:
+        """The process answers."""
+        return {"status": "ok"}
+
+    @probe_app.get("/health/ready")
+    async def ready() -> JSONResponse:
+        """Every dependency answers in time."""
+        names = list(checks)
+        outcomes = await asyncio.gather(*(run_check(checks[name]) for name in names))
+        results = dict(zip(names, outcomes, strict=True))
+        healthy = all(outcome == "ok" for outcome in outcomes)
+        body = {"status": "ok" if healthy else "unavailable", "checks": results}
+        return JSONResponse(body, status_code=200 if healthy else 503)
+
+    @probe_app.get("/health/startup")
+    async def startup() -> JSONResponse:
+        """Started yet?"""
+        started = bool(state.get("started"))
+        return JSONResponse({"started": started}, status_code=200 if started else 503)
+
+    return probe_app
+
+
+# <<< Lab 6.7 exercise 6
+
+
+# Check helpers (the notebook's check cells).
+
+
+def check_exercise_6_7_1() -> None:
+    """Exercise 1 checks."""
+    workflow = build_ci_workflow()
+    job = workflow["jobs"]["test"]
+    steps = job["steps"]
+    services = job["services"]
+    run_checks(
+        [
+            ("triggers", lambda: {"push", "pull_request"} <= set(workflow["on"]), True),
+            (
+                "working directory",
+                lambda: workflow["defaults"]["run"]["working-directory"],
+                "projects/notes_api",
+            ),
+            ("Linux runner", lambda: job["runs-on"].startswith("ubuntu"), True),
+            (
+                "postgres service",
+                lambda: (
+                    services["postgres"]["image"],
+                    "pg_isready" in services["postgres"]["options"],
+                ),
+                ("postgres:18-alpine", True),
+            ),
+            (
+                "redis service",
+                lambda: (
+                    services["redis"]["image"],
+                    "redis-cli ping" in services["redis"]["options"],
+                ),
+                ("redis:7.4", True),
+            ),
+            (
+                "published ports",
+                lambda: (services["postgres"]["ports"], services["redis"]["ports"]),
+                (["5432:5432"], ["6379:6379"]),
+            ),
+            (
+                "database url",
+                lambda: (
+                    job["env"]["NOTES_TEST_DATABASE_URL"].startswith("postgresql+asyncpg://")
+                    and "localhost:5432" in job["env"]["NOTES_TEST_DATABASE_URL"]
+                ),
+                True,
+            ),
+            ("redis url", lambda: job["env"]["NOTES_TEST_REDIS_URL"], "redis://localhost:6379/0"),
+            (
+                "checkout and uv",
+                lambda: [
+                    any(step.get("uses", "").startswith(prefix) for step in steps)
+                    for prefix in ("actions/checkout@", "astral-sh/setup-uv@")
+                ],
+                [True, True],
+            ),
+            (
+                "frozen install, then pytest",
+                lambda: (
+                    "uv sync --frozen" in [step.get("run") for step in steps],
+                    any("pytest" in step.get("run", "") for step in steps),
+                ),
+                (True, True),
+            ),
+            (
+                "survives a YAML round trip",
+                lambda: yaml.safe_load(yaml.safe_dump(workflow)) == workflow,
+                True,
+            ),
+        ]
+    )
+
+
+def check_exercise_6_7_2() -> None:
+    """Exercise 2 checks."""
+    buggy: dict[str, set[str]] = {}
+    fixed: dict[str, set[str]] | str = "not run"
+    with contextlib.suppress(Exception):
+        buggy = contract_failures(build_buggy_shop())
+    with contextlib.suppress(Exception):
+        fixed = contract_failures(build_fixed_shop())
+    post, get = "POST /carts/{cart_id}/lines", "GET /carts/{cart_id}"
+    run_checks(
+        [
+            ("POST finds the server error", lambda: "Server error" in buggy.get(post, set()), True),
+            (
+                "GET finds the schema violation",
+                lambda: "Response violates schema" in buggy.get(get, set()),
+                True,
+            ),
+            ("only the two buggy operations", lambda: sorted(buggy), [get, post]),
+            ("the fixed shop passes", lambda: fixed, {}),
+        ]
+    )
+
+
+def logged_scenario() -> dict[str, Any]:
+    """Two requests (one with an id), then a log line outside any request."""
+    stream = io.StringIO()
+    configure_lab_logging(stream)
+    with TestClient(build_logged_app()) as client:
+        first = client.post("/notes", headers={"X-Request-ID": "req-123"})
+        second = client.post("/notes")
+    structlog.get_logger().info("after the requests")
+    lines = [json.loads(line) for line in stream.getvalue().splitlines()]
+    structlog.reset_defaults()
+    return {"lines": lines, "first": first, "second": second}
+
+
+def check_exercise_6_7_3() -> None:
+    """Exercise 3 checks."""
+    results: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        results = logged_scenario()
+    events = ["note created", "request finished", "note created", "request finished"]
+    run_checks(
+        [
+            (
+                "four request lines, one outside",
+                lambda: [line["event"] for line in results["lines"]],
+                [*events, "after the requests"],
+            ),
+            (
+                "the given id on both lines",
+                lambda: [line.get("request_id") for line in results["lines"][:2]],
+                ["req-123", "req-123"],
+            ),
+            (
+                "a generated id, echoed in the header",
+                lambda: (
+                    results["lines"][2]["request_id"] == results["second"].headers["x-request-id"]
+                    and len(results["lines"][2]["request_id"]) == 32
+                ),
+                True,
+            ),
+            (
+                "request line fields",
+                lambda: {
+                    key: results["lines"][1][key] for key in ("method", "path", "status", "level")
+                },
+                {"method": "POST", "path": "/notes", "status": 201, "level": "info"},
+            ),
+            (
+                "duration is a number",
+                lambda: isinstance(results["lines"][1]["duration_ms"], int | float),
+                True,
+            ),
+            (
+                "context cleared after the request",
+                lambda: "request_id" in results["lines"][-1],
+                False,
+            ),
+        ]
+    )
+
+
+def histogram_scenario() -> dict[str, Any]:
+    """Five requests of known durations, a 404, then the metrics."""
+    registry, clock = CollectorRegistry(), LabClock()
+    with TestClient(build_metrics_app(registry, clock)) as client:
+        for milliseconds in (30, 80, 120, 300, 700):
+            client.get(f"/work/{milliseconds}")
+        client.get("/nowhere")
+        text = client.get("/metrics").text
+    return {"text": text, "buckets": bucket_counts(registry, "/work/{ms}")}
+
+
+def check_exercise_6_7_4() -> None:
+    """Exercise 4 checks."""
+    results: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        results = histogram_scenario()
+    expected = [(0.05, 1), (0.1, 2), (0.25, 3), (0.5, 4), (1.0, 5), (math.inf, 5)]
+    unmatched = 'lab_requests_total{route="unmatched",status="404"} 1.0'
+    run_checks(
+        [
+            ("cumulative buckets", lambda: results["buckets"], expected),
+            (
+                "route template, not the path",
+                lambda: (
+                    'route="/work/{ms}"' in results["text"] and "/work/30" not in results["text"]
+                ),
+                True,
+            ),
+            ("404s are counted as unmatched", lambda: unmatched in results["text"], True),
+            ("/metrics is not measured", lambda: 'route="/metrics"' in results["text"], False),
+            ("median estimate", lambda: round(estimate_quantile(0.5, expected), 4), 0.175),
+            ("p95 estimate", lambda: round(estimate_quantile(0.95, expected), 4), 0.875),
+        ]
+    )
+
+
+INCOMING_TRACE = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+
+def tracing_scenario() -> dict[str, Any]:
+    """One request with an incoming traceparent; collect the spans."""
+    exporter, provider = InMemorySpanExporter(), TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with TestClient(build_traced_app(provider)) as client:
+        traceparent = f"00-{INCOMING_TRACE}-00f067aa0ba902b7-01"
+        client.get("/notes/7", headers={"traceparent": traceparent})
+    finished = exporter.get_finished_spans()
+    spans = {span.name: span for span in finished if "http send" not in span.name}
+    with provider.get_tracer("lab").start_as_current_span("caller") as caller:
+        inside = outgoing_headers().get("traceparent", "")
+        caller_trace = format(caller.get_span_context().trace_id, "032x")
+    return {
+        "spans": spans,
+        "inside": inside,
+        "caller_trace": caller_trace,
+        "outside": outgoing_headers(),
+    }
+
+
+def check_exercise_6_7_5() -> None:
+    """Exercise 5 checks."""
+    results: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        results = tracing_scenario()
+    server_name = "GET /notes/{note_id}"
+    run_checks(
+        [
+            (
+                "server and child spans",
+                lambda: sorted(results["spans"]),
+                [server_name, "db.load_note"],
+            ),
+            ("server span kind", lambda: results["spans"][server_name].kind.name, "SERVER"),
+            (
+                "child of the server span",
+                lambda: (
+                    results["spans"]["db.load_note"].parent.span_id
+                    == results["spans"][server_name].context.span_id
+                ),
+                True,
+            ),
+            (
+                "note.id attribute",
+                lambda: dict(results["spans"]["db.load_note"].attributes),
+                {"note.id": 7},
+            ),
+            (
+                "incoming trace continued",
+                lambda: format(results["spans"]["db.load_note"].context.trace_id, "032x"),
+                INCOMING_TRACE,
+            ),
+            (
+                "outgoing traceparent carries the trace",
+                lambda: results["inside"].split("-")[1] == results["caller_trace"],
+                True,
+            ),
+            ("nothing to propagate outside a span", lambda: results["outside"], {}),
+        ]
+    )
+
+
+def probe_scenario() -> dict[str, Any]:
+    """Probe an app whose checks succeed, fail and hang."""
+    calls: list[str] = []
+
+    async def database() -> None:
+        """Healthy."""
+        calls.append("database")
+
+    async def redis() -> None:
+        """Refuses connections."""
+        calls.append("redis")
+        raise ConnectionError("refused")
+
+    async def search() -> None:
+        """Hangs."""
+        calls.append("search")
+        await asyncio.sleep(5)
+
+    state = {"started": False}
+    results: dict[str, Any] = {}
+    with TestClient(build_probe_app({"database": database}, state)) as client:
+        results["live"] = (client.get("/health/live").status_code, list(calls))
+        results["ready ok"] = client.get("/health/ready").json()
+        results["startup before"] = client.get("/health/startup").status_code
+        state["started"] = True
+        results["startup after"] = client.get("/health/startup").json()
+    every_check = {"database": database, "redis": redis, "search": search}
+    with TestClient(build_probe_app(every_check, state)) as client:
+        started = time.perf_counter()
+        ready = client.get("/health/ready")
+        results["ready bad"] = (ready.status_code, ready.json(), time.perf_counter() - started < 2)
+    return results
+
+
+def check_exercise_6_7_6() -> None:
+    """Exercise 6 checks."""
+    results: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        results = probe_scenario()
+    bad_checks = {"database": "ok", "redis": "failed: ConnectionError", "search": "timeout"}
+    run_checks(
+        [
+            ("liveness calls no check", lambda: results["live"], (200, [])),
+            (
+                "ready when all checks pass",
+                lambda: results["ready ok"],
+                {"status": "ok", "checks": {"database": "ok"}},
+            ),
+            ("startup 503 before", lambda: results["startup before"], 503),
+            ("startup 200 after", lambda: results["startup after"], {"started": True}),
+            (
+                "503 naming each failure, quickly",
+                lambda: results["ready bad"],
+                (503, {"status": "unavailable", "checks": bad_checks}, True),
+            ),
+        ]
+    )
+
+
+def check_lab_6_7() -> None:
+    """Run every Lab 6.7 check (each check prints PASS/FAIL)."""
+    for title, check in (
+        ("exercise 1", check_exercise_6_7_1),
+        ("exercise 2", check_exercise_6_7_2),
+        ("exercise 3", check_exercise_6_7_3),
+        ("exercise 4", check_exercise_6_7_4),
+        ("exercise 5", check_exercise_6_7_5),
+        ("exercise 6", check_exercise_6_7_6),
+    ):
+        print(f"--- {title}")
+        check()
+
+
+# ---------------------------------------------------------------------------- Lab 6.8
+# Helpers from the notebook's setup (minimal versions) and the given code of Lab 6.8.
+
+
+def free_port() -> int:
+    """A TCP port nobody listens on right now."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def wait_for_health(url: str, process: subprocess.Popen[Any], timeout: float) -> None:
+    """Poll url until it answers 200 (raise if the process dies or time runs out)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"server exited with {process.returncode}")
+        with contextlib.suppress(httpx.TransportError):
+            if httpx.get(url, timeout=0.5).status_code == 200:
+                return
+        time.sleep(0.1)
+    raise TimeoutError(url)
+
+
+@contextlib.contextmanager
+def uvicorn_server(app_spec: str, *, app_dir: Path) -> Iterator[str]:
+    """Serve app_spec with Uvicorn on a free port; always stop it."""
+    port = free_port()
+    command = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        app_spec,
+        "--app-dir",
+        str(app_dir),
+        "--port",
+        str(port),
+    ]
+    process = subprocess.Popen([*command, "--log-level", "warning"], cwd=app_dir)
+    try:
+        wait_for_health(f"http://127.0.0.1:{port}/health", process, 15)
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        process.terminate()
+        process.wait(timeout=15)
+
+
+def docker(
+    *arguments: str, cwd: Path = PHASE6_DIR, timeout: float = 600, check: bool = True
+) -> str:
+    """Run a docker command; return its output (raise with the output if it fails and check)."""
+    run = subprocess.run(
+        ["docker", *arguments], cwd=cwd, capture_output=True, text=True, timeout=timeout
+    )
+    if check and run.returncode != 0:
+        raise RuntimeError(f"docker {' '.join(arguments[:3])} failed:\n{run.stdout + run.stderr}")
+    return (run.stdout + run.stderr).strip()
+
+
+HAS_DOCKER = shutil.which("docker") is not None and (
+    subprocess.run(["docker", "info"], capture_output=True).returncode == 0
+)
+LAB_APP_DIR = PHASE6_DIR / "lab68_app"
+shutil.rmtree(LAB_APP_DIR, ignore_errors=True)  # start clean: no files left by an earlier run
+LAB_APP_DIR.mkdir()
+(LAB_APP_DIR / "app.py").write_text(
+    textwrap.dedent('''
+    """The Lab 6.8 app."""
+
+    import asyncio
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        """Liveness."""
+        return {"status": "ok"}
+
+
+    @app.get("/slow")
+    async def slow(seconds: float = 1.0) -> dict[str, float]:
+        """A request that takes a while."""
+        await asyncio.sleep(seconds)
+        return {"slept": seconds}
+''')
+)
+(LAB_APP_DIR / "requirements.txt").write_text("fastapi==0.163.1\nuvicorn==0.54.0\n")
+(LAB_APP_DIR / "notes.txt").write_text("a local file that must not end up in the image\n")
+(LAB_APP_DIR / "locustfile.py").write_text(
+    textwrap.dedent('''
+    """Lab load: health checks and short requests."""
+
+    from locust import HttpUser, between, task
+
+
+    class LabUser(HttpUser):
+        """One simulated client."""
+
+        wait_time = between(0.01, 0.05)
+
+        @task(4)
+        def health(self) -> None:
+            """Cheap."""
+            self.client.get("/health")
+
+        @task(1)
+        def short(self) -> None:
+            """20 ms."""
+            self.client.get("/slow?seconds=0.02", name="/slow")
+''')
+)
+SAMPLE_LOCUST_CSV = (
+    "Type,Name,Request Count,Failure Count,Median Response Time,Average Response Time,"
+    "Min Response Time,Max Response Time,Average Content Size,Requests/s,Failures/s,"
+    "50%,66%,75%,80%,90%,95%,98%,99%,99.9%,99.99%,100%\n"
+    "GET,/health,800,0,3,3.4,1,40,15,80.0,0.0,3,4,4,5,6,8,12,20,35,40,40\n"
+    "GET,/slow,200,2,24,26.1,21,310,30,20.0,0.2,24,25,26,27,30,45,120,250,310,310,310\n"
+    ",Aggregated,1000,2,4,7.9,1,310,18,100.0,0.2,4,5,6,8,24,27,40,120,310,310,310\n"
+)
+
+
+# >>> Lab 6.8 exercise 1
+def write_dockerfile(app_dir: Path) -> Path:
+    """Write an optimized Dockerfile and .dockerignore for the lab app."""
+    health = "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health')"
+    lines = [
+        "FROM ghcr.io/astral-sh/uv:0.13.5 AS uv",
+        "",
+        "FROM python:3.15-slim AS build",
+        "COPY --from=uv /uv /usr/local/bin/uv",
+        "ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 UV_PYTHON_DOWNLOADS=never",
+        "COPY requirements.txt /tmp/requirements.txt",
+        "RUN --mount=type=cache,target=/root/.cache/uv \\",
+        "    uv venv /venv && uv pip install --python /venv/bin/python -r /tmp/requirements.txt",
+        "",
+        "FROM python:3.15-slim AS runtime",
+        "RUN useradd --system --uid 10001 --no-create-home app",
+        "COPY --from=build /venv /venv",
+        "COPY --chown=app app.py /app/app.py",
+        "WORKDIR /app",
+        'ENV PATH="/venv/bin:$PATH" PYTHONUNBUFFERED=1',
+        "USER app",
+        f'HEALTHCHECK --interval=5s --timeout=2s CMD ["python", "-c", "{health}"]',
+        'CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]',
+    ]
+    (app_dir / ".dockerignore").write_text("*\n!app.py\n!requirements.txt\n")
+    dockerfile = app_dir / "Dockerfile"
+    dockerfile.write_text("\n".join(lines) + "\n")
+    return dockerfile
+
+
+# <<< Lab 6.8 exercise 1
+
+
+# >>> Lab 6.8 exercise 2
+def build_compose(image: str) -> dict[str, Any]:
+    """A Compose stack: redis, a one-off init job, the api, a proxy."""
+    healthy = {"condition": "service_healthy"}
+    api_check = "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health')"
+    return {
+        "services": {
+            "redis": {
+                "image": "redis:7.4",
+                "healthcheck": {
+                    "test": ["CMD", "redis-cli", "ping"],
+                    "interval": "2s",
+                    "retries": 15,
+                },
+            },
+            "init": {
+                "image": "redis:7.4",
+                "command": ["redis-cli", "-h", "redis", "set", "ready", "1"],
+                "restart": "no",
+                "depends_on": {"redis": healthy},
+            },
+            "api": {
+                "image": image,
+                "expose": ["8000"],
+                "read_only": True,
+                "healthcheck": {"test": ["CMD", "python", "-c", api_check], "interval": "5s"},
+                "depends_on": {
+                    "redis": healthy,
+                    "init": {"condition": "service_completed_successfully"},
+                },
+            },
+            "proxy": {
+                "image": "caddy:2",
+                "ports": ["127.0.0.1:8443:443"],
+                "depends_on": {"api": healthy},
+            },
+        }
+    }
+
+
+# <<< Lab 6.8 exercise 2
+
+
+# >>> Lab 6.8 exercise 3
+def write_caddyfile(site: str, upstream: str) -> str:
+    """A Caddyfile for site, proxying to upstream."""
+    return (
+        f"{site} {{\n"
+        "\tencode zstd gzip\n"
+        '\theader Strict-Transport-Security "max-age=31536000; includeSubDomains"\n'
+        "\t@metrics path /metrics /metrics/*\n"
+        "\trespond @metrics 404\n"
+        f"\treverse_proxy {upstream}\n"
+        "\tlog {\n"
+        "\t\toutput stdout\n"
+        "\t\tformat json\n"
+        "\t}\n"
+        "}\n"
+    )
+
+
+# <<< Lab 6.8 exercise 3
+
+
+# >>> Lab 6.8 exercise 4
+def build_pipeline() -> dict[str, Any]:
+    """lint, test, build, scan, push, deploy."""
+
+    def job(needs: list[str], *commands: str, **extra: Any) -> dict[str, Any]:
+        """A job on Ubuntu running commands after a checkout."""
+        steps = [{"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"}]
+        steps += [{"run": command} for command in commands]
+        return {
+            "runs-on": "ubuntu-24.04",
+            **({"needs": needs} if needs else {}),
+            **extra,
+            "steps": steps,
+        }
+
+    postgres = {"image": "postgres:18-alpine", "env": {"POSTGRES_PASSWORD": "ci"}}
+    return {
+        "name": "notes-api",
+        "on": {"push": {}, "pull_request": {}},
+        "jobs": {
+            "lint": job([], "uv run ruff check ."),
+            "test": job([], "uv run pytest", services={"postgres": postgres}),
+            "build": job(["lint", "test"], "docker build -t notes-api ."),
+            "scan": job(["build"], "uvx pip-audit"),
+            "push": job(
+                ["scan"],
+                "docker push ghcr.io/example/notes-api",
+                **{"if": "github.ref == 'refs/heads/main'"},
+            ),
+            "deploy": job(["push"], "./deploy.sh", environment="production"),
+        },
+    }
+
+
+def job_waves(pipeline: dict[str, Any]) -> list[list[str]]:
+    """Jobs grouped by when they can start."""
+    graph = {}
+    for name, job in pipeline["jobs"].items():
+        needs = job.get("needs", [])
+        graph[name] = [needs] if isinstance(needs, str) else list(needs)
+    sorter = graphlib.TopologicalSorter(graph)
+    sorter.prepare()
+    waves = []
+    while sorter.is_active():
+        ready = sorted(sorter.get_ready())
+        waves.append(ready)
+        sorter.done(*ready)
+    return waves
+
+
+# <<< Lab 6.8 exercise 4
+
+
+# >>> Lab 6.8 exercise 5
+def graceful_shutdown_result(port: int) -> dict[str, object]:
+    """SIGTERM during a request: what does the client see?"""
+    command = [sys.executable, "-m", "uvicorn", "app:app", "--port", str(port)]
+    command += ["--timeout-graceful-shutdown", "10", "--log-level", "warning"]
+    server = subprocess.Popen(command, cwd=LAB_APP_DIR)
+    base_url = f"http://127.0.0.1:{port}"
+    replies: dict[str, httpx.Response] = {}
+    try:
+        wait_for_health(f"{base_url}/health", server, 15)
+        request = threading.Thread(
+            target=lambda: replies.update(
+                slow=httpx.get(f"{base_url}/slow?seconds=1.0", timeout=10)
+            )
+        )
+        request.start()
+        time.sleep(0.3)
+        server.send_signal(signal.SIGTERM)
+        request.join(timeout=15)
+        exit_status = server.wait(timeout=15)
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.wait()
+    try:
+        httpx.get(f"{base_url}/health", timeout=1)
+        refused = False
+    except httpx.ConnectError:
+        refused = True
+    reply = replies["slow"]
+    return {
+        "status": reply.status_code,
+        "body": reply.json(),
+        "exit_status": exit_status,
+        "refused_after": refused,
+    }
+
+
+# <<< Lab 6.8 exercise 5
+
+
+# >>> Lab 6.8 exercise 6
+def load_report(csv_prefix: Path) -> dict[str, object]:
+    """The Aggregated row of a Locust stats CSV, with a pass/fail verdict."""
+    with open(f"{csv_prefix}_stats.csv", newline="", encoding="utf-8") as stats_file:
+        total = next(row for row in csv.DictReader(stats_file) if row["Name"] == "Aggregated")
+    requests, failures = int(total["Request Count"]), int(total["Failure Count"])
+    p95 = float(total["95%"])
+    passed = p95 < 200 and failures / max(requests, 1) < 0.01
+    rps = round(float(total["Requests/s"]), 1)
+    return {"requests": requests, "failures": failures, "rps": rps, "p95_ms": p95, "passed": passed}
+
+
+def run_load_test(base_url: str, csv_prefix: Path) -> int:
+    """Run Locust headless; return its exit code."""
+    command = [sys.executable, "-m", "locust", "-f", str(LAB_APP_DIR / "locustfile.py")]
+    command += ["--host", base_url, "--headless", "-u", "10", "-r", "10", "-t", "8s"]
+    command += ["--only-summary", "--csv", str(csv_prefix)]
+    return subprocess.run(command, capture_output=True, text=True, timeout=120).returncode
+
+
+# <<< Lab 6.8 exercise 6
+
+
+# Check helpers (the notebook's check cells).
+
+
+def built_image_facts() -> dict[str, object]:
+    """Write the Dockerfile, build, then inspect the image and a running container."""
+    write_dockerfile(LAB_APP_DIR)
+    docker("build", "--quiet", "--tag", "lab68:latest", ".", cwd=LAB_APP_DIR)
+    files = docker(
+        "run", "--rm", "--entrypoint", "ls", "lab68:latest", "-a", "/app", check=False
+    ).split()
+    uid = docker("run", "--rm", "--entrypoint", "id", "lab68:latest", "-u")
+    container = docker("run", "--detach", "lab68:latest")
+    time.sleep(2)
+    started = time.perf_counter()
+    docker("stop", "--time", "5", container)
+    stop_seconds = time.perf_counter() - started
+    docker("rm", container)
+    return {"notes.txt in image": "notes.txt" in files, "uid": uid, "stops fast": stop_seconds < 3}
+
+
+def check_exercise_6_8_1() -> None:
+    """Exercise 1 checks (the build checks need Docker)."""
+    text = write_dockerfile(LAB_APP_DIR).read_text()
+    checks = [
+        ("two or more stages", lambda: len(re.findall(r"^FROM ", text, re.M)) >= 2, True),
+        (
+            "non-root user",
+            lambda: re.findall(r"^USER\s+(\S+)", text, re.M)[-1] not in ("root", "0"),
+            True,
+        ),
+        ("health check", lambda: "HEALTHCHECK" in text and "/health" in text, True),
+        (
+            "exec-form CMD with uvicorn",
+            lambda: re.search(r'^CMD \[.*"uvicorn".*\]', text, re.M) is not None,
+            True,
+        ),
+        ("no COPY of the whole folder", lambda: re.search(r"^COPY \. ", text, re.M) is None, True),
+        ("a .dockerignore", lambda: (LAB_APP_DIR / ".dockerignore").exists(), True),
+    ]
+    if HAS_DOCKER:
+        facts: dict[str, object] = {}
+        with contextlib.suppress(Exception):
+            facts = built_image_facts()
+        checks += [
+            ("notes.txt stayed out", lambda: facts["notes.txt in image"], False),
+            ("runs with a non-zero uid", lambda: facts["uid"] != "0", True),
+            ("SIGTERM reaches uvicorn (stops in < 3 s)", lambda: facts["stops fast"], True),
+        ]
+    run_checks(checks)
+
+
+def check_exercise_6_8_2() -> None:
+    """Exercise 2 checks."""
+    services = build_compose("lab68:latest")["services"]
+
+    def config_is_valid() -> bool:
+        """docker compose config accepts the file."""
+        compose_file = LAB_APP_DIR / "compose.lab.yaml"
+        compose_file.write_text(yaml.safe_dump(build_compose("lab68:latest")))
+        docker("compose", "-f", compose_file.name, "config", "--quiet", cwd=LAB_APP_DIR)
+        return True
+
+    api = services["api"]
+    publishing = [name for name, service in services.items() if "ports" in service]
+    checks = [
+        ("four services", lambda: sorted(services), ["api", "init", "proxy", "redis"]),
+        (
+            "redis health check",
+            lambda: "redis-cli" in str(services["redis"]["healthcheck"]["test"]),
+            True,
+        ),
+        (
+            "init waits for healthy redis",
+            lambda: services["init"]["depends_on"]["redis"]["condition"],
+            "service_healthy",
+        ),
+        (
+            "api waits for init to finish",
+            lambda: api["depends_on"]["init"]["condition"],
+            "service_completed_successfully",
+        ),
+        (
+            "api has a health check, no ports, read-only",
+            lambda: ("healthcheck" in api, "ports" in api, api["read_only"]),
+            (True, False, True),
+        ),
+        (
+            "only the proxy publishes, on 127.0.0.1",
+            lambda: (
+                publishing == ["proxy"]
+                and all(str(port).startswith("127.0.0.1:") for port in services["proxy"]["ports"])
+            ),
+            True,
+        ),
+        (
+            "proxy waits for a healthy api",
+            lambda: services["proxy"]["depends_on"]["api"]["condition"],
+            "service_healthy",
+        ),
+    ]
+    if HAS_DOCKER:
+        checks.append(("docker compose config accepts it", config_is_valid, True))
+    run_checks(checks)
+
+
+def check_exercise_6_8_3() -> None:
+    """Exercise 3 checks."""
+    text = write_caddyfile("notes.example.com", "api:8000")
+
+    def caddy_validates() -> str:
+        """caddy validate's verdict (its log lines go to stderr, interleaved)."""
+        path = LAB_APP_DIR / "Caddyfile"
+        path.write_text(text)
+        output = docker(
+            "run",
+            "--rm",
+            "-v",
+            f"{path}:/etc/caddy/Caddyfile:ro",
+            "caddy:2",
+            "caddy",
+            "validate",
+            "--config",
+            "/etc/caddy/Caddyfile",
+            "--adapter",
+            "caddyfile",
+            check=False,
+        )
+        return "Valid configuration" if "Valid configuration" in output else output.splitlines()[-1]
+
+    hsts = r'header\s+Strict-Transport-Security\s+"?max-age=31536000'
+    checks = [
+        (
+            "site block",
+            lambda: re.search(r"^notes\.example\.com\s*\{", text, re.M) is not None,
+            True,
+        ),
+        ("reverse_proxy to the upstream", lambda: "reverse_proxy api:8000" in text, True),
+        (
+            "/metrics answered with 404",
+            lambda: "/metrics" in text and re.search(r"respond\s+@\w+\s+404", text) is not None,
+            True,
+        ),
+        ("HSTS header", lambda: re.search(hsts, text) is not None, True),
+        (
+            "compression and JSON logs",
+            lambda: ("encode" in text, "format json" in text),
+            (True, True),
+        ),
+    ]
+    if HAS_DOCKER:
+        checks.append(("caddy validate", caddy_validates, "Valid configuration"))
+    run_checks(checks)
+
+
+def check_exercise_6_8_4() -> None:
+    """Exercise 4 checks."""
+    jobs = build_pipeline()["jobs"]
+    other_graph = {
+        "jobs": {"a": {}, "b": {"needs": "a"}, "c": {"needs": ["a"]}, "d": {"needs": ["b", "c"]}}
+    }
+    run_checks(
+        [
+            ("six jobs", lambda: sorted(jobs), ["build", "deploy", "lint", "push", "scan", "test"]),
+            (
+                "waves",
+                lambda: job_waves(build_pipeline()),
+                [["lint", "test"], ["build"], ["scan"], ["push"], ["deploy"]],
+            ),
+            ("push only from main", lambda: "refs/heads/main" in jobs["push"]["if"], True),
+            (
+                "deploy through production",
+                lambda: str(jobs["deploy"]["environment"]).count("production") >= 1,
+                True,
+            ),
+            ("tests get PostgreSQL", lambda: "postgres" in jobs["test"]["services"], True),
+            (
+                "every job has steps",
+                lambda: all(
+                    job["steps"] and job["runs-on"] == "ubuntu-24.04" for job in jobs.values()
+                ),
+                True,
+            ),
+            ("waves of another graph", lambda: job_waves(other_graph), [["a"], ["b", "c"], ["d"]]),
+        ]
+    )
+
+
+def check_exercise_6_8_5() -> None:
+    """Exercise 5 checks."""
+    result: dict[str, object] = {}
+    with contextlib.suppress(Exception):
+        result = graceful_shutdown_result(free_port())
+    run_checks(
+        [
+            ("the request in flight succeeds", lambda: result["status"], 200),
+            ("with its full body", lambda: result["body"], {"slept": 1.0}),
+            (
+                "a clean exit (0, or SIGTERM re-raised)",
+                lambda: result["exit_status"] in (0, -signal.SIGTERM),
+                True,
+            ),
+            ("new connections refused afterwards", lambda: result["refused_after"], True),
+        ]
+    )
+
+
+def check_exercise_6_8_6() -> None:
+    """Exercise 6 checks."""
+    sample_prefix = LAB_APP_DIR / "sample"
+    Path(f"{sample_prefix}_stats.csv").write_text(SAMPLE_LOCUST_CSV)
+    live_prefix = LAB_APP_DIR / "live"
+    live: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        with uvicorn_server("app:app", app_dir=LAB_APP_DIR) as lab_url:
+            live = {"exit": run_load_test(lab_url, live_prefix), "report": load_report(live_prefix)}
+    expected = {"requests": 1000, "failures": 2, "rps": 100.0, "p95_ms": 27.0, "passed": True}
+    run_checks(
+        [
+            ("sample report", lambda: load_report(sample_prefix), expected),
+            (
+                "the sample p95 is under the limit",
+                lambda: load_report(sample_prefix)["p95_ms"] < 200,
+                True,
+            ),
+            ("live run: exit code 0", lambda: live["exit"], 0),
+            (
+                "live run: requests and no failures",
+                lambda: live["report"]["requests"] > 100 and live["report"]["failures"] == 0,
+                True,
+            ),
+            ("live run: p95 under 200 ms", lambda: live["report"]["passed"], True),
+        ]
+    )
+
+
+def check_lab_6_8() -> None:
+    """Run every Lab 6.8 check (each check prints PASS/FAIL)."""
+    for title, check in (
+        ("exercise 1", check_exercise_6_8_1),
+        ("exercise 2", check_exercise_6_8_2),
+        ("exercise 3", check_exercise_6_8_3),
+        ("exercise 4", check_exercise_6_8_4),
+        ("exercise 5", check_exercise_6_8_5),
+        ("exercise 6", check_exercise_6_8_6),
+    ):
+        print(f"--- {title}")
+        check()
+
+
 if __name__ == "__main__":
     selected = set(sys.argv[1:])
     labs = [
@@ -5155,6 +6447,8 @@ if __name__ == "__main__":
         ("Lab 6.4", check_lab_6_4),
         ("Lab 6.5", check_lab_6_5),
         ("Lab 6.6", check_lab_6_6),
+        ("Lab 6.7", check_lab_6_7),
+        ("Lab 6.8", check_lab_6_8),
     ]
     for lab_title, check_lab in labs:
         if selected and lab_title not in selected:

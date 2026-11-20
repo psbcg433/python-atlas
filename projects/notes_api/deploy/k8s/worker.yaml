@@ -1,0 +1,26 @@
+# The ARQ worker: no Service (it serves nothing); liveness from its Redis health key.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes-worker
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: notes-worker } }
+  template:
+    metadata: { labels: { app: notes-worker } }
+    spec:
+      terminationGracePeriodSeconds: 60 # a job in progress may finish
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: worker
+          image: ghcr.io/example/notes-api:0.7.0
+          command: ["python", "-m", "notes_api.worker"]
+          envFrom: [{ configMapRef: { name: notes-config } }, { secretRef: { name: notes-secrets } }]
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 512Mi } }
+          livenessProbe:
+            exec: { command: ["python", "-m", "notes_api.worker", "--check"] }
+            periodSeconds: 30
+            initialDelaySeconds: 20
+          securityContext: { readOnlyRootFilesystem: true, allowPrivilegeEscalation: false }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }, { name: metrics, mountPath: /tmp/prometheus }]
+      volumes: [{ name: tmp, emptyDir: {} }, { name: metrics, emptyDir: {} }]

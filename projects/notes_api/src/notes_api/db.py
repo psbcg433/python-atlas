@@ -1,5 +1,6 @@
 """Database plumbing: naming conventions, the declarative base, the engine and sessions."""
 
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,6 +18,8 @@ from sqlalchemy.types import TypeDecorator
 from notes_api.core.config import Settings
 
 # Predictable constraint names, so Alembic can find (and drop) them later.
+SCHEMA_REVISION = "0006"  # the Alembic revision this code expects (/health/startup checks it)
+
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
     "uq": "uq_%(table_name)s_%(column_0_name)s",
@@ -68,12 +71,22 @@ def create_engine_from_settings(settings: Settings) -> AsyncEngine:
         engine = create_async_engine(url, echo=settings.database_echo)
         event.listen(engine.sync_engine, "connect", enable_sqlite_foreign_keys)
         return engine
+    connect_args = {}
+    if settings.database_pgbouncer:
+        # PgBouncer in transaction mode hands each transaction to any server connection, so
+        # prepared statements cached on one connection do not exist on the next one.
+        connect_args = {
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0,
+            "prepared_statement_name_func": lambda: f"__asyncpg_{uuid.uuid4()}__",
+        }
     return create_async_engine(
         url,
         echo=settings.database_echo,
         pool_size=settings.database_pool_size,
         max_overflow=settings.database_max_overflow,
         pool_pre_ping=True,  # replace connections the server closed while idle
+        connect_args=connect_args,
     )
 
 

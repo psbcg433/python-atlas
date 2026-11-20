@@ -1,16 +1,36 @@
-# Local PostgreSQL and Redis for the Notes API:  docker compose up -d --wait   (stop: docker compose down)
-# The password is for local development only; real deployments read secrets from the platform.
+# The Notes API stack. Local development needs only the backing services:
+#     docker compose up -d --wait db redis       (then run the API and worker with uv)
+# The whole stack, built from the Dockerfile, behind Caddy with TLS:
+#     mkdir -p .secrets && openssl rand -base64 32 > .secrets/notes_jwt_secret   (git-ignored)
+#     chmod 444 .secrets/notes_jwt_secret        (the container user, uid 10001, must read it)
+#     docker compose up -d --build --wait
+#     open https://localhost:8443                (stop: docker compose down; add -v for data)
+name: notes
+
+x-app: &app # shared by api, worker and migrate (YAML anchor)
+  build: .
+  image: ${NOTES_IMAGE:-notes-api}:${TAG:-latest} # CI deploys ghcr.io/<owner>/notes-api:<version>
+  environment:
+    NOTES_DATABASE_URL: postgresql+asyncpg://notes:${POSTGRES_PASSWORD:-notes}@db:5432/notes
+    NOTES_REDIS_URL: redis://redis:6379/0
+    NOTES_ENVIRONMENT: production
+    FORWARDED_ALLOW_IPS: "*" # only Caddy can reach the app on this network
+  secrets: [notes_jwt_secret] # a file in /run/secrets, read by get_settings()
+  read_only: true # nothing in the image can be modified at run time ...
+  tmpfs: ["/tmp:mode=1777", "/tmp/prometheus:mode=1777"] # ... except scratch space
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  restart: unless-stopped
+
 services:
   db:
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: notes
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notes}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notes} # local default; set it for real use
       POSTGRES_DB: notes
-    ports:
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - notes-db:/var/lib/postgresql
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes: ["notes-db:/var/lib/postgresql"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U notes -d notes"]
       interval: 2s
@@ -19,13 +39,56 @@ services:
 
   redis:
     image: redis:7.4
-    ports:
-      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    ports: ["127.0.0.1:${REDIS_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 15
 
+  migrate: # a one-off job: run the migrations, exit; api and worker wait for it
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db: { condition: service_healthy }
+
+  api:
+    <<: *app
+    expose: ["8000"] # reachable from the proxy, not from the host
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "notes_api.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "notes_api.worker", "--check"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  proxy:
+    image: caddy:2
+    ports: ["127.0.0.1:${HTTPS_PORT:-8443}:443", "127.0.0.1:${HTTP_PORT:-8080}:80"]
+    volumes: ["./deploy/Caddyfile:/etc/caddy/Caddyfile:ro", "caddy-data:/data"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      api: { condition: service_healthy }
+
+secrets:
+  notes_jwt_secret:
+    file: ./.secrets/notes_jwt_secret # never committed (.gitignore), mounted read-only
+
 volumes:
   notes-db:
+  caddy-data:

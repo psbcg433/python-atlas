@@ -1,5 +1,6 @@
 """Domain errors and RFC 9457 Problem Details responses for every error the API returns."""
 
+import re
 from http import HTTPStatus
 from typing import Any
 
@@ -70,10 +71,31 @@ async def domain_error_handler(request: Request, error: DomainError) -> JSONResp
     )
 
 
+def allowed_methods(app: FastAPI, path: str) -> list[str]:
+    """Every documented method of the paths matching this URL path.
+
+    FastAPI has one route per method, so Starlette's own 405 lists only the first matching
+    route's methods; the OpenAPI document knows them all.
+    """
+    paths = app.openapi().get("paths", {})
+    if path in paths:  # a literal path wins over templates (/notes/feed vs /notes/{note_id})
+        return sorted(method.upper() for method in paths[path])
+    methods: set[str] = set()
+    for template, operations in paths.items():
+        if re.fullmatch(re.sub(r"\{[^/]+\}", "[^/]+", template), path):
+            methods |= {method.upper() for method in operations}
+    return sorted(methods)
+
+
 async def http_error_handler(request: Request, error: StarletteHTTPException) -> JSONResponse:
     """HTTPException (ours, and Starlette's 404/405) → Problem Details."""
     detail = error.detail if isinstance(error.detail, str) else None
-    return problem_response(request, error.status_code, detail, headers=error.headers)
+    headers = dict(error.headers or {})
+    if error.status_code == HTTPStatus.METHOD_NOT_ALLOWED:
+        documented = allowed_methods(request.app, request.url.path)
+        if documented:
+            headers["Allow"] = ", ".join(documented)
+    return problem_response(request, error.status_code, detail, headers=headers or None)
 
 
 async def validation_error_handler(request: Request, error: RequestValidationError) -> JSONResponse:
@@ -115,3 +137,37 @@ def install_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(IntegrityError, integrity_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)
+    document_problem_responses(app)
+
+
+def document_problem_responses(app: FastAPI) -> None:
+    """Make the OpenAPI document tell the truth: every 4xx/5xx body is application/problem+json.
+
+    FastAPI documents its 422 as application/json (HTTPValidationError); our handlers send
+    RFC 9457 problems instead. Contract tests (Schemathesis) caught the mismatch.
+    """
+    generate = app.openapi
+
+    def openapi_with_problems() -> dict[str, Any]:
+        """Generate once, rewrite the error responses, cache."""
+        if app.openapi_schema is not None:
+            return app.openapi_schema
+        schema = generate()
+        problem = {"schema": {"$ref": "#/components/schemas/ProblemDetail"}}
+        schema.setdefault("components", {}).setdefault("schemas", {})["ProblemDetail"] = (
+            ProblemDetail.model_json_schema(ref_template="#/components/schemas/{model}")
+        )
+        for path_item in schema.get("paths", {}).values():
+            for operation in path_item.values():
+                responses = operation.setdefault("responses", {})
+                if "requestBody" in operation:  # a body that is not valid JSON
+                    responses.setdefault("400", {"description": "Malformed request body."})
+                for code, response in responses.items():
+                    if code[0] in "45":
+                        response["content"] = {PROBLEM_JSON: problem}
+        for unused in ("HTTPValidationError", "ValidationError"):
+            schema["components"]["schemas"].pop(unused, None)
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = openapi_with_problems  # type: ignore[method-assign]

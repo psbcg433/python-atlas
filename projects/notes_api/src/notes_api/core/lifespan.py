@@ -38,3 +38,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.queue.aclose()
         await app.state.redis.aclose()
         await engine.dispose()  # close every pooled database connection
+        app.state.tracer_provider.shutdown()  # flush spans still waiting in the exporter

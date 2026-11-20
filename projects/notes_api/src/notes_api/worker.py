@@ -1,7 +1,4 @@
-"""The ARQ worker: outbox relay, signed webhooks, exports, clean-up (python -m notes_api.worker).
-
-Queues deliver *at least once*, so every task is idempotent or guarded.
-"""
+"""The ARQ worker (python -m notes_api.worker): relay, webhooks, exports, clean-up."""
 
 import asyncio
 import json
@@ -20,6 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from notes_api import __version__
 from notes_api.core.config import Settings, get_settings
+from notes_api.core.logging import configure_logging
 from notes_api.db import create_engine_from_settings, make_session_factory
 from notes_api.events import (
     EVENT_ID_HEADER,
@@ -199,6 +197,8 @@ async def run_worker(burst: bool = False, settings: Settings | None = None) -> N
     `arq notes_api.worker.WorkerSettings` is the usual command, but arq 0.25's CLI calls
     asyncio.get_event_loop() outside a running loop, which raises on Python 3.14+.
     """
+    log_settings = settings or get_settings()
+    configure_logging(log_settings.log_level, log_settings.log_json)  # the same JSON as the API
     worker = Worker(
         functions=WorkerSettings.functions,
         cron_jobs=WorkerSettings.cron_jobs,
@@ -212,6 +212,7 @@ async def run_worker(burst: bool = False, settings: Settings | None = None) -> N
         ctx={"settings": settings} if settings else {},
         burst=burst,
         poll_delay=0.1,
+        health_check_interval=HEALTH_CHECK_SECONDS,  # arq's default is an hour
         max_tries=WorkerSettings.max_tries if settings is None else settings.webhook_max_attempts,
         job_timeout=WorkerSettings.job_timeout,
         keep_result=WorkerSettings.keep_result,
@@ -222,5 +223,22 @@ async def run_worker(burst: bool = False, settings: Settings | None = None) -> N
         await worker.close()
 
 
+HEALTH_CHECK_KEY = "arq:queue:health-check"  # arq refreshes it every health_check_interval
+HEALTH_CHECK_SECONDS = 30
+
+
+async def worker_is_healthy(settings: Settings) -> bool:
+    """True if some worker refreshed its health key recently (it expires after ~31 s)."""
+    redis = redis_asyncio.from_url(settings.redis_url.get_secret_value())
+    try:
+        return bool(await redis.exists(HEALTH_CHECK_KEY))
+    except OSError, redis_asyncio.RedisError:
+        return False
+    finally:
+        await redis.aclose()
+
+
 if __name__ == "__main__":
+    if "--check" in sys.argv:  # container health check: exit 0 = healthy
+        sys.exit(0 if asyncio.run(worker_is_healthy(get_settings())) else 1)
     asyncio.run(run_worker(burst="--burst" in sys.argv))

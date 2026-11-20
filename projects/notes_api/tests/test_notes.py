@@ -180,5 +180,6 @@ def test_search_treats_percent_and_underscore_literally(client: TestClient) -> N
 
 
 def test_readiness_checks_the_database(client: TestClient) -> None:
-    """/health/ready runs SELECT 1 through the session dependency."""
-    assert client.get("/health/ready").json() == {"status": "ok", "database": "ok"}
+    """/health/ready runs SELECT 1 and pings Redis."""
+    expected = {"status": "ok", "checks": {"database": "ok", "redis": "ok"}}
+    assert client.get("/health/ready").json() == expected

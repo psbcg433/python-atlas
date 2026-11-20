@@ -3,6 +3,7 @@
 A FastAPI service for creating, searching and organizing notes. It is built step by step in
 Phase 6 of the course (`notebooks/phase6_web_fastapi.ipynb`); the notebook writes these files.
 
+
 | Version | Unit | Adds |
 | --- | --- | --- |
 | v1 | 6.2 | CRUD path operations, Pydantic v2 schemas, filtering and pagination, OpenAPI |
@@ -10,6 +11,9 @@ Phase 6 of the course (`notebooks/phase6_web_fastapi.ipynb`); the notebook write
 | v3 | 6.4 | PostgreSQL with async SQLAlchemy 2.0 (typed models, many-to-many tags), a session per request, Alembic migrations, optimistic locking (409), trigram search, keyset pagination on an index |
 | v4 | 6.5 | users (Argon2id), JWT access tokens with scopes and roles, rotating refresh tokens with reuse detection, logout and revocation, owner-only notes, hashed API keys, Redis login rate limiting, cookie login with CSRF for the pages, OpenID Connect login, SSRF-safe link previews, security headers, log redaction |
 | v5 | 6.6 | an ARQ worker: transactional outbox relay, signed webhooks with retries and a dead-letter list, exports with SSE progress, scheduled clean-up with locks; a WebSocket feed fanned out through Redis pub/sub; ETags, 304 and Cache-Control; Redis cache-aside with stampede protection and hit-rate stats; a welcome email from BackgroundTasks |
+| v6 | 6.7 | the test suite reorganised (async client tests, PostgreSQL rollback-per-test with factories, Schemathesis contract tests, an OpenAPI snapshot) and run in CI against service containers; JSON logs with request and trace ids (structlog), Prometheus metrics on `/metrics`, OpenTelemetry tracing, optional Sentry, liveness / readiness / startup probes |
+| v7 | 6.8 | a multi-stage uv Dockerfile (non-root, read-only), a Compose stack (db, redis, migrate job, api, worker, Caddy with TLS), an Nginx alternative, Kubernetes / systemd / Procfile / Cloud Run targets, Docker secrets, PgBouncer mode, a worker health check, a CI/CD pipeline (lint, types, test, build, scan, push, deploy), a graceful-shutdown test and a Locust load test with a p95 gate |
+
 
 ## Run
 
@@ -22,18 +26,49 @@ uv run uvicorn notes_api.main:app --reload    # http://127.0.0.1:8000/ and /docs
 uv run python -m notes_api.worker             # the ARQ worker (second terminal)
 uv run pytest                                 # fast tests + PostgreSQL / Redis tests (Docker)
 uv run pytest -m "not postgres and not redis" # only the fast tests (SQLite, fakeredis)
+UPDATE_SNAPSHOTS=1 uv run pytest -k snapshot  # record a deliberate OpenAPI change
 docker compose down                           # add -v to delete the data volume
 ```
 
 Local plain HTTP: set `NOTES_COOKIE_SECURE=false`, or the browser will not send the session
 cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
 
+Observability: every log line is JSON with `request_id`, `trace_id` and `span_id`
+(`NOTES_LOG_JSON=false` for console output); Prometheus scrapes `GET /metrics`;
+`NOTES_OTEL_EXPORTER=otlp` sends traces to an OpenTelemetry Collector at `NOTES_OTEL_ENDPOINT`;
+`NOTES_SENTRY_DSN` turns on error tracking. Probes: `/health/live`, `/health/ready`
+(database and Redis), `/health/startup` (schema at the expected migration).
+
+CI (`.github/workflows/notes-api.yml`) runs the whole suite against PostgreSQL and Redis service
+containers: the tests read `NOTES_TEST_DATABASE_URL` and `NOTES_TEST_REDIS_URL`, and start
+testcontainers only when those are not set.
+
+
+## Deploy
+
+```bash
+mkdir -p .secrets && openssl rand -base64 32 > .secrets/notes_jwt_secret && chmod 444 .secrets/notes_jwt_secret
+docker compose up -d --build --wait           # db, redis, migrate (one-off), api, worker, proxy
+curl -k https://localhost:8443/health/ready   # Caddy terminates TLS (its local CA for localhost)
+docker compose up -d --wait --scale api=3     # stateless API: Caddy balances the replicas
+uv run locust -f load/locustfile.py --host https://localhost:8443 --headless -u 20 -r 10 -t 30s
+docker compose down                           # -v also deletes the database volume
+```
+
+The image (`Dockerfile`) runs Uvicorn with `WEB_CONCURRENCY` worker processes, trusts proxy
+headers, and shuts down gracefully (20 s) on SIGTERM. `deploy/` holds the Caddyfile, an Nginx
+equivalent, Kubernetes manifests (probes, rolling updates, a migrate Job, an autoscaler), a
+systemd unit and a Cloud Run service; `Procfile` covers Heroku-style platforms. CI/CD:
+`.github/workflows/notes-api.yml`.
+
 
 ## Endpoints
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| `GET` | `/health`, `/health/ready` | none | liveness; readiness runs `SELECT 1` |
+| `GET` | `/health`, `/health/live` | none | liveness (no dependency calls) |
+| `GET` | `/health/ready`, `/health/startup` | none | readiness (database + Redis), startup (migrations at head) |
+| `GET` | `/metrics` | none (block it at the proxy) | Prometheus text format |
 | `POST` | `/api/v1/auth/register` | none | 201; rate limited; never accepts a role |
 | `POST` | `/api/v1/auth/token` | none | OAuth2 password form (`username` = email, optional `scope`); rate limited (429 + `Retry-After`) |
 | `POST` | `/api/v1/auth/refresh` | refresh token | rotation: each refresh token works once; reuse revokes the family |
@@ -66,7 +101,8 @@ Credentials: `Authorization: Bearer <access token>` or `X-API-Key: nk_...`. Erro
 ```text
 src/notes_api/
 ├── main.py           # create_app(): settings, security, handlers, middleware, routers
-├── core/             # config.py, errors.py, middleware.py, lifespan.py, logging.py (redaction)
+├── core/             # config, errors, middleware, lifespan, logging (structlog + redaction),
+│                     # metrics (Prometheus), tracing (OpenTelemetry), sentry
 ├── routers/          # health, auth, users, notes, exports, realtime, admin, pages
 ├── dependencies.py   # principal / scopes / roles, sessions, Redis, services as Annotated aliases
 ├── auth.py           # AuthService: register, login, rotate, logout, API keys, OIDC accounts
@@ -88,10 +124,18 @@ src/notes_api/
 ├── templates/        # Jinja2 templates (login, notes)
 └── static/           # CSS
 alembic/              # env.py (async) + versions/0001-0006
-compose.yaml          # local PostgreSQL and Redis
-tests/                # pytest: one app, SQLite file and fakeredis per test;
-                      # test_postgres.py / test_redis_worker.py use testcontainers
+compose.yaml          # the stack: db, redis, migrate, api, worker, proxy (Caddy)
+Dockerfile            # multi-stage uv build, non-root runtime; .dockerignore
+deploy/               # Caddyfile, nginx.conf, k8s/, systemd/, cloudrun/
+load/locustfile.py    # load test with a p95 < 200 ms gate
+Procfile              # web / worker / release for a PaaS
+tests/                # pytest: one app, SQLite file and fakeredis per test; factories.py;
+                      # PostgreSQL / Redis tests use CI services or testcontainers;
+                      # test_contract.py: Schemathesis + snapshots/openapi.json
 ```
+
+
+## Dependency rule
 
 Dependencies point inwards: routers → services → repositories → models. Nothing in
 `services.py`, `auth.py`, `security.py`, `repositories.py`, `models.py`, `db.py` or

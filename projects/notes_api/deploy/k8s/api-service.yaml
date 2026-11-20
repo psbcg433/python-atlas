@@ -1,0 +1,20 @@
+# A stable address for the API pods, and horizontal autoscaling on CPU (stateless scaling).
+apiVersion: v1
+kind: Service
+metadata:
+  name: notes-api
+spec:
+  selector: { app: notes-api }
+  ports: [{ port: 80, targetPort: 8000 }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: notes-api
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: notes-api }
+  minReplicas: 3
+  maxReplicas: 12 # x pool size must stay below the database's max_connections (or PgBouncer)
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }

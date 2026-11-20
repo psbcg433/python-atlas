@@ -1,0 +1,16 @@
+# Configuration for the Kubernetes deployment. Plain settings live in a ConfigMap; secrets are
+# created out of band, never committed, e.g.:
+#   kubectl create secret generic notes-secrets \
+#     --from-literal=NOTES_JWT_SECRET="$(openssl rand -base64 32)" \
+#     --from-literal=NOTES_DATABASE_URL='postgresql+asyncpg://notes:<password>@<host>:5432/notes'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notes-config
+data:
+  NOTES_ENVIRONMENT: production
+  NOTES_REDIS_URL: redis://redis:6379/0
+  NOTES_LOG_LEVEL: INFO
+  NOTES_OTEL_EXPORTER: otlp
+  NOTES_OTEL_ENDPOINT: http://otel-collector:4318/v1/traces
+  FORWARDED_ALLOW_IPS: "*" # only the ingress controller reaches the pods

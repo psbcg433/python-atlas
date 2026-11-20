@@ -1,8 +1,10 @@
 """Small helpers shared by the test modules."""
 
 import ipaddress
+from pathlib import Path
 from typing import Any
 
+from alembic.config import Config
 from fastapi.testclient import TestClient
 
 from notes_api.core.config import Settings
@@ -83,3 +85,27 @@ class FakeMailer:
     async def send(self, to: str, subject: str, body: str) -> None:
         """Record one message."""
         self.sent.append((to, subject))
+
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+POSTGRES_IMAGE = "postgres:18-alpine"
+REDIS_IMAGE = "redis:7.4"
+
+
+def docker_available() -> bool:
+    """True if a Docker daemon answers (the PostgreSQL / Redis tests need one, or CI services)."""
+    try:
+        import docker
+
+        docker.from_env().ping()
+    except Exception:
+        return False
+    return True
+
+
+def postgres_alembic_config(url: str) -> Config:
+    """alembic.ini pointed at a PostgreSQL URL."""
+    config = Config(PROJECT_DIR / "alembic.ini")
+    config.set_main_option("sqlalchemy.url", url)
+    config.attributes["configure_logger"] = False
+    return config

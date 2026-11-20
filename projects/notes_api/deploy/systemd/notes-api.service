@@ -1,0 +1,26 @@
+# A plain VM: systemd runs Uvicorn behind Caddy or Nginx on the same host.
+# Install the project into /opt/notes-api (uv sync --frozen --no-dev), put settings in
+# /etc/notes-api/env (mode 600), then: systemctl enable --now notes-api
+[Unit]
+Description=Notes API (Uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=notes
+Group=notes
+WorkingDirectory=/opt/notes-api
+EnvironmentFile=/etc/notes-api/env
+ExecStartPre=/opt/notes-api/.venv/bin/alembic upgrade head
+ExecStart=/opt/notes-api/.venv/bin/uvicorn notes_api.main:app --host 127.0.0.1 --port 8000 \
+    --workers 4 --proxy-headers --timeout-graceful-shutdown 20
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

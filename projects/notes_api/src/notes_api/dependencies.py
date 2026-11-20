@@ -216,9 +216,9 @@ def get_mailer() -> Mailer:
     return LogMailer()
 
 
-def get_note_cache(redis: RedisDep, settings: SettingsDep) -> NoteCache:
-    """Cache-aside for single notes."""
-    return NoteCache(redis, settings.cache_ttl_seconds)
+def get_note_cache(request: Request, redis: RedisDep, settings: SettingsDep) -> NoteCache:
+    """Cache-aside for single notes, traced with the app's tracer."""
+    return NoteCache(redis, settings.cache_ttl_seconds, tracer=request.app.state.tracer)
 
 
 QueueDep = Annotated[ArqRedis, Depends(get_queue)]

@@ -1,0 +1,29 @@
+# Caddy in front of the Notes API. Automatic HTTPS: a public domain gets a Let's Encrypt
+# certificate, "localhost" one from Caddy's internal CA. HTTP is redirected to HTTPS, the
+# X-Forwarded-* headers are set, and WebSocket upgrades pass through without extra settings.
+{
+	admin localhost:2019
+}
+
+{$NOTES_SITE:localhost} {
+	encode zstd gzip
+	header -Server
+	header /static/* Cache-Control "public, max-age=86400" # a CDN can cache these too
+
+	@internal path /metrics /metrics/*
+	respond @internal 404 # Prometheus scrapes the app directly, inside the network
+
+	reverse_proxy {
+		dynamic a api 8000 { # every "api" container: docker compose up --scale api=3
+			refresh 5s
+		}
+		lb_policy round_robin
+		health_uri /health/ready # stop sending traffic to a replica that is not ready
+		health_interval 5s
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

@@ -1,0 +1,10 @@
+# Only what the image needs goes into the build context: smaller, faster, no secrets.
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!alembic.ini
+!alembic/
+**/__pycache__
+**/*.pyc

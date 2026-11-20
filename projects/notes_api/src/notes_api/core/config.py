@@ -1,6 +1,7 @@
 """Application settings: environment variables (prefix NOTES_) and an optional .env file."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
@@ -30,7 +31,9 @@ class Settings(BaseSettings):
     database_echo: bool = False  # log every SQL statement (development only)
     database_pool_size: int = Field(default=5, ge=1)
     database_max_overflow: int = Field(default=10, ge=0)
+    database_pgbouncer: bool = False  # behind PgBouncer (transaction pooling): no statement cache
     redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
+
     # Authentication: an HS256 secret (required in production; a random one per process otherwise)
     jwt_secret: SecretStr | None = None
     jwt_issuer: str = "notes-api"
@@ -43,6 +46,7 @@ class Settings(BaseSettings):
     login_rate_limit: int = Field(default=5, ge=1)  # attempts per window, per IP + email
     login_rate_window_seconds: int = Field(default=60, ge=1)
     cookie_secure: bool = True  # session cookie only over HTTPS (False for local HTTP)
+
     # Third-party login (OpenID Connect, Authorization Code + PKCE); disabled until configured
     oauth_client_id: str | None = None
     oauth_client_secret: SecretStr | None = None
@@ -51,12 +55,24 @@ class Settings(BaseSettings):
     oauth_jwks_url: str | None = None
     oauth_issuer: str | None = None
     oauth_redirect_url: str = "http://localhost:8000/api/v1/auth/oauth/callback"
+
     # Background work, real time and caching (Unit 6.6)
     webhook_timeout_seconds: float = Field(default=5.0, gt=0)
     webhook_max_attempts: int = Field(default=5, ge=1)  # then the event is dead-lettered
     cache_ttl_seconds: int = Field(default=60, ge=1)
     ws_heartbeat_seconds: float = Field(default=20.0, gt=0)
     export_ttl_seconds: int = Field(default=3600, ge=60)
+
+    # Observability (Unit 6.7)
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    log_json: bool = True  # one JSON object per line; False: coloured console output
+    metrics_enabled: bool = (
+        True  # GET /metrics (keep it off the public internet: the proxy blocks it)
+    )
+    otel_exporter: Literal["none", "console", "otlp", "memory"] = "none"
+    otel_endpoint: str = "http://localhost:4318/v1/traces"  # OTLP over HTTP (a collector)
+    sentry_dsn: SecretStr | None = None  # error tracking is off unless a DSN is configured
+    check_migrations: bool = True  # /health/startup: the database must be at the newest revision
 
     @property
     def oauth_enabled(self) -> bool:
@@ -80,7 +96,16 @@ class Settings(BaseSettings):
         return self
 
 
+SECRETS_DIR = Path("/run/secrets")  # where Docker, Compose and Kubernetes mount secret files
+
+
 @lru_cache
 def get_settings() -> Settings:
-    """The process-wide settings, read from the environment once and then cached."""
+    """The process-wide settings, read once and cached (12-factor: config from the environment).
+
+    Order of precedence: environment variables, then .env, then secret files in /run/secrets
+    (a file named notes_jwt_secret holds NOTES_JWT_SECRET), then the defaults.
+    """
+    if SECRETS_DIR.is_dir():
+        return Settings(_secrets_dir=SECRETS_DIR)  # type: ignore[call-arg]  # a pydantic-settings init option
     return Settings()

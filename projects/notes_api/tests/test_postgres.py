@@ -1,25 +1,23 @@
 """The same app on PostgreSQL in Docker: migrations, drift check, trigram search, races.
 
-Skipped when Docker is not available. Run only these: `uv run pytest -m postgres`; skip them:
-`uv run pytest -m "not postgres"`.
+Uses the CI service (NOTES_TEST_DATABASE_URL) or a testcontainer; skipped without either.
+Run only these: `uv run pytest -m postgres`; skip them: `uv run pytest -m "not postgres"`.
 """
 
 import asyncio
 import secrets
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from pathlib import Path
 
 import fakeredis
 import pytest
 import sqlalchemy as sa
 from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from helpers import USER_EMAIL, auth_headers
+from helpers import USER_EMAIL, auth_headers, postgres_alembic_config
 from notes_api.core.config import Settings
 from notes_api.dependencies import get_redis
 from notes_api.main import create_app
@@ -27,45 +25,15 @@ from notes_api.repositories import SqlNoteRepository, SqlUserRepository
 from notes_api.schemas import NoteCreate
 
 pytestmark = pytest.mark.postgres
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-POSTGRES_IMAGE = "postgres:18-alpine"
-
-
-def docker_available() -> bool:
-    """True if a Docker daemon answers."""
-    try:
-        import docker
-
-        docker.from_env().ping()
-    except Exception:
-        return False
-    return True
-
-
-def alembic_config(url: str) -> Config:
-    """alembic.ini pointed at the container."""
-    config = Config(PROJECT_DIR / "alembic.ini")
-    config.set_main_option("sqlalchemy.url", url)
-    config.attributes["configure_logger"] = False
-    return config
-
-
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    """Start PostgreSQL once for this module, migrate it to head, remove it afterwards."""
-    if not docker_available():
-        pytest.skip("Docker is not available")
-    from testcontainers.community.postgres import PostgresContainer
-
-    with PostgresContainer(POSTGRES_IMAGE, driver="asyncpg") as container:
-        url = container.get_connection_url()
-        command.upgrade(alembic_config(url), "head")
-        yield url
 
 
 @pytest.fixture
-def empty_url(postgres_url: str) -> str:
-    """The database with every row removed and ids restarted."""
+def empty_url(postgres_url: str) -> Iterator[str]:
+    """The database with every row removed and ids restarted, before and after the test.
+
+    The database is shared with test_postgres_rollback.py (session-scoped), so these
+    committing tests clean up after themselves.
+    """
 
     async def truncate() -> None:
         """TRUNCATE all tables."""
@@ -77,12 +45,13 @@ def empty_url(postgres_url: str) -> str:
         await engine.dispose()
 
     asyncio.run(truncate())
-    return postgres_url
+    yield postgres_url
+    asyncio.run(truncate())
 
 
 def test_models_match_the_migrations(postgres_url: str) -> None:
     """alembic check: autogenerate finds no difference between the models and the schema."""
-    command.check(alembic_config(postgres_url))
+    command.check(postgres_alembic_config(postgres_url))
 
 
 def test_api_round_trip_on_postgres(empty_url: str) -> None:
@@ -115,7 +84,7 @@ def test_api_round_trip_on_postgres(empty_url: str) -> None:
         assert (
             client.patch("/api/v1/notes/1", json={"pinned": False, "version": 1}).status_code == 409
         )
-        assert client.get("/health/ready").json()["database"] == "ok"
+        assert client.get("/health/ready").json()["checks"]["database"] == "ok"
 
 
 def test_trigram_index_serves_substring_search(empty_url: str) -> None:

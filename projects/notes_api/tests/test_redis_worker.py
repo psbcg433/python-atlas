@@ -4,7 +4,6 @@ Skipped without Docker. Run only these: `uv run pytest -m redis`.
 """
 
 import asyncio
-from collections.abc import Iterator
 
 import pytest
 import respx
@@ -17,23 +16,9 @@ from notes_api.dependencies import get_mailer, get_resolver
 from notes_api.events import SIGNATURE_HEADER, verify_webhook
 from notes_api.main import create_app
 from notes_api.worker import run_worker
-from test_postgres import docker_available
 
 pytestmark = pytest.mark.redis
-REDIS_IMAGE = "redis:7.4"
 HOOK = "https://hooks.example/notes"
-
-
-@pytest.fixture(scope="module")
-def redis_url() -> Iterator[str]:
-    """One Redis container for this module (removed afterwards)."""
-    if not docker_available():
-        pytest.skip("Docker is not available")
-    from testcontainers.community.redis import RedisContainer
-
-    with RedisContainer(REDIS_IMAGE) as container:
-        host, port = container.get_container_host_ip(), container.get_exposed_port(6379)
-        yield f"redis://{host}:{port}/0"
 
 
 @pytest.fixture

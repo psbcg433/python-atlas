@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 from pydantic import TypeAdapter, ValidationError
 
+from notes_api.core.metrics import NOTES_WRITTEN
 from notes_api.events import new_event
 from notes_api.exceptions import NoteNotFoundError, UploadRejectedError, VersionConflictError
 from notes_api.models import Note
@@ -45,6 +46,7 @@ class NoteService:
         """Write an outbox event in the same transaction as the change it describes."""
         data = {"note_id": note.id, "title": note.title, "version": note.version}
         await self.repository.add_event(new_event(self.owner_id, event_type, data))
+        NOTES_WRITTEN.labels(event_type.removeprefix("note.")).inc()
 
     async def create(self, data: NoteCreate) -> Note:
         """Store a new note for the owner, stamped with the current time."""
@@ -118,12 +120,12 @@ def parse_import(filename: str, content: bytes) -> list[NoteCreate]:
     try:
         text = content.decode("utf-8-sig")
         if filename.endswith(".json"):
-            return IMPORT_ADAPTER.validate_python(json.loads(text))
+            return IMPORT_ADAPTER.validate_python(json.loads(text), strict=False)
         rows = [
             {**row, "tags": [tag for tag in (row.get("tags") or "").split(";") if tag]}
             for row in csv.DictReader(io.StringIO(text))
         ]
-        return IMPORT_ADAPTER.validate_python(rows)
+        return IMPORT_ADAPTER.validate_python(rows, strict=False)
     except (UnicodeDecodeError, json.JSONDecodeError, ValidationError) as error:
         reason = f"{type(error).__name__}: {str(error).splitlines()[0]}"
         raise UploadRejectedError(reason, HTTPStatus.UNPROCESSABLE_CONTENT) from error

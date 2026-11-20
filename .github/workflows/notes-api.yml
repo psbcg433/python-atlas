@@ -1,0 +1,149 @@
+# CI/CD for the Notes API (projects/notes_api/).
+#
+#   lint ─┐
+#   types ├─> build image (+ smoke test) ─> scan ─> push to GHCR ─> deploy (tags only)
+#   test ─┘   (test: PostgreSQL and Redis as service containers)
+#
+# Pushes go to ghcr.io/<owner>/notes-api for the main branch and for tags notes-api-v*; only a
+# tag deploys, through the "production" environment (configure required reviewers there).
+# Actions are pinned to commit SHAs; the comment names the release.
+name: notes-api
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["notes-api-v*"]
+    paths: ["projects/notes_api/**", ".github/workflows/notes-api.yml"]
+  pull_request:
+    paths: ["projects/notes_api/**", ".github/workflows/notes-api.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notes-api-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/notes-api
+
+defaults:
+  run:
+    working-directory: projects/notes_api
+
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: { python-version: "3.15", enable-cache: true, cache-dependency-glob: projects/notes_api/uv.lock }
+      - run: uv sync --frozen
+      - run: uv run ruff check . && uv run ruff format --check .
+
+  types:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: { python-version: "3.15", enable-cache: true, cache-dependency-glob: projects/notes_api/uv.lock }
+      - run: uv sync --frozen
+      - run: uv run mypy # files and the typing-debt list are in pyproject.toml
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env: { POSTGRES_USER: notes, POSTGRES_PASSWORD: notes, POSTGRES_DB: notes_test } # CI only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U notes -d notes_test"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+      redis:
+        image: redis:7.4
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 3s --health-retries 15
+    env:
+      NOTES_TEST_DATABASE_URL: postgresql+asyncpg://notes:notes@localhost:5432/notes_test
+      NOTES_TEST_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: { python-version: "3.15", enable-cache: true, cache-dependency-glob: projects/notes_api/uv.lock }
+      - run: uv sync --frozen
+      - run: uv run pytest -p no:cacheprovider -rs --junitxml=test-results.xml
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: notes-api-test-results, path: projects/notes_api/test-results.xml }
+
+  build:
+    needs: [lint, types, test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the image
+        run: docker build --tag "$IMAGE:$GITHUB_SHA" .
+      - name: Report the image size
+        run: docker image inspect "$IMAGE:$GITHUB_SHA" --format 'size={{.Size}}' >> "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test (the container starts and answers its liveness probe)
+        run: |
+          docker run --detach --name smoke --publish 8000:8000 \
+            --env NOTES_ENVIRONMENT=test --env NOTES_CHECK_MIGRATIONS=false \
+            --env NOTES_DATABASE_URL=sqlite+aiosqlite:////tmp/smoke.db "$IMAGE:$GITHUB_SHA"
+          for attempt in $(seq 30); do curl --fail --silent localhost:8000/health/live && exit 0; sleep 1; done
+          docker logs smoke; exit 1
+      - run: docker save "$IMAGE:$GITHUB_SHA" | gzip > image.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: notes-api-image, path: projects/notes_api/image.tar.gz, retention-days: 3 }
+
+  scan:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: notes-api-image, path: projects/notes_api }
+      - run: gunzip -c image.tar.gz | docker load
+      - name: Vulnerabilities in the image (OS packages and Python wheels)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.1 \
+            image --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed "$IMAGE:$GITHUB_SHA"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Known vulnerabilities in the locked dependencies
+        run: uv export --frozen --no-dev --no-hashes > requirements.txt && uvx pip-audit -r requirements.txt
+
+  push:
+    needs: scan
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/notes-api-v'))
+    runs-on: ubuntu-24.04
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: notes-api-image, path: projects/notes_api }
+      - run: gunzip -c image.tar.gz | docker load
+      - name: Push the commit tag, plus the version tag (tags) or latest (main)
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          extra="latest"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then extra="${GITHUB_REF_NAME#notes-api-v}"; fi
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:$extra"
+          docker push "$IMAGE:$GITHUB_SHA" && docker push "$IMAGE:$extra"
+
+  deploy:
+    needs: push
+    if: startsWith(github.ref, 'refs/tags/notes-api-v')
+    runs-on: ubuntu-24.04
+    environment: { name: production, url: "https://${{ vars.NOTES_HOST }}" }
+    steps:
+      - name: Migrate, then replace the containers one service at a time
+        env: { SSH_KEY: "${{ secrets.DEPLOY_SSH_KEY }}", HOST: "${{ vars.NOTES_HOST }}" }
+        run: |
+          install -m 600 /dev/null ~/.ssh_key && printf '%s\n' "$SSH_KEY" > ~/.ssh_key
+          ssh -i ~/.ssh_key -o StrictHostKeyChecking=accept-new "deploy@$HOST" \
+            "cd /srv/notes && export TAG=${GITHUB_REF_NAME#notes-api-v} && docker compose pull \
+             && docker compose run --rm migrate && docker compose up -d --no-deps --wait api worker"
