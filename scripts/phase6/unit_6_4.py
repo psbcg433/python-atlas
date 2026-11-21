@@ -1,9 +1,7 @@
 """Unit 6.4 — Databases with SQLAlchemy 2.0 (with Lab 6.4 and Notes API v3)."""
 
+from helpers_module import setup_cells
 from nbformat import NotebookNode
-from unit_6_1 import SERVER_HELPERS_SOURCE, UNIT_SETUP_SOURCE_2  # one copy of the helpers
-from unit_6_2 import NOTES_HELPERS_SOURCE
-from unit_6_3 import NOTES_PROJECT_HELPERS_SOURCE, PRUNE_HELPER_SOURCE
 
 from nb_builder import code, md, predict_cells, writefile_cells
 
@@ -17,7 +15,6 @@ import inspect
 import json
 import logging
 import os
-import platform
 import random
 import re
 import secrets
@@ -26,13 +23,11 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import sysconfig
 import time
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
 from typing import Annotated, Any
 
 import alembic
@@ -82,24 +77,6 @@ from sqlalchemy.orm import (
 )
 from sqlalchemy.orm.exc import StaleDataError
 
-REPO_ROOT = find_repo_root()
-scratch_dir = REPO_ROOT / "notebooks" / "_scratch"  # git-ignored
-PHASE6_DIR = scratch_dir / "phase6"
-PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(REPO_ROOT / "notebooks")  # %%writefile cells use paths relative to notebooks/
-if str(PHASE6_DIR) not in sys.path:
-    sys.path.insert(0, str(PHASE6_DIR))
-CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1"}
-CHILD_ENV.pop("FORCE_COLOR", None)
-HAS_NODE = shutil.which("node") is not None
-HAS_UV = shutil.which("uv") is not None
-
-NOTES_API_DIR = REPO_ROOT / "projects" / "notes_api"  # the Notes API's own uv project
-NOTES_SRC = NOTES_API_DIR / "src"
-for folder in (NOTES_SRC / "notes_api", NOTES_API_DIR / "tests"):
-    folder.mkdir(parents=True, exist_ok=True)  # %%writefile does not create folders
-if str(NOTES_SRC) not in sys.path:
-    sys.path.insert(0, str(NOTES_SRC))
 """
 
 DATABASE_HELPERS_SOURCE = r'''
@@ -225,32 +202,21 @@ def _overview_cells() -> list[NotebookNode]:
             | Mongoose | (no ORM needed) Motor / PyMongo, or PostgreSQL `JSONB` | documents are dicts; PostgreSQL often covers the use case |
             | `ioredis` | `redis.asyncio` | same commands, same data types |
 
-            Run the setup cells first. Part 1: imports (SQLAlchemy, asyncpg, Alembic) and the
-            project folders:
+            Run the setup cells first. Part 1: the imports (SQLAlchemy, asyncpg, Alembic):
             """
         ),
-        code(UNIT_SETUP_SOURCE),
-        md("Part 2: helpers shared with Units 6.1–6.3:"),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
+        *setup_cells(
+            "6.4",
+            UNIT_SETUP_SOURCE,
             """
-            Part 3: the server and Notes API helpers from Units 6.1–6.3, and the database
-            helpers for this unit: `docker_available()` (PostgreSQL and Redis run in Docker
-            when it is there), an echo handler that prints SQLAlchemy's SQL log as `SQL: ...`
-            lines without timings, `SqlRecorder(engine)` to collect the statements a block of
-            code sends, and `mask_plan()` to strip costs and timings from query plans:
-            """
-        ),
-        code(
-            SERVER_HELPERS_SOURCE
-            + "\n"
-            + NOTES_HELPERS_SOURCE
-            + "\n"
-            + PRUNE_HELPER_SOURCE
-            + "\n"
-            + NOTES_PROJECT_HELPERS_SOURCE
-            + "\n"
-            + DATABASE_HELPERS_SOURCE
+            Part 2: the shared helpers from [`phase6_helpers.py`](phase6_helpers.py) (server and Notes API helpers of Units
+            6.1–6.3), including the database helpers this unit introduces:
+            `docker_available()` and `HAS_DOCKER` (PostgreSQL and Redis run in Docker when it is
+            there), an echo handler that prints SQLAlchemy's SQL log as `SQL: ...` lines without
+            timings, `SqlRecorder(engine)` to collect the statements a block of code sends, and
+            `mask_plan()` to strip costs and timings from query plans:
+            """,
+            folders="*NOTES_FOLDERS",
         ),
     ]
 
@@ -6276,6 +6242,9 @@ def _notes_v3_test_cells() -> list[NotebookNode]:
                 ),
             ],
         ),
+        md(
+            "`tests/helpers.py`: the shared test functions, plus `create_tables()` for the database:"
+        ),
         code(NOTES_V3_TESTS_HELPERS_PY),
         md(
             "`test_notes.py` adds versions, the 409, shared sorted tags, `LIKE` escaping and readiness:"
@@ -6534,14 +6503,16 @@ def _notes_v3_run_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            **Run the suite.** With the kernel's environment, the fast SQLite tests only
+            **Run this version's tests.** `NEW_TESTS` lists the test files v3 adds or changes
+            (the full suite runs once, in the Phase 6 Project). With the kernel's environment, the fast SQLite tests among them
             (`-m "not postgres"`):
             """
         ),
         code(
             r"""
+            NEW_TESTS = __NEW_TESTS__
             pytest_run = run_in_notes(
-                sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-m", "not postgres"
+                sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-m", "not postgres", *NEW_TESTS
             )
             print(tidy_test_output(pytest_run.stdout + pytest_run.stderr).splitlines()[-1])
             print(f"{pytest_run.returncode=}")
@@ -6549,10 +6520,10 @@ def _notes_v3_run_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            And the whole suite as its own uv project, the way CI and the Unit 6.8 image will
-            run it: `uv lock` adds the database packages to `projects/notes_api/uv.lock`, and
-            `uv run --frozen pytest` runs every test, including `test_postgres.py`, which
-            starts (and removes) its own PostgreSQL container:
+            And as its own uv project, the way CI and the Unit 6.8 image will run it: `uv lock`
+            adds the database packages to `projects/notes_api/uv.lock`, and `uv run --frozen
+            pytest` runs all of `NEW_TESTS`, including `test_postgres.py`, which starts (and
+            removes) its own PostgreSQL container:
             """
         ),
         code(
@@ -6561,7 +6532,9 @@ def _notes_v3_run_cells() -> list[NotebookNode]:
                 lock_run = run_in_notes("uv", "lock")
                 print(lock_summary(lock_run.stderr))
                 if lock_run.returncode == 0:
-                    uv_pytest = run_in_notes("uv", "run", "--frozen", "pytest", "-p", "no:cacheprovider", "-rs")
+                    uv_pytest = run_in_notes(
+                        "uv", "run", "--frozen", "pytest", "-p", "no:cacheprovider", "-rs", *NEW_TESTS
+                    )
                     summary = tidy_test_output(uv_pytest.stdout).splitlines()
                     print(summary[-1], f"(exit code {uv_pytest.returncode})")
                     print(*[line for line in summary if line.startswith("SKIPPED")], sep="\n")

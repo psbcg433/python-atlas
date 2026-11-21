@@ -1,27 +1,33 @@
 """Unit 6.8 — Deployment and Operations (with Lab 6.8 and Notes API v7)."""
 
+from helpers_module import setup_cells
 from nbformat import NotebookNode
-from unit_6_1 import SERVER_HELPERS_SOURCE, UNIT_SETUP_SOURCE_2  # one copy of the helpers
-from unit_6_2 import NOTES_HELPERS_SOURCE
-from unit_6_3 import NOTES_PROJECT_HELPERS_SOURCE, PRUNE_HELPER_SOURCE
-from unit_6_4 import DATABASE_HELPERS_SOURCE
-from unit_6_5 import REDIS_HELPERS_SOURCE
-from unit_6_6 import WORKER_HELPERS_SOURCE
-from unit_6_7 import POSTGRES_HELPERS_SOURCE
 
 from nb_builder import code, md, predict_cells, writefile_cells
+
+UNIT_FOLDERS = """
+*NOTES_FOLDERS,
+NOTES_API_DIR / "deploy" / "k8s",
+NOTES_API_DIR / "deploy" / "systemd",
+NOTES_API_DIR / "deploy" / "cloudrun",
+NOTES_API_DIR / "load",
+REPO_ROOT / ".github" / "workflows",
+PHASE6_DIR / "deploy_demo",
+"""  # the arguments of enter_phase6() in Unit 6.8 and the project
 
 UNIT_SETUP_SOURCE = r"""
 import asyncio
 import atexit
 import contextlib
 import csv
+import dataclasses
 import graphlib
 import hashlib
 import importlib
 import importlib.util
 import inspect
 import io
+import itertools
 import json
 import logging
 import math
@@ -35,7 +41,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import sysconfig
 import textwrap
 import threading
 import time
@@ -45,7 +50,6 @@ from collections import Counter as TallyCounter
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
 from typing import Annotated, Any
 
 import alembic
@@ -82,34 +86,6 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", message="Call to deprecated close", category=DeprecationWarning)
 
-REPO_ROOT = find_repo_root()
-scratch_dir = REPO_ROOT / "notebooks" / "_scratch"  # git-ignored
-PHASE6_DIR = scratch_dir / "phase6"
-PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(REPO_ROOT / "notebooks")  # %%writefile cells use paths relative to notebooks/
-if str(PHASE6_DIR) not in sys.path:
-    sys.path.insert(0, str(PHASE6_DIR))
-CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1"}
-CHILD_ENV.pop("FORCE_COLOR", None)
-HAS_NODE = shutil.which("node") is not None
-HAS_UV = shutil.which("uv") is not None
-HAS_OPENSSL = shutil.which("openssl") is not None
-
-NOTES_API_DIR = REPO_ROOT / "projects" / "notes_api"  # the Notes API's own uv project
-NOTES_SRC = NOTES_API_DIR / "src"
-for folder in (
-    NOTES_SRC / "notes_api",
-    NOTES_API_DIR / "tests",
-    NOTES_API_DIR / "deploy" / "k8s",
-    NOTES_API_DIR / "deploy" / "systemd",
-    NOTES_API_DIR / "deploy" / "cloudrun",
-    NOTES_API_DIR / "load",
-    REPO_ROOT / ".github" / "workflows",
-    PHASE6_DIR / "deploy_demo",
-):
-    folder.mkdir(parents=True, exist_ok=True)  # %%writefile does not create folders
-if str(NOTES_SRC) not in sys.path:
-    sys.path.insert(0, str(NOTES_SRC))
 """
 
 DOCKER_HELPERS_SOURCE = r'''
@@ -180,54 +156,34 @@ def _overview_cells() -> list[NotebookNode]:
             | `server.close()` on SIGTERM | Uvicorn's graceful shutdown (`--timeout-graceful-shutdown`) | the container's PID 1 must receive the signal |
             | k6 / Artillery | Locust (Python user classes) | the load generator is Python code too |
 
-            Run the setup cells first. Part 1: imports and the project folders:
+            Run the setup cells first. Part 1: the imports:
             """
         ),
-        code(UNIT_SETUP_SOURCE),
-        md("Part 2: helpers shared with Units 6.1–6.7:"),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
+        *setup_cells(
+            "6.8",
+            UNIT_SETUP_SOURCE,
             """
-            Part 3: the server, Notes API, database, Redis, worker and PostgreSQL helpers from
-            Units 6.1–6.7, plus `docker(*arguments)` (run the Docker CLI, raise with its output on
-            failure) and `image_size_mb()`. Everything that needs Docker prints a skip message
-            without it:
-            """
+            Part 2: the shared helpers from [`phase6_helpers.py`](phase6_helpers.py) (server,
+            Notes API, database, Redis, worker and PostgreSQL helpers of Units 6.1–6.7),
+            including this unit's `docker(*arguments)` (run the Docker CLI, raise with its output
+            on failure), `image_size_mb()` and `DEMO_DIR`, the folder the demo images and stacks
+            are built from. Everything that needs Docker prints a skip message without it:
+            """,
+            folders=UNIT_FOLDERS,
         ),
-        code(
-            SERVER_HELPERS_SOURCE
-            + "\n"
-            + NOTES_HELPERS_SOURCE
-            + "\n"
-            + PRUNE_HELPER_SOURCE
-            + "\n"
-            + NOTES_PROJECT_HELPERS_SOURCE
-            + "\n"
-            + DATABASE_HELPERS_SOURCE
-            + "\n"
-            + REDIS_HELPERS_SOURCE
-            + "\n"
-            + WORKER_HELPERS_SOURCE
-            + "\n"
-            + POSTGRES_HELPERS_SOURCE
-            + "\n"
-            + DOCKER_HELPERS_SOURCE
-        ),
-        md(
-            """
-            The demo app for this unit's sections: it reports which process answered and how it
-            sees the client (address and scheme, as proxies change them), has a slow route for
-            the shutdown demo, a WebSocket echo, and two counters (in memory, and in Redis when
-            `REDIS_URL` is set):
-            """
-        ),
-        code(
+        *writefile_cells(
             r'''
             %%writefile _scratch/phase6/deploy_demo/app.py
             """The deployment demo app (served by Uvicorn, inside or outside a container)."""
 
             import asyncio
             import os
+            import socket
+            import sys
+            import tracemalloc
+
+            if os.environ.get("TRACE_MEMORY"):  # started first, so importing FastAPI is measured
+                tracemalloc.start()
 
             import redis.asyncio as redis_asyncio
             from fastapi import FastAPI, Request, WebSocket
@@ -243,11 +199,18 @@ def _overview_cells() -> list[NotebookNode]:
                 return {"status": "ok"}
 
 
+            @app.get("/version")
+            def version() -> dict[str, object]:
+                """The release this process runs (APP_VERSION), for the blue-green demo."""
+                return {"version": os.environ.get("APP_VERSION", "dev"), "pid": os.getpid()}
+
+
             @app.get("/whoami")
             def whoami(request: Request) -> dict[str, object]:
                 """Which process answered, and the client and scheme as this app sees them."""
                 forwarded = {key: value for key, value in request.headers.items() if key.startswith("x-forwarded")}
-                return {"pid": os.getpid(), "client": request.client.host if request.client else None,
+                return {"pid": os.getpid(), "host": socket.gethostname(),
+                        "client": request.client.host if request.client else None,
                         "scheme": request.url.scheme, "forwarded": forwarded}
 
 
@@ -272,7 +235,58 @@ def _overview_cells() -> list[NotebookNode]:
                 await websocket.accept()
                 await websocket.send_text("echo: " + await websocket.receive_text())
                 await websocket.close()
-            '''
+
+
+            @app.get("/memory")
+            async def memory(hold: float = 0.0) -> dict[str, object]:
+                """This process's Python allocations (tracemalloc) and peak resident memory."""
+                await asyncio.sleep(hold)  # lets concurrent requests reach different workers
+                traced, peak = tracemalloc.get_traced_memory() if tracemalloc.is_tracing() else (0, 0)
+                try:
+                    import resource  # Unix only
+
+                    max_rss_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KiB on Linux
+                except ImportError:
+                    max_rss_kib = -1
+                return {"pid": os.getpid(), "traced_kib": traced // 1024, "peak_kib": peak // 1024,
+                        "max_rss_kib": max_rss_kib, "modules": len(sys.modules)}
+            ''',
+            [
+                (
+                    "",
+                    """
+                    The demo app for this unit's sections, in parts. Part 1: imports and state.
+                    With `TRACE_MEMORY` set, `tracemalloc` starts **before** FastAPI is
+                    imported, so the memory demo in 6.8.1 sees what the import costs each
+                    process. `COUNTS` lives in the process; `REDIS` is shared when `REDIS_URL`
+                    is set:
+                    """,
+                ),
+                (
+                    '@app.get("/health")',
+                    """
+                    Part 2: the health check, `/version` (the release named by `APP_VERSION`,
+                    for the blue-green demo in 6.8.9), and `/whoami`, which reports the process
+                    (process and host name) that answered and the client address and scheme
+                    **as this app sees them** (a proxy changes both; 6.8.5):
+                    """,
+                ),
+                (
+                    '@app.get("/slow")',
+                    """
+                    Part 3: a slow route for the worker and shutdown demos, and two counters (in
+                    memory, and in Redis when configured) for the scaling demo in 6.8.9:
+                    """,
+                ),
+                ('@app.websocket("/ws")', "Part 4: a WebSocket echo, for proxying in 6.8.5:"),
+                (
+                    '@app.get("/memory")',
+                    """
+                    Part 5: `/memory`, the process's own view of its memory: Python allocations
+                    traced since start-up and the peak resident set size (`ru_maxrss`):
+                    """,
+                ),
+            ],
         ),
         md("Its pinned requirements (the same versions as the course environment):"),
         code(
@@ -337,6 +351,58 @@ def _process_model_cells() -> list[NotebookNode]:
             print(f"{len(answered_by)} processes served 30 concurrent requests: {sorted(answered_by.values())}")
             print(f"this machine has {os.cpu_count()} logical CPUs")
             '''
+        ),
+        md(
+            """
+            **Under the hood: every worker is a whole interpreter.** `--workers 3` starts three
+            separate processes, and each one imports Python, FastAPI, Pydantic and your app for
+            itself. The `/memory` route asks each worker (with `TRACE_MEMORY=1`) how much memory
+            `tracemalloc` saw it allocate since start-up and its peak resident set size. Twelve
+            overlapping requests reach different workers:
+            """
+        ),
+        code(
+            r'''
+            def memory_by_worker(base_url: str, requests: int = 12) -> dict[int, dict[str, int]]:
+                """GET /memory concurrently (each holds 0.3 s); one answer per worker pid."""
+                answers: list[dict[str, int]] = []
+
+                def ask() -> None:
+                    answers.append(httpx.get(f"{base_url}/memory?hold=0.3", timeout=10).json())
+
+                threads = [threading.Thread(target=ask) for _ in range(requests)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                return {answer["pid"]: answer for answer in answers}
+
+
+            with uvicorn_server(
+                "app:app", app_dir=DEMO_DIR, extra_args=["--workers", "3"], extra_env={"TRACE_MEMORY": "1"}
+            ) as base_url:
+                time.sleep(1.5)  # let all three workers finish importing
+                workers = memory_by_worker(base_url)
+            for pid, answer in sorted(workers.items()):
+                traced, peak, rss = (answer[key] / 1024 for key in ("traced_kib", "peak_kib", "max_rss_kib"))
+                print(
+                    f"worker {pid}: tracemalloc {traced:5.1f} MiB (peak {peak:5.1f}), "
+                    f"max RSS {rss:5.1f} MiB, {answer['modules']} modules"
+                )
+            total_rss = sum(answer["max_rss_kib"] for answer in workers.values()) / 1024
+            print(f"{len(workers)} workers answered; together about {total_rss:.0f} MiB resident")
+            '''
+        ),
+        md(
+            """
+            Each worker carries the same tens of MiB of modules and objects: memory grows with
+            `workers × replicas`, which is why memory, not CPU, often decides how many processes
+            fit on a machine. Pages loaded from the same files are shared by the operating
+            system, so RSS figures overlap (the sum overstates the real total a little); Python
+            objects are not shared, because reference counting writes to them. Gunicorn's
+            `--preload` imports the app once before forking to share more pages; it helps less
+            in Python than in C programs for the same reason.
+            """
         ),
         md(
             """
@@ -643,13 +709,23 @@ def _compose_cells() -> list[NotebookNode]:
         md(
             """
             Up, with `--wait` (it returns when every health check passes and the job has
-            finished), then the state of each service:
+            finished), then the state of each service. An `atexit` hook takes the stack down
+            when the kernel stops, so a cell that fails before the *take it down* cell in 6.8.5
+            cannot leave containers and ports behind:
             """
         ),
         code(
-            r"""
+            r'''
             DEMO_STACK = ["compose", "-p", "deploy-demo"]
+
+
+            def remove_demo_stack() -> None:
+                """compose down -v for the demo stack (also the exit hook, if a later cell fails)."""
+                docker(*DEMO_STACK, "down", "-v", "--remove-orphans", check=False)
+
+
             if HAS_DOCKER:
+                atexit.register(remove_demo_stack)  # registered before up: a failed up is cleaned too
                 started = time.perf_counter()
                 docker(*DEMO_STACK, "up", "-d", "--wait")
                 print(f"stack up and healthy in {time.perf_counter() - started:.1f} s")
@@ -659,7 +735,7 @@ def _compose_cells() -> list[NotebookNode]:
                     print("  ", line)
             else:
                 print("SKIP the Compose demo: Docker is not available")
-            """
+            '''
         ),
     ]
 
@@ -880,15 +956,103 @@ def _proxy_cells() -> list[NotebookNode]:
             (`traefik.http.routers.api.rule=Host(\\`notes.example\\`)`,
             `traefik.http.routers.api.tls.certresolver=letsencrypt`,
             `traefik.http.services.api.loadbalancer.server.port=8000`) and Traefik discovers the
-            containers through the Docker API. The Notes API uses Caddy (`deploy/Caddyfile`).
+            containers through the Docker API; in Kubernetes, `IngressRoute` resources. Its
+            **file provider** takes the same model as YAML, which makes the parts visible: a
+            *static* configuration (entry points, providers) and a *dynamic* one (routers that
+            match requests, services that balance them over servers, with health checks). Both,
+            built as data:
+            """
+        ),
+        code(
+            r"""
+            TRAEFIK_IMAGE = "traefik:v3"
+            TRAEFIK_DIR = DEMO_DIR / "traefik"
+            TRAEFIK_DIR.mkdir(exist_ok=True)
+            traefik_static = {
+                "entryPoints": {"web": {"address": ":80"}},
+                "providers": {"file": {"filename": "/etc/traefik/dynamic.yml"}},
+                "log": {"level": "ERROR"},
+            }
+            traefik_dynamic = {
+                "http": {
+                    "routers": {"demo": {"rule": "PathPrefix(`/`)", "entryPoints": ["web"], "service": "demo"}},
+                    "services": {
+                        "demo": {
+                            "loadBalancer": {
+                                "servers": [{"url": "http://app:8000"}, {"url": "http://app_untrusting:8000"}],
+                                "healthCheck": {"path": "/health", "interval": "2s", "timeout": "1s"},
+                            }
+                        }
+                    },
+                }
+            }
+            (TRAEFIK_DIR / "traefik.yml").write_text(yaml.safe_dump(traefik_static, sort_keys=False))
+            (TRAEFIK_DIR / "dynamic.yml").write_text(yaml.safe_dump(traefik_dynamic, sort_keys=False))
+            print((TRAEFIK_DIR / "dynamic.yml").read_text())
+            """
+        ),
+        md(
+            """
+            With Docker, Traefik runs for a moment on the demo stack's network (the first run
+            pulls `traefik:v3`; no Docker or no network prints SKIP). Four requests are balanced
+            round-robin over the two apps, and the proxy-header lesson repeats: only `app`
+            trusts the proxy, so only it reports the real client from `X-Forwarded-For`:
+            """
+        ),
+        code(
+            r'''
+            def through_traefik(requests: int = 4) -> list[dict[str, Any]]:
+                """Start Traefik on the demo network, send some requests, always remove it."""
+                name, port = "deploy-demo-traefik", free_port()
+                docker("rm", "-f", name, check=False)
+                docker(
+                    *["run", "-d", "--name", name, "--network", "deploy-demo_default"],
+                    *["-p", f"127.0.0.1:{port}:80", "-v", f"{TRAEFIK_DIR}:/etc/traefik:ro"],
+                    TRAEFIK_IMAGE,
+                )
+                try:
+                    base_url = f"http://127.0.0.1:{port}"
+                    with httpx.Client(base_url=base_url, trust_env=False, timeout=3) as client:
+                        deadline = time.monotonic() + 30
+                        while True:  # wait until both servers passed a health check
+                            with contextlib.suppress(httpx.HTTPError):
+                                if len({client.get("/whoami").json()["host"] for _ in range(4)}) == 2:
+                                    break
+                            if time.monotonic() > deadline:
+                                raise TimeoutError("Traefik did not route to both apps within 30 s")
+                            time.sleep(0.5)
+                        return [client.get("/whoami").json() for _ in range(requests)]
+                finally:
+                    docker("rm", "-f", name, check=False)
 
-            The demo stack has served its purpose; take it down (`-v` also removes its volumes):
+
+            if HAS_DOCKER:
+                try:
+                    for seen in through_traefik():
+                        print(
+                            f"host={seen['host'][:12]}  client={seen['client']:12} "
+                            f"X-Forwarded-For={seen['forwarded'].get('x-forwarded-for')}"
+                        )
+                except (RuntimeError, TimeoutError) as error:
+                    print(f"SKIP Traefik: {str(error).splitlines()[-1][:150]}")
+            else:
+                print("SKIP Traefik: Docker is not available")
+            '''
+        ),
+        md(
+            """
+            Two container host names alternate: Traefik balanced per request. The Notes API
+            uses Caddy (`deploy/Caddyfile`); Nginx and Traefik are the alternatives above.
+
+            The demo stack has served its purpose; take it down (`-v` also removes its volumes)
+            and cancel its exit hook:
             """
         ),
         code(
             r"""
             if HAS_DOCKER:
-                docker(*DEMO_STACK, "down", "-v")
+                remove_demo_stack()
+                atexit.unregister(remove_demo_stack)
                 print("demo stack removed; containers left:", docker(*DEMO_STACK, "ps", "-aq") or "none")
             """
         ),
@@ -964,6 +1128,67 @@ def _cicd_cells() -> list[NotebookNode]:
                 )
             )
             """
+        ),
+        md(
+            """
+            **The scan stage, locally.** CI scans every image with Trivy (the Notes API
+            workflow runs `aquasec/trivy:0.58.1` and fails on fixable HIGH/CRITICAL findings).
+            The first scan downloads Trivy and its vulnerability database (a few hundred MB), so
+            this cell runs only when Trivy is already here (the `trivy` CLI or the image) or
+            when you set `RUN_TRIVY=1` before starting Jupyter; otherwise it prints SKIP. It
+            scans the optimized demo image from 6.8.2:
+            """
+        ),
+        code(
+            r'''
+            TRIVY_IMAGE = "aquasec/trivy:0.58.1"  # the version the Notes API workflow uses
+
+
+            def trivy_command() -> list[str] | None:
+                """The Trivy CLI, the Trivy container (present, or RUN_TRIVY=1), or None."""
+                if shutil.which("trivy"):
+                    return ["trivy"]
+                if not HAS_DOCKER:
+                    return None
+                if docker("image", "ls", "-q", TRIVY_IMAGE) or os.environ.get("RUN_TRIVY") == "1":
+                    mounts = ["-v", "/var/run/docker.sock:/var/run/docker.sock"]  # reads local images
+                    mounts += ["-v", "trivy-cache:/root/.cache"]  # the database, kept between runs
+                    return ["docker", "run", "--rm", *mounts, TRIVY_IMAGE]
+                return None
+
+
+            def trivy_summary(image: str, command: list[str]) -> str:
+                """Fixable HIGH/CRITICAL findings in image, counted by severity, plus the first few."""
+                options = ["--quiet", "--scanners", "vuln", "--severity", "HIGH,CRITICAL", "--ignore-unfixed"]
+                scan = subprocess.run(
+                    [*command, "image", *options, "--format", "json", image],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                if scan.returncode != 0:
+                    return f"SKIP Trivy: {(scan.stderr.strip().splitlines() or ['failed'])[-1][:150]}"
+                findings = [
+                    finding
+                    for result in json.loads(scan.stdout).get("Results", [])
+                    for finding in result.get("Vulnerabilities") or []
+                ]
+                counts = TallyCounter(finding["Severity"] for finding in findings)
+                lines = [f"{image}: {dict(counts) or 'no fixable HIGH/CRITICAL findings'}"]
+                for item in findings[:5]:
+                    package = f"{item['PkgName']} {item['InstalledVersion']} -> {item['FixedVersion']}"
+                    lines.append(f"  {item['VulnerabilityID']:20} {package}")
+                return "\n".join(lines)
+
+
+            trivy = trivy_command()
+            if trivy is None:
+                print("SKIP Trivy: not installed and RUN_TRIVY is not 1 (CI scans every image)")
+            elif not docker("image", "ls", "-q", "deploy-demo:optimized"):
+                print("SKIP Trivy: the 6.8.2 image deploy-demo:optimized was not built")
+            else:
+                print(trivy_summary("deploy-demo:optimized", trivy))
+            '''
         ),
     ]
 
@@ -1140,6 +1365,18 @@ def _targets_cells() -> list[NotebookNode]:
                 print(f"SKIP kubectl dry run: {reason}; the Notes API's manifests are checked by its tests")
             """
         ),
+        md(
+            """
+            **Where the other targets appear.** The Notes API v7 files at the end of this unit
+            write one configuration per target: Kubernetes manifests (`deploy/k8s/`), a
+            hardened **systemd** unit for a plain VM (`deploy/systemd/notes-api.service`) and a
+            **Cloud Run** service (`deploy/cloudrun/service.yaml`, a Knative manifest). **ECS /
+            Fargate** takes the same facts (image, command, port, environment, secrets, health
+            check, CPU and memory) in a task definition, as the Cloud Run file's header comment
+            notes. The **VM with Compose** path is the one the Phase 6 Project deploys for
+            real.
+            """
+        ),
     ]
 
 
@@ -1160,7 +1397,10 @@ def _zero_downtime_cells() -> list[NotebookNode]:
         code(
             r'''
             def graceful_shutdown_demo() -> dict[str, object]:
-                """Start Uvicorn, begin a 1.5 s request, send SIGTERM, see what happens."""
+                """Start Uvicorn, begin a 1.5 s request, send SIGTERM, see what happens.
+
+                The finally block kills the server if anything fails before it has exited.
+                """
                 port = free_port()
                 server = subprocess.Popen(
                     [
@@ -1179,24 +1419,29 @@ def _zero_downtime_cells() -> list[NotebookNode]:
                     env=CHILD_ENV,
                 )
                 base_url = f"http://127.0.0.1:{port}"
-                wait_for_health(base_url + "/health", server, 15)
-                results: dict[str, object] = {}
-                request = threading.Thread(
-                    target=lambda: results.update(
-                        reply=httpx.get(base_url + "/slow?seconds=1.5", timeout=10).json()
+                try:
+                    wait_for_health(base_url + "/health", server, 15)
+                    results: dict[str, object] = {}
+                    request = threading.Thread(
+                        target=lambda: results.update(
+                            reply=httpx.get(base_url + "/slow?seconds=1.5", timeout=10).json()
+                        )
                     )
-                )
-                request.start()
-                time.sleep(0.4)
-                server.send_signal(signal.SIGTERM)
-                started = time.perf_counter()
-                request.join()
-                results["exit status"] = server.wait(timeout=15)
-                results["stopped after"] = f"{time.perf_counter() - started:.1f} s"
-                results["new connections"] = raised_error_name(
-                    lambda: httpx.get(base_url + "/health", timeout=1)
-                )
-                return results
+                    request.start()
+                    time.sleep(0.4)
+                    server.send_signal(signal.SIGTERM)
+                    started = time.perf_counter()
+                    request.join()
+                    results["exit status"] = server.wait(timeout=15)
+                    results["stopped after"] = f"{time.perf_counter() - started:.1f} s"
+                    results["new connections"] = raised_error_name(
+                        lambda: httpx.get(base_url + "/health", timeout=1)
+                    )
+                    return results
+                finally:
+                    if server.poll() is None:  # only when something above failed
+                        server.kill()
+                        server.wait()
             '''
         ),
         md("Run it:"),
@@ -1219,6 +1464,88 @@ def _zero_downtime_cells() -> list[NotebookNode]:
             | **Rolling** | replace replicas a few at a time (`maxUnavailable: 0`, `maxSurge: 1`) | roll forward again, or `kubectl rollout undo` | none extra; both versions serve for a while |
             | **Blue-green** | start the full new version beside the old, switch traffic at once | switch back | double capacity during the switch |
             | **Canary** | send a small share (1 %, 5 %, 25 %...) to the new version, watch its error rate and latency | route the share back to 0 | needs traffic splitting and good metrics |
+
+            **Blue-green in miniature.** Two complete releases run side by side: *blue* (live)
+            and *green* (new). Green is started and health-checked **before** it gets any
+            traffic; the switch is one assignment, and blue keeps running, so rolling back is
+            the same assignment the other way. Here the "load balancer" is a variable that a
+            traffic thread reads on every request; in production it is the proxy's upstream (a
+            Caddy or Nginx reload, a Kubernetes Service selector, a load-balancer target group;
+            the project's `rollout.sh` pins Caddy's upstreams the same way):
+            """
+        ),
+        code(
+            r'''
+            @dataclasses.dataclass
+            class BlueGreenSwitch:
+                """Which colour is live: the only thing a blue-green release changes."""
+
+                upstreams: dict[str, str]
+                live: str
+
+                def url(self) -> str:
+                    """The base URL of the live colour."""
+                    return self.upstreams[self.live]
+
+
+            def send_traffic(switch: BlueGreenSwitch, stop: threading.Event, replies: list[str]) -> None:
+                """GET /version through the switch until stop is set; record versions or "error"."""
+                with httpx.Client(timeout=5, trust_env=False) as client:
+                    while not stop.is_set():
+                        try:
+                            replies.append(client.get(switch.url() + "/version").json()["version"])
+                        except httpx.HTTPError:
+                            replies.append("error")
+
+
+            def run_lengths(replies: list[str]) -> str:
+                """Compress the replies: [a, a, b, b, b, a] -> "a x2 -> b x3 -> a x1"."""
+                groups = [(name, len(list(run))) for name, run in itertools.groupby(replies)]
+                return " -> ".join(f"{name} x{count}" for name, count in groups)
+            '''
+        ),
+        md(
+            """
+            The release: blue serves alone, green starts beside it, traffic flips to green,
+            then (as if green had a problem) flips back. Requests keep flowing the whole time:
+            """
+        ),
+        code(
+            r'''
+            def blue_green_release() -> list[str]:
+                """Serve from blue, switch to green, roll back to blue; return every reply."""
+                replies: list[str] = []
+                stop = threading.Event()
+                with uvicorn_server("app:app", app_dir=DEMO_DIR, extra_env={"APP_VERSION": "blue-v1"}) as blue:
+                    switch = BlueGreenSwitch({"blue": blue}, live="blue")
+                    sender = threading.Thread(target=send_traffic, args=(switch, stop, replies))
+                    sender.start()
+                    try:
+                        with uvicorn_server(
+                            "app:app", app_dir=DEMO_DIR, extra_env={"APP_VERSION": "green-v2"}
+                        ) as green:  # started and healthy before it is live
+                            switch.upstreams["green"] = green
+                            switch.live = "green"  # the release
+                            time.sleep(0.5)
+                            switch.live = "blue"  # the rollback: blue never stopped
+                            time.sleep(0.3)
+                    finally:
+                        stop.set()
+                        sender.join()
+                return replies
+
+
+            release_replies = blue_green_release()
+            print(run_lengths(release_replies))
+            print(f"{len(release_replies)} requests, {release_replies.count('error')} failed")
+            '''
+        ),
+        md(
+            """
+            Every request was answered by exactly one complete release, none failed, and the
+            rollback took no restart. The cost is visible too: during the switch both releases
+            run, so the platform needs room for two full copies, and both share one database,
+            so the schema must suit both (expand/contract, 6.8.7).
 
             A canary step in miniature: 5 % of 20 000 simulated requests go to the new version,
             which has a bug; comparing error rates decides whether to continue:
@@ -1390,7 +1717,7 @@ def _load_test_cells() -> list[NotebookNode]:
             csv_prefix = DEMO_DIR / "locust_demo"
             '''
         ),
-        md("The run: Uvicorn with two workers, then Locust headless with 20 users for 10 s:"),
+        md("The run: Uvicorn with two workers, then Locust headless with 20 users for 5 s:"),
         code(
             r"""
             with uvicorn_server("app:app", app_dir=DEMO_DIR, extra_args=["--workers", "2"]) as base_url:
@@ -1409,7 +1736,7 @@ def _load_test_cells() -> list[NotebookNode]:
                         "-r",
                         "10",
                         "-t",
-                        "10s",
+                        "5s",
                         "--only-summary",
                         "--csv",
                         str(csv_prefix),
@@ -2324,17 +2651,26 @@ def _notes_v7_stack_cells() -> list[NotebookNode]:
                 if run.returncode != 0:
                     raise RuntimeError((run.stdout + run.stderr)[-2000:])
                 return (run.stdout + run.stderr).strip()
+
+
+            def remove_notes_stack() -> None:
+                """compose down -v for the v7 stack; never raises (it is also the exit hook)."""
+                with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+                    notes_stack("down", "-v", "--remove-orphans")
             '''
         ),
         md(
             """
             Up with `--wait`: PostgreSQL and Redis become healthy, `migrate` runs and exits 0,
-            then `api` and `worker` start and pass their health checks, then Caddy:
+            then `api` and `worker` start and pass their health checks, then Caddy. The exit
+            hook is registered first, so even a failed `up` or a failing cell below cannot leave
+            the stack (and its ports 58080, 58443, 55432, 56379) running after the kernel stops:
             """
         ),
         code(
             r"""
             if HAS_DOCKER:
+                atexit.register(remove_notes_stack)
                 started = time.perf_counter()
                 notes_stack("up", "-d", "--wait")
                 print(f"stack up and healthy in {time.perf_counter() - started:.1f} s")
@@ -2461,7 +2797,7 @@ def _notes_v7_stack_cells() -> list[NotebookNode]:
                         "-r",
                         "10",
                         "-t",
-                        "15s",
+                        "8s",
                         "--only-summary",
                         "--csv",
                         str(locust_prefix),
@@ -2481,11 +2817,14 @@ def _notes_v7_stack_cells() -> list[NotebookNode]:
                 print("exit code (0 = within the SLO):", load_run.returncode)
             """
         ),
-        md("Take the stack down (`-v`: the database and Caddy volumes go too):"),
+        md(
+            "Take the stack down (`-v`: the database and Caddy volumes go too) and cancel its exit hook:"
+        ),
         code(
             r"""
             if HAS_DOCKER:
-                notes_stack("down", "-v")
+                remove_notes_stack()
+                atexit.unregister(remove_notes_stack)
                 print("stack removed; containers left:", notes_stack("ps", "-aq") or "none")
             """
         ),
@@ -2499,7 +2838,8 @@ def _notes_v7_ci_cells() -> list[NotebookNode]:
             """
             **The pipeline's checks, locally**: the `lint` and `types` jobs, then the `test` job
             the CI way (service URLs pointing at this unit's PostgreSQL and Redis containers, a
-            fresh database), which now includes the graceful-shutdown and deployment tests:
+            fresh database) for the test files v7 adds, the graceful-shutdown and deployment
+            tests (the full suite runs once, in the Phase 6 Project):
             """
         ),
         code(
@@ -2529,6 +2869,7 @@ def _notes_v7_ci_cells() -> list[NotebookNode]:
                 return server_url.rsplit("/", 1)[0] + f"/{name}"
 
 
+            NEW_TESTS = __NEW_TESTS__
             PG_URL, REDIS_URL = start_shared_postgres(), start_shared_redis()
             ci_env = {}
             if PG_URL and REDIS_URL:
@@ -2545,6 +2886,7 @@ def _notes_v7_ci_cells() -> list[NotebookNode]:
                     "-p",
                     "no:cacheprovider",
                     "-rfs",
+                    *NEW_TESTS,
                     extra_env=ci_env,
                     timeout=600,
                 )

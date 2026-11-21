@@ -1,7 +1,7 @@
 """Unit 6.2 — FastAPI Fundamentals and Pydantic v2 (with Lab 6.2 and Notes API v1)."""
 
+from helpers_module import setup_cells
 from nbformat import NotebookNode
-from unit_6_1 import SERVER_HELPERS_SOURCE, UNIT_SETUP_SOURCE_2  # one copy of the helpers
 
 from nb_builder import code, md, predict_cells, writefile_cells
 
@@ -14,13 +14,11 @@ import importlib.util
 import inspect
 import json
 import os
-import platform
 import re
 import shutil
 import socket
 import subprocess
 import sys
-import sysconfig
 import threading
 import time
 import typing
@@ -30,7 +28,6 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from types import ModuleType
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -56,24 +53,6 @@ from pydantic import (
     model_validator,
 )
 
-REPO_ROOT = find_repo_root()
-scratch_dir = REPO_ROOT / "notebooks" / "_scratch"  # git-ignored
-PHASE6_DIR = scratch_dir / "phase6"
-PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(REPO_ROOT / "notebooks")  # %%writefile cells use paths relative to notebooks/
-if str(PHASE6_DIR) not in sys.path:
-    sys.path.insert(0, str(PHASE6_DIR))
-CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1"}
-CHILD_ENV.pop("FORCE_COLOR", None)
-HAS_NODE = shutil.which("node") is not None
-HAS_UV = shutil.which("uv") is not None
-
-NOTES_API_DIR = REPO_ROOT / "projects" / "notes_api"  # the Notes API's own uv project
-NOTES_SRC = NOTES_API_DIR / "src"
-for folder in (NOTES_SRC / "notes_api", NOTES_API_DIR / "tests"):
-    folder.mkdir(parents=True, exist_ok=True)  # %%writefile does not create folders
-if str(NOTES_SRC) not in sys.path:
-    sys.path.insert(0, str(NOTES_SRC))
 """
 
 NOTES_HELPERS_SOURCE = r'''
@@ -147,29 +126,28 @@ def _overview_cells() -> list[NotebookNode]:
             | Supertest (`request(app).get(...)`) | `TestClient(app).get(...)` | in-process, no port; `httpx.AsyncClient` + `ASGITransport` for async tests |
             | `async` everywhere in Node | `async def` **or** `def` handlers | a blocking call inside `async def` freezes every request; `def` runs in a thread pool |
 
-            Run the setup cells first. Part 1: imports, the scratch folder, and the Notes API
-            folder `projects/notes_api/` with `src/` added to `sys.path`, so the kernel can
-            import the app the notebook writes:
+            Run the setup cells first. Part 1: the imports (FastAPI, Starlette, Pydantic,
+            Uvicorn):
             """
         ),
-        code(UNIT_SETUP_SOURCE),
-        md(
+        *setup_cells(
+            "6.2",
+            UNIT_SETUP_SOURCE,
             """
-            Part 2: the helpers shared with Unit 6.1 (`raised_error_name`, `raised_message`,
-            `interpreter_label`, `Timer`, `fresh_import`, `mask_dates`):
-            """
-        ),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
-            """
-            Part 3: the server helpers from Unit 6.1 (`free_port`, `wait_for_health`,
+            Part 2: the shared helpers. `from phase6_helpers import *` loads [`phase6_helpers.py`](phase6_helpers.py), the
+            module that holds every helper Phase 6 shares: Unit 6.1's error and timing helpers
+            (`raised_error_name`, `raised_message`, `interpreter_label`, `Timer`, `fresh_import`,
+            `mask_dates`) and server helpers (`free_port`, `wait_for_health`,
             `background_server`, `uvicorn_server`: start a server in a child process, wait for
-            `/health`, always stop it), plus two helpers for the Notes API:
-            `reload_notes_api()` re-imports the app after a `%%writefile` cell changed it, and
-            `tidy_test_output()` hides timings in pytest output:
-            """
+            `/health`, always stop it), plus three this unit introduces for the Notes API:
+            `reload_notes_api()` re-imports the app after a `%%writefile` cell changed it,
+            `validation_problems()` lists a `ValidationError`'s problems, and
+            `tidy_test_output()` hides timings in pytest output. `enter_phase6(*NOTES_FOLDERS)`
+            creates `projects/notes_api/src/notes_api/` and `tests/` and puts `src/` on
+            `sys.path`, so the kernel can import the app the notebook writes:
+            """,
+            folders="*NOTES_FOLDERS",
         ),
-        code(SERVER_HELPERS_SOURCE + "\n" + NOTES_HELPERS_SOURCE),
     ]
 
 
@@ -3991,8 +3969,9 @@ def _notes_project_cells() -> list[NotebookNode]:
             """
         ),
         code(NOTES_PYPROJECT),
-        md("Ruff settings (inherit the course configuration) and the README:"),
+        md("Ruff settings (inherit the course configuration):"),
         code(NOTES_RUFF),
+        md("The README: what the service is, how to run it and how to test it:"),
         code(NOTES_README),
         md("The package marker with the version that `/openapi.json` reports:"),
         code(NOTES_INIT),

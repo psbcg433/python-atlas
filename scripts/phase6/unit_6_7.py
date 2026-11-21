@@ -1,12 +1,7 @@
 """Unit 6.7 — API Testing and Observability (with Lab 6.7 and Notes API v6)."""
 
+from helpers_module import setup_cells
 from nbformat import NotebookNode
-from unit_6_1 import SERVER_HELPERS_SOURCE, UNIT_SETUP_SOURCE_2  # one copy of the helpers
-from unit_6_2 import NOTES_HELPERS_SOURCE
-from unit_6_3 import NOTES_PROJECT_HELPERS_SOURCE, PRUNE_HELPER_SOURCE
-from unit_6_4 import DATABASE_HELPERS_SOURCE
-from unit_6_5 import REDIS_HELPERS_SOURCE
-from unit_6_6 import WORKER_HELPERS_SOURCE
 
 from nb_builder import code, md, predict_cells, writefile_cells
 
@@ -33,7 +28,6 @@ import sqlite3
 import statistics
 import subprocess
 import sys
-import sysconfig
 import textwrap
 import threading
 import time
@@ -43,7 +37,6 @@ import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
 from typing import Annotated, Any
 
 import alembic
@@ -93,28 +86,6 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", message="Call to deprecated close", category=DeprecationWarning)
 
-REPO_ROOT = find_repo_root()
-scratch_dir = REPO_ROOT / "notebooks" / "_scratch"  # git-ignored
-PHASE6_DIR = scratch_dir / "phase6"
-PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(REPO_ROOT / "notebooks")  # %%writefile cells use paths relative to notebooks/
-if str(PHASE6_DIR) not in sys.path:
-    sys.path.insert(0, str(PHASE6_DIR))
-CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1"}
-CHILD_ENV.pop("FORCE_COLOR", None)
-HAS_NODE = shutil.which("node") is not None
-HAS_UV = shutil.which("uv") is not None
-
-NOTES_API_DIR = REPO_ROOT / "projects" / "notes_api"  # the Notes API's own uv project
-NOTES_SRC = NOTES_API_DIR / "src"
-for folder in (
-    NOTES_SRC / "notes_api",
-    NOTES_API_DIR / "tests",
-    REPO_ROOT / ".github" / "workflows",
-):
-    folder.mkdir(parents=True, exist_ok=True)  # %%writefile does not create folders
-if str(NOTES_SRC) not in sys.path:
-    sys.path.insert(0, str(NOTES_SRC))
 """
 
 POSTGRES_HELPERS_SOURCE = r'''
@@ -189,36 +160,20 @@ def _overview_cells() -> list[NotebookNode]:
             | `@opentelemetry/auto-instrumentations-node` | `opentelemetry-instrumentation-fastapi` | instrument the app object; exporters are configured in code |
             | `@sentry/node` | `sentry-sdk` | `before_send` must scrub secrets |
 
-            Run the setup cells first. Part 1: imports (structlog, prometheus_client,
-            OpenTelemetry, Schemathesis) and the project folders:
+            Run the setup cells first. Part 1: the imports (structlog, prometheus_client,
+            OpenTelemetry, Schemathesis):
             """
         ),
-        code(UNIT_SETUP_SOURCE),
-        md("Part 2: helpers shared with Units 6.1–6.6:"),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
+        *setup_cells(
+            "6.7",
+            UNIT_SETUP_SOURCE,
             """
-            Part 3: the server, Notes API, database, Redis and worker helpers from Units 6.1–6.6,
-            plus `start_shared_postgres()` (one PostgreSQL testcontainer for the unit, removed in
-            the *Clean up* cell and by an `atexit` hook):
-            """
-        ),
-        code(
-            SERVER_HELPERS_SOURCE
-            + "\n"
-            + NOTES_HELPERS_SOURCE
-            + "\n"
-            + PRUNE_HELPER_SOURCE
-            + "\n"
-            + NOTES_PROJECT_HELPERS_SOURCE
-            + "\n"
-            + DATABASE_HELPERS_SOURCE
-            + "\n"
-            + REDIS_HELPERS_SOURCE
-            + "\n"
-            + WORKER_HELPERS_SOURCE
-            + "\n"
-            + POSTGRES_HELPERS_SOURCE
+            Part 2: the shared helpers from [`phase6_helpers.py`](phase6_helpers.py) (server, Notes API, database, Redis and
+            worker helpers of Units 6.1–6.6), including `start_shared_postgres()`: one
+            PostgreSQL testcontainer for the unit, removed in the *Clean up* cell and by an
+            `atexit` hook:
+            """,
+            folders='*NOTES_FOLDERS, REPO_ROOT / ".github" / "workflows"',
         ),
     ]
 
@@ -890,6 +845,42 @@ def _structured_logging_cells() -> list[NotebookNode]:
             demo_log.warning("cache miss", key="notes:v5:note:42")
             for line in log_buffer.getvalue().splitlines():
                 print(re.sub(r'"timestamp": "[^"]+"', '"timestamp": "<now>"', line))
+            """
+        ),
+        md(
+            """
+            **Under the hood: a processor is any callable `(logger, method_name, event_dict)`.**
+            `structlog.get_config()` returns the chain just configured; `inspect` shows what
+            each entry is (a plain function or an instance with `__call__`), its signature and
+            where it is defined:
+            """
+        ),
+        code(
+            r"""
+            chain = structlog.get_config()["processors"]
+            for position, processor in enumerate(chain, start=1):
+                is_function = inspect.isfunction(processor)
+                kind = "function" if is_function else f"{type(processor).__name__} instance"
+                source_file = Path(inspect.getfile(processor if is_function else type(processor)))
+                where = f"{source_file.parent.name}/{source_file.name}"
+                print(f"{position}. {kind:30} {inspect.signature(processor)}  ({where})")
+            """
+        ),
+        md(
+            """
+            So `log.info("note created", note_id=42)` is a fold over that list: the event dict
+            goes through each processor in turn, and the last one turns it into the string the
+            logger prints. Running the chain by hand shows each step:
+            """
+        ),
+        code(
+            r"""
+            event: object = {"event": "note created", "note_id": 42}
+            for processor in chain:
+                event = processor(None, "info", event)
+                name = getattr(processor, "__name__", type(processor).__name__)
+                shown = re.sub(r"\d{4}-\d\d-\d\dT[\d:.]+Z", "<now>", repr(event))
+                print(f"{name:20} -> {type(event).__name__:4} {shown}")
             """
         ),
         md(
@@ -2451,8 +2442,9 @@ def _notes_v6_run_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            **The suite, the way CI runs it.** `uv lock` adds the new packages to the project's
-            lock; then the whole suite runs with `NOTES_TEST_DATABASE_URL` and
+            **This version's tests, the way CI runs them.** `uv lock` adds the new packages to
+            the project's lock; then the test files v6 adds or changes (`NEW_TESTS`; the full suite runs once, in the Phase 6 Project)
+            run with `NOTES_TEST_DATABASE_URL` and
             `NOTES_TEST_REDIS_URL` pointing at this unit's PostgreSQL and Redis containers,
             exactly as the workflow points them at its service containers (so no test starts its
             own container). Without Docker the PostgreSQL and Redis tests skip:
@@ -2471,6 +2463,7 @@ def _notes_v6_run_cells() -> list[NotebookNode]:
                 return server_url.rsplit("/", 1)[0] + f"/{name}"
 
 
+            NEW_TESTS = __NEW_TESTS__
             REDIS_URL = start_shared_redis()
             ci_env = {}
             if PG_URL and REDIS_URL:
@@ -2494,6 +2487,7 @@ def _notes_v6_run_cells() -> list[NotebookNode]:
                     "-p",
                     "no:cacheprovider",
                     "-rfs",
+                    *NEW_TESTS,
                     extra_env=ci_env,
                     timeout=600,
                 )

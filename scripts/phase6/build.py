@@ -8,6 +8,7 @@ root:
 """
 
 import importlib
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -17,6 +18,7 @@ SCRIPTS_DIR = PHASE_DIR.parent
 REPO_ROOT = SCRIPTS_DIR.parent
 sys.path[:0] = [str(SCRIPTS_DIR), str(PHASE_DIR)]
 
+from helpers_module import write_module  # noqa: E402
 from nbformat import NotebookNode  # noqa: E402
 
 from nb_builder import code, md, new_notebook, save_notebook, shared_setup_cells  # noqa: E402
@@ -26,6 +28,18 @@ NOTEBOOK_PATH = REPO_ROOT / "notebooks" / "phase6_web_fastapi.ipynb"
 UNIT_MODULE_NAMES = [f"unit_6_{unit_number}" for unit_number in range(1, 9)]
 PROJECT_MODULE_NAME = "project"
 NOTES_V1_HEADING = "### Notes API v1 — the project files"
+NEW_TESTS_PLACEHOLDER = "__NEW_TESTS__"
+UNPARENTHESIZED_EXCEPT = re.compile(
+    r"^\s*except\s+[A-Za-z_][\w.]*(\s*,\s*[A-Za-z_][\w.]*)+\s*:", re.M
+)
+PEP758_NOTE = (
+    "*New in 3.14 ([PEP 758](https://peps.python.org/pep-0758/)):* the next cell writes "
+    "`except A, B:` without parentheses. It catches either exception, exactly like "
+    "`except (A, B):`; with `as name` the parentheses are still required."
+)
+TEST_WRITEFILE = re.compile(
+    r"%%writefile(?P<append> -a)? \.\./projects/notes_api/(?P<path>tests/\S+)\n"
+)
 NOTES_V1_FILES = [
     "README.md",
     "pyproject.toml",
@@ -142,24 +156,23 @@ def notes_v1_prune_cells() -> list[NotebookNode]:
     """Cells that reset projects/notes_api/ to v1's file set before Unit 6.2 writes v1.
 
     Later units add files (routers, migrations, more tests). Without this, re-running Unit 6.2
-    after them would run v3 tests against v1's conftest. The helper source lives in unit_6_3.
+    after them would run v3 tests against v1's conftest. prune_notes_project() comes from the
+    shared helper module (its source lives in unit_6_3).
     """
-    from unit_6_3 import PRUNE_HELPER_SOURCE
-
     files = ",\n    ".join(f'"{name}"' for name in NOTES_V1_FILES)
     return [
         md(
             """
             **Re-running this section after Unit 6.3 or later?** Later units add files to
             `projects/notes_api/` (routers, migrations, more tests). The next cell deletes every
-            file v1 does not have, so the cells below rebuild exactly v1 and its tests run
-            against v1's code; the Unit 6.3 and 6.4 sections write their versions again.
-            `.venv`, `.env` and `uv.lock` are never touched:
+            file v1 does not have, with `prune_notes_project()` from the shared helpers, so the
+            cells below rebuild exactly v1 and its tests run against v1's code; the Unit 6.3 and
+            6.4 sections write their versions again. `.venv`, `.env` and `uv.lock` are never
+            touched:
             """
         ),
         code(
-            PRUNE_HELPER_SOURCE
-            + f"\n\nNOTES_V1_FILES = [\n    {files},\n]\n"
+            f"NOTES_V1_FILES = [\n    {files},\n]\n"
             + 'print("removed:", prune_notes_project(NOTES_V1_FILES))'
         ),
         md("Now the project metadata, as described above:"),
@@ -176,9 +189,60 @@ def insert_after_heading(
     return cells
 
 
+def tests_list_source(files: list[str]) -> str:
+    """A list literal of test files, laid out the way ruff format would (100 columns)."""
+    one_line = "[" + ", ".join(f'"{name}"' for name in files) + "]"
+    if len("NEW_TESTS = " + one_line) <= 100:
+        return one_line
+    return "[\n" + "".join(f'    "{name}",\n' for name in files) + "]"
+
+
+def fill_new_tests(cells: list[NotebookNode], known: dict[str, str], module_name: str) -> None:
+    """Replace NEW_TESTS_PLACEHOLDER with the test files this unit adds or changes.
+
+    known maps each Notes API test file (relative to projects/notes_api/) to its content after
+    the earlier units; it is updated with this unit's files. Every in-notebook pytest run of a
+    version runs only these files; the project runs the full suite once.
+    """
+    written: dict[str, str] = {}
+    for cell in cells:
+        match = TEST_WRITEFILE.match(cell.source) if cell.cell_type == "code" else None
+        if match:
+            body = cell.source[match.end() :]
+            written[match["path"]] = (
+                written.get(match["path"], "") + body if match["append"] else body
+            )
+    changed = sorted(
+        path
+        for path, body in written.items()
+        if Path(path).name.startswith("test_") and known.get(path) != body
+    )
+    known.update(written)
+    placeholders = [cell for cell in cells if NEW_TESTS_PLACEHOLDER in cell.source]
+    if placeholders and not changed:
+        raise ValueError(f"{module_name} runs NEW_TESTS but writes no new or changed test file")
+    for cell in placeholders:
+        cell.source = cell.source.replace(NEW_TESTS_PLACEHOLDER, tests_list_source(changed))
+
+
+def label_pep758(cells: list[NotebookNode]) -> None:
+    """Label the unit's first `except A, B:` (new in 3.14) in the markdown cell just before it.
+
+    Convention: features newer than 3.12 are labelled where a unit first uses them. Skipped when
+    that markdown already mentions PEP 758 or the unit never uses the syntax.
+    """
+    for index, cell in enumerate(cells):
+        if cell.cell_type == "code" and UNPARENTHESIZED_EXCEPT.search(cell.source):
+            previous = cells[index - 1]
+            if previous.cell_type == "markdown" and "PEP 758" not in previous.source:
+                previous.source = previous.source.rstrip() + "\n\n" + PEP758_NOTE
+            return
+
+
 def unit_cells() -> list[NotebookNode]:
     """Collect cells from every unit module (then the project) that exists, in syllabus order."""
     collected_cells: list[NotebookNode] = []
+    known_tests: dict[str, str] = {}
     for module_name in [*UNIT_MODULE_NAMES, PROJECT_MODULE_NAME]:
         unit_module = import_optional(module_name)
         if unit_module is None:
@@ -188,6 +252,8 @@ def unit_cells() -> list[NotebookNode]:
             unit_cell_list = insert_after_heading(
                 unit_cell_list, NOTES_V1_HEADING, notes_v1_prune_cells()
             )
+        fill_new_tests(unit_cell_list, known_tests, module_name)
+        label_pep758(unit_cell_list)
         print(f"{module_name}: {len(unit_cell_list)} cells")
         collected_cells.extend(unit_cell_list)
     return collected_cells
@@ -195,6 +261,8 @@ def unit_cells() -> list[NotebookNode]:
 
 def build() -> None:
     """Assemble all cells and write the notebook."""
+    helpers_path = write_module(NOTEBOOK_PATH.parent)
+    print(f"wrote {helpers_path.relative_to(REPO_ROOT)}")
     all_cells = [*title_cells(), *shared_setup_cells(), *unit_cells()]
     notebook = new_notebook(NOTEBOOK_TITLE, all_cells)
     save_notebook(notebook, NOTEBOOK_PATH)

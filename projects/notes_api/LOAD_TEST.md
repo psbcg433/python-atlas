@@ -28,7 +28,7 @@ It has two result sections:
 - **Run (live):** 50 users, spawn rate 10 per second, 2 minutes, from a machine close to the
   server's region. Network round trips count in the client-side numbers; the server-side
   95th percentile from Prometheus does not include them.
-- **Run (local rehearsal):** 50 users, spawn rate 10 per second, 30 seconds (shorter, so the
+- **Run (local rehearsal):** 50 users, spawn rate 10 per second, 15 seconds (shorter, so the
   notebook stays fast).
 
 ## Targets
@@ -63,22 +63,22 @@ account. [DEPLOY.md](DEPLOY.md) shows how to delete them.
 ## Results — local rehearsal
 
 <!-- results:local:start -->
-Run at 2026-11-20 19:28 UTC against `https://localhost:58443`: 50 users, spawn rate 10/s, 30s.
+Run at 2026-11-21 07:20 UTC against `https://localhost:58443`: 50 users, spawn rate 10/s, 15s.
 
 | Endpoint | Requests | Failures | req/s | p50 ms | p95 ms | p99 ms | max ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GET `/api/v1/notes` | 4304 | 0 | 148.2 | 22 | 67 | 94 | 163 |
-| POST `/api/v1/notes` | 920 | 0 | 31.7 | 23 | 68 | 98 | 136 |
-| GET `/api/v1/notes/feed` | 817 | 0 | 28.1 | 19 | 56 | 85 | 143 |
-| GET `/api/v1/notes/{id}` | 2587 | 0 | 89.1 | 19 | 69 | 100 | 170 |
-| **All requests** | 8628 | 0 | 297.1 | 21 | 66 | 96 | 170 |
+| GET `/api/v1/notes` | 2202 | 0 | 157.2 | 8 | 15 | 27 | 67 |
+| POST `/api/v1/notes` | 449 | 0 | 32.0 | 9 | 17 | 28 | 70 |
+| GET `/api/v1/notes/feed` | 470 | 0 | 33.5 | 7 | 15 | 28 | 61 |
+| GET `/api/v1/notes/{id}` | 1222 | 0 | 87.2 | 6 | 13 | 21 | 75 |
+| **All requests** | 4343 | 0 | 310.0 | 7 | 15 | 25 | 75 |
 
 | Target | Measured | Verdict |
 | --- | ---: | --- |
-| p95 latency (client side) < 200 ms | 66 ms | **PASS** |
+| p95 latency (client side) < 200 ms | 15 ms | **PASS** |
 | failed requests < 1% | 0.00% | **PASS** |
-| throughput >= 100 req/s | 297 req/s | **PASS** |
-| p95 latency (server side, Prometheus) < 200 ms | 71 ms | **PASS** |
+| throughput >= 100 req/s | 310 req/s | **PASS** |
+| p95 latency (server side, Prometheus) < 200 ms | 18 ms | **PASS** |
 <!-- results:local:end -->
 
 ## Results — live

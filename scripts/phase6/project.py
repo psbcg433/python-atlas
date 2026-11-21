@@ -12,15 +12,9 @@ documents; the notebook reads DEPLOY.md and fills LOAD_TEST.md's local results.
 
 from pathlib import Path
 
+from helpers_module import setup_cells
 from nbformat import NotebookNode
-from unit_6_1 import SERVER_HELPERS_SOURCE, UNIT_SETUP_SOURCE_2
-from unit_6_2 import NOTES_HELPERS_SOURCE
-from unit_6_3 import NOTES_PROJECT_HELPERS_SOURCE, PRUNE_HELPER_SOURCE
-from unit_6_4 import DATABASE_HELPERS_SOURCE
-from unit_6_5 import REDIS_HELPERS_SOURCE
-from unit_6_6 import WORKER_HELPERS_SOURCE
-from unit_6_7 import POSTGRES_HELPERS_SOURCE
-from unit_6_8 import DOCKER_HELPERS_SOURCE, UNIT_SETUP_SOURCE
+from unit_6_8 import UNIT_FOLDERS, UNIT_SETUP_SOURCE
 
 from nb_builder import code, md, predict_cells, writefile_cells
 
@@ -30,10 +24,12 @@ PROJECT_FILES = Path(__file__).resolve().parent / "project_files"
 UNUSED_SETUP_IMPORTS = {
     "import asyncio": "",
     "import csv": "",
+    "import dataclasses": "",
     "import graphlib": "",
     "import hashlib": "",
     "import inspect": "",
     "import io": "",
+    "import itertools": "",
     "import math": "",
     "import random": "",
     "import signal": "",
@@ -159,41 +155,23 @@ def _overview_cells() -> list[NotebookNode]:
             `DEPLOY.md`. After the first deploy, the live load test fills the second results
             section of `LOAD_TEST.md`.
 
-            Run the setup cells first. Part 1: imports and the project folders (the same as
-            Unit 6.8):
+            Run the setup cells first. Part 1: the imports (Unit 6.8's, minus the ones the
+            project does not use):
             """
         ),
-        code(project_unit_setup_source()),
-        md("Part 2: helpers shared with Units 6.1–6.8:"),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
+        *setup_cells(
+            "project",
+            project_unit_setup_source(),
             """
-            Part 3: the server, Notes API, database, Redis, worker, PostgreSQL and Docker helpers
-            of Units 6.1–6.8 (everything that needs Docker prints a skip message without it):
-            """
-        ),
-        code(
-            SERVER_HELPERS_SOURCE
-            + "\n"
-            + NOTES_HELPERS_SOURCE
-            + "\n"
-            + PRUNE_HELPER_SOURCE
-            + "\n"
-            + NOTES_PROJECT_HELPERS_SOURCE
-            + "\n"
-            + DATABASE_HELPERS_SOURCE
-            + "\n"
-            + REDIS_HELPERS_SOURCE
-            + "\n"
-            + WORKER_HELPERS_SOURCE
-            + "\n"
-            + POSTGRES_HELPERS_SOURCE
-            + "\n"
-            + DOCKER_HELPERS_SOURCE
+            Part 2: every helper of Units 6.1–6.8 from [`phase6_helpers.py`](phase6_helpers.py):
+            servers, the Notes API, databases, Redis, workers, PostgreSQL and Docker (everything
+            that needs Docker prints a skip message without it):
+            """,
+            folders=UNIT_FOLDERS,
         ),
         md(
             """
-            Part 4: the project's own setup: the folders the `%%writefile` cells need, and
+            Part 3: the project's own setup: the folders the `%%writefile` cells need, and
             `run_tool()`, which runs a checker (Caddy, promtool, shellcheck, actionlint) from its
             pinned Docker image so nothing has to be installed on this machine:
             """
@@ -537,6 +515,7 @@ def _compose_cells() -> list[NotebookNode]:
                 )
             '''
         ),
+        md("The merged services, with their images and published ports:"),
         code(
             r"""
             if shutil.which("docker"):
@@ -1494,6 +1473,12 @@ def production_script(
     )
 
 
+def remove_rehearsal_stack() -> subprocess.CompletedProcess[str]:
+    """compose down for the rehearsal (volumes too); also the exit hook if a cell fails."""
+    # down needs some TAG to read the files; no release is recorded
+    return production_script("dc", "down", "--volumes", "--remove-orphans", extra_env={"TAG": "-"})
+
+
 def rollout_log(run: subprocess.CompletedProcess[str]) -> list[str]:
     """The script's own log lines (Compose's progress lines left out); the tail on failure."""
     lines = [line for line in run.stdout.splitlines() if "rollout.sh:" in line]
@@ -1619,14 +1604,16 @@ def _rehearsal_cells() -> list[NotebookNode]:
             """
             **The first deploy**: an empty server. `rollout.sh release-a` starts PostgreSQL and
             Redis, skips the backup (nothing to back up yet), runs the migrations, starts two
-            API replicas, the worker, Caddy, Prometheus and Grafana:
+            API replicas, the worker, Caddy, Prometheus and Grafana. An exit hook takes the
+            rehearsal stack down when the kernel stops, so a failing cell before the clean-up at
+            the end of this step cannot leave it (and ports 58080, 58443, 59090, 53000) behind:
             """
         ),
         code(
             r"""
             if HAS_DOCKER:
-                # a clean start (down needs some TAG to read the files; no release is recorded)
-                production_script("dc", "down", "--volumes", "--remove-orphans", extra_env={"TAG": "-"})
+                remove_rehearsal_stack()  # a clean start
+                atexit.register(remove_rehearsal_stack)
                 shutil.rmtree(REHEARSAL_STATE, ignore_errors=True)
                 started = time.perf_counter()
                 first_deploy = production_script("rollout.sh", "release-a")
@@ -1826,7 +1813,7 @@ def _rehearsal_cells() -> list[NotebookNode]:
         md(
             """
             **The load test.** Locust runs the Step 9 scenario against the rehearsal stack (50
-            users, 30 s, through Caddy and TLS), then `load/report.py` writes the results into
+            users, 15 s, through Caddy and TLS), then `load/report.py` writes the results into
             the *local rehearsal* section of `LOAD_TEST.md`, with the server-side p95 from the
             rehearsal's Prometheus:
             """
@@ -1835,7 +1822,7 @@ def _rehearsal_cells() -> list[NotebookNode]:
             r"""
             if HAS_DOCKER:
                 locust_prefix = PHASE6_DIR / "project_locust"
-                locust_options = f"--host {REHEARSAL_URL} --headless -u 50 -r 10 -t 30s --only-summary"
+                locust_options = f"--host {REHEARSAL_URL} --headless -u 50 -r 10 -t 15s --only-summary"
                 load_run = subprocess.run(
                     [sys.executable, "-m", "locust", "-f", "load/locustfile.py", *locust_options.split()]
                     + ["--csv", str(locust_prefix)],
@@ -1849,7 +1836,7 @@ def _rehearsal_cells() -> list[NotebookNode]:
                 time.sleep(16)  # one more Prometheus scrape after the last request
                 report_options = (
                     f"--stats {locust_prefix}_stats.csv --section local --host {REHEARSAL_URL} "
-                    "--users 50 --duration 30s --window 60 --prometheus http://127.0.0.1:59090"
+                    "--users 50 --duration 15s --window 60 --prometheus http://127.0.0.1:59090"
                 )
                 report = subprocess.run(
                     [sys.executable, "load/report.py", *report_options.split()],
@@ -1877,7 +1864,8 @@ def _rehearsal_cells() -> list[NotebookNode]:
         code(
             r"""
             if HAS_DOCKER:
-                down = production_script("dc", "down", "--volumes", "--remove-orphans", extra_env={"TAG": "-"})
+                down = remove_rehearsal_stack()
+                atexit.unregister(remove_rehearsal_stack)
                 print("rehearsal stack removed:", down.returncode == 0)
                 docker("rmi", "notes-api:release-b", "notes-api:release-a", check=False)
             stop_shared_postgres()

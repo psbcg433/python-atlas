@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 
+from helpers_module import helper_table_markdown, setup_cells
 from nbformat import NotebookNode
 
 from nb_builder import code, md, predict_cells, writefile_cells
@@ -24,7 +25,7 @@ def _load_shop_api_source() -> str:
 
 SHOP_API_SOURCE = _load_shop_api_source()
 
-UNIT_SETUP_SOURCE = r'''
+UNIT_SETUP_SOURCE = r"""
 import asyncio
 import base64
 import contextlib
@@ -36,14 +37,12 @@ import importlib.util
 import inspect
 import json
 import os
-import platform
 import re
 import shutil
 import socket
 import ssl
 import subprocess
 import sys
-import sysconfig
 import threading
 import time
 import urllib.error
@@ -52,22 +51,12 @@ import urllib.request
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from http import HTTPStatus
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import httpx
+"""
 
-REPO_ROOT = find_repo_root()
-scratch_dir = REPO_ROOT / "notebooks" / "_scratch"  # git-ignored
-PHASE6_DIR = scratch_dir / "phase6"
-PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(REPO_ROOT / "notebooks")  # %%writefile cells use paths relative to notebooks/
-if str(PHASE6_DIR) not in sys.path:
-    sys.path.insert(0, str(PHASE6_DIR))
-CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1"}
-CHILD_ENV.pop("FORCE_COLOR", None)
-
-
+UNIT_EXTRA_SOURCE = r'''
 def has_module(name: str) -> bool:
     """True if the module can be imported (checked without importing it)."""
     return importlib.util.find_spec(name) is not None
@@ -89,8 +78,6 @@ OPTIONAL_PACKAGES = {
         "gunicorn",
     )
 }
-HAS_NODE = shutil.which("node") is not None
-HAS_OPENSSL = shutil.which("openssl") is not None
 SHOP_API = start_shop_api()  # the local API from Unit 4.6
 '''
 
@@ -287,26 +274,22 @@ def _overview_cells() -> list[NotebookNode]:
             """
         ),
         code(SHOP_API_SOURCE),
-        md(
-            """
-            Unit setup, part 1: imports, the scratch folder `notebooks/_scratch/phase6/`
-            (git-ignored; `%%writefile` cells save demo apps there), flags for optional
-            packages, and `SHOP_API`, the base URL of the shop API.
-            """
-        ),
-        code(UNIT_SETUP_SOURCE),
-        md(
-            """
-            Unit setup, part 2: the error and timing helpers shared since earlier phases
-            (`raised_error_name`, `raised_message`, `interpreter_label`, `Timer`),
-            `fresh_import` (re-imports a `%%writefile` module) and `mask_dates`, which hides the
-            parts of raw HTTP output that change on every run (the `Date` header, ports).
-            """
-        ),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
-            """
-            Unit setup, part 3: the **server helpers** every Phase 6 unit uses.
+        md("Unit setup, part 1: the standard-library modules and `httpx` this unit uses:"),
+        *setup_cells(
+            "6.1",
+            UNIT_SETUP_SOURCE,
+            f"""
+            Unit setup, part 2: the **shared helpers**. Every Phase 6 unit needs the same
+            helpers, so they live in one module next to this notebook,
+            [`phase6_helpers.py`](phase6_helpers.py), instead of being pasted into each unit.
+            `from phase6_helpers import *` is the one star import of the course: a notebook
+            setup wants the same few dozen names in every unit, and the module's `__all__`
+            decides exactly which names come in (nothing else leaks). Open the file to read any
+            helper; each group was introduced by the unit in the table:
+
+            {helper_table_markdown()}
+
+            The **server helpers** are the ones every Phase 6 unit uses:
 
             | Helper | What it does |
             | --- | --- |
@@ -317,10 +300,14 @@ def _overview_cells() -> list[NotebookNode]:
 
             Server output goes to a log file in the scratch folder (a pipe nobody reads can
             fill up and freeze the server); when a server fails to start, the helper prints the
-            end of its log.
-            """
+            end of its log. `enter_phase6()` makes `notebooks/` the working directory
+            (`%%writefile` paths are relative to it) and the scratch folder
+            `notebooks/_scratch/phase6/` (git-ignored) importable. The cell also checks the
+            optional packages and starts `SHOP_API`, the base URL of the shop API:
+            """,
+            extra_source=UNIT_EXTRA_SOURCE,
+            report_source=SETUP_REPORT_SOURCE,
         ),
-        code(SERVER_HELPERS_SOURCE + "\n" + SETUP_REPORT_SOURCE),
     ]
 
 

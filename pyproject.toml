@@ -89,3 +89,6 @@ select = ["E", "W", "F", "I", "UP", "B"]
 # Notebooks keep sys.version_info guards (course convention 5) and each unit re-imports
 # what it needs so it can run on its own (convention 12).
 "notebooks/*.ipynb" = ["UP036", "F811"]
+# Phase 6 units import their shared helpers with `from phase6_helpers import *` (the module's
+# __all__ lists exactly what comes in), so names used after it come from a star import.
+"notebooks/phase6_web_fastapi.ipynb" = ["F403", "F405"]

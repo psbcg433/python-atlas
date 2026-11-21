@@ -1,11 +1,7 @@
 """Unit 6.6 — Background Jobs, Real-Time and Caching (with Lab 6.6 and Notes API v5)."""
 
+from helpers_module import setup_cells
 from nbformat import NotebookNode
-from unit_6_1 import SERVER_HELPERS_SOURCE, UNIT_SETUP_SOURCE_2  # one copy of the helpers
-from unit_6_2 import NOTES_HELPERS_SOURCE
-from unit_6_3 import NOTES_PROJECT_HELPERS_SOURCE, PRUNE_HELPER_SOURCE
-from unit_6_4 import DATABASE_HELPERS_SOURCE
-from unit_6_5 import REDIS_HELPERS_SOURCE
 
 from nb_builder import code, md, predict_cells, writefile_cells
 
@@ -32,7 +28,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import sysconfig
 import textwrap
 import time
 import urllib.request
@@ -42,7 +37,6 @@ from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
 from typing import Annotated, Any
 
 import alembic
@@ -89,24 +83,6 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", message="Call to deprecated close", category=DeprecationWarning)
 
-REPO_ROOT = find_repo_root()
-scratch_dir = REPO_ROOT / "notebooks" / "_scratch"  # git-ignored
-PHASE6_DIR = scratch_dir / "phase6"
-PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(REPO_ROOT / "notebooks")  # %%writefile cells use paths relative to notebooks/
-if str(PHASE6_DIR) not in sys.path:
-    sys.path.insert(0, str(PHASE6_DIR))
-CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1"}
-CHILD_ENV.pop("FORCE_COLOR", None)
-HAS_NODE = shutil.which("node") is not None
-HAS_UV = shutil.which("uv") is not None
-
-NOTES_API_DIR = REPO_ROOT / "projects" / "notes_api"  # the Notes API's own uv project
-NOTES_SRC = NOTES_API_DIR / "src"
-for folder in (NOTES_SRC / "notes_api", NOTES_API_DIR / "tests"):
-    folder.mkdir(parents=True, exist_ok=True)  # %%writefile does not create folders
-if str(NOTES_SRC) not in sys.path:
-    sys.path.insert(0, str(NOTES_SRC))
 """
 
 WORKER_HELPERS_SOURCE = r'''
@@ -212,37 +188,22 @@ def _overview_cells() -> list[NotebookNode]:
             | `ioredis` caching, `node-cache` | `redis.asyncio`, in-process `functools.lru_cache` / `cachetools` | a per-process cache is not shared between Uvicorn workers |
             | Stripe-style webhook signatures (`stripe.webhooks.constructEvent`) | HMAC-SHA256 over `timestamp.body` with `hmac.compare_digest` | same scheme, same replay window |
 
-            Run the setup cells first. Part 1: imports (arq, Redis, fakeredis, respx) and the
-            project folders:
+            Run the setup cells first. Part 1: the imports (arq, Redis, fakeredis, respx):
             """
         ),
-        code(UNIT_SETUP_SOURCE),
-        md("Part 2: helpers shared with Units 6.1–6.5:"),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
+        *setup_cells(
+            "6.6",
+            UNIT_SETUP_SOURCE,
             """
-            Part 3: the server, Notes API, database and Redis helpers from Units 6.1–6.5, plus
-            this unit's `worker_process(command, ready)` (starts a worker in a background
-            process, waits until `ready()` is true, **always** stops it) and `format_sse()`.
-            Docker is used for a real Redis (one container for the unit, started in 6.6.2 and
-            removed in the *Clean up* cell); without it the demos fall back to fakeredis and
-            the worker demos print skip messages:
-            """
-        ),
-        code(
-            SERVER_HELPERS_SOURCE
-            + "\n"
-            + NOTES_HELPERS_SOURCE
-            + "\n"
-            + PRUNE_HELPER_SOURCE
-            + "\n"
-            + NOTES_PROJECT_HELPERS_SOURCE
-            + "\n"
-            + DATABASE_HELPERS_SOURCE
-            + "\n"
-            + REDIS_HELPERS_SOURCE
-            + "\n"
-            + WORKER_HELPERS_SOURCE
+            Part 2: the shared helpers from [`phase6_helpers.py`](phase6_helpers.py) (server, Notes API, database and Redis
+            helpers of Units 6.1–6.5), including this unit's `worker_process(command, ready)`
+            (starts a worker in a background process, waits until `ready()` is true, **always**
+            stops it), `redis_key_exists()` and `format_sse()`. Docker is used for a real Redis
+            (one container for the unit, started in 6.6.2 and removed in the *Clean up* cell);
+            without it the demos fall back to fakeredis and the worker demos print skip
+            messages:
+            """,
+            folders="*NOTES_FOLDERS",
         ),
     ]
 
@@ -3163,14 +3124,23 @@ def _notes_v5_run_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            **Run the suite.** With the kernel's environment, the fast tests only (no
+            **Run this version's tests.** `NEW_TESTS` lists the test files v5 adds or changes
+            (the full suite runs once, in the Phase 6 Project). With the kernel's environment, the fast ones among them (no
             PostgreSQL, no real Redis):
             """
         ),
         code(
             r"""
+            NEW_TESTS = __NEW_TESTS__
             pytest_run = run_in_notes(
-                sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-m", "not postgres and not redis"
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-m",
+                "not postgres and not redis",
+                *NEW_TESTS,
             )
             print(tidy_test_output(pytest_run.stdout + pytest_run.stderr).splitlines()[-1])
             print(f"{pytest_run.returncode=}")
@@ -3178,10 +3148,9 @@ def _notes_v5_run_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            And everything as its own uv project: `uv lock` adds `arq`, then `uv run --frozen
-            pytest` runs the whole suite, including `test_postgres.py` and
-            `test_redis_worker.py`, which start (and remove) their own PostgreSQL and Redis
-            containers and run the real ARQ worker in burst mode:
+            And as its own uv project: `uv lock` adds `arq`, then `uv run --frozen pytest` runs
+            all of `NEW_TESTS`, including `test_redis_worker.py`, which starts (and removes) its
+            own Redis container and runs the real ARQ worker in burst mode:
             """
         ),
         code(
@@ -3190,9 +3159,8 @@ def _notes_v5_run_cells() -> list[NotebookNode]:
                 lock_run = run_in_notes("uv", "lock")
                 print(lock_summary(lock_run.stderr))
                 if lock_run.returncode == 0:
-                    uv_pytest = run_in_notes(
-                        "uv", "run", "--frozen", "pytest", "-p", "no:cacheprovider", "-rs", timeout=600
-                    )
+                    uv_command = ["uv", "run", "--frozen", "pytest", "-p", "no:cacheprovider", "-rs"]
+                    uv_pytest = run_in_notes(*uv_command, *NEW_TESTS, timeout=600)
                     summary = tidy_test_output(uv_pytest.stdout).splitlines()
                     print(summary[-1], f"(exit code {uv_pytest.returncode})")
                     print(*[line for line in summary if line.startswith("SKIPPED")], sep="\n")
@@ -3216,8 +3184,8 @@ def _notes_v5_run_cells() -> list[NotebookNode]:
         ),
         code(
             r"""
-            if redis_container is not None:
-                container_id = redis_container.get_wrapped_container().id
+            container_id = shared_redis_id()  # None when the unit started no container
+            if container_id is not None:
                 stop_shared_redis()
                 still_there = subprocess.run(
                     ["docker", "ps", "-aq", "--filter", f"id={container_id}"], capture_output=True, text=True

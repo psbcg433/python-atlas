@@ -1,8 +1,7 @@
 """Unit 6.3 — Dependency Injection and Application Structure (with Lab 6.3 and Notes API v2)."""
 
+from helpers_module import setup_cells
 from nbformat import NotebookNode
-from unit_6_1 import SERVER_HELPERS_SOURCE, UNIT_SETUP_SOURCE_2  # one copy of the helpers
-from unit_6_2 import NOTES_HELPERS_SOURCE
 
 from nb_builder import code, md, predict_cells, writefile_cells
 
@@ -19,7 +18,6 @@ import inspect
 import json
 import logging
 import os
-import platform
 import re
 import secrets
 import shutil
@@ -27,7 +25,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import sysconfig
 import threading
 import time
 import typing
@@ -38,7 +35,6 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from http import HTTPStatus
 from pathlib import Path
-from types import ModuleType
 from typing import Annotated, Any, Literal
 
 import fastapi
@@ -76,24 +72,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-REPO_ROOT = find_repo_root()
-scratch_dir = REPO_ROOT / "notebooks" / "_scratch"  # git-ignored
-PHASE6_DIR = scratch_dir / "phase6"
-PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(REPO_ROOT / "notebooks")  # %%writefile cells use paths relative to notebooks/
-if str(PHASE6_DIR) not in sys.path:
-    sys.path.insert(0, str(PHASE6_DIR))
-CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1"}
-CHILD_ENV.pop("FORCE_COLOR", None)
-HAS_NODE = shutil.which("node") is not None
-HAS_UV = shutil.which("uv") is not None
-
-NOTES_API_DIR = REPO_ROOT / "projects" / "notes_api"  # the Notes API's own uv project
-NOTES_SRC = NOTES_API_DIR / "src"
-for folder in (NOTES_SRC / "notes_api", NOTES_API_DIR / "tests"):
-    folder.mkdir(parents=True, exist_ok=True)  # %%writefile does not create folders
-if str(NOTES_SRC) not in sys.path:
-    sys.path.insert(0, str(NOTES_SRC))
 """
 
 PRUNE_HELPER_SOURCE = r'''
@@ -244,38 +222,25 @@ def _overview_cells() -> list[NotebookNode]:
             | Jest `jest.mock()` / NestJS `overrideProvider` | `app.dependency_overrides[original] = fake` | override the **dependency function**, not a module import |
             | Supertest | `TestClient` (sync) / `httpx.AsyncClient` + `ASGITransport` | `with TestClient(app)` runs the lifespan; without `with` it does not |
 
-            Run the setup cells first. Part 1: imports, the scratch folder and the Notes API
-            folder (with `src/` on `sys.path`):
+            Run the setup cells first. Part 1: the imports (FastAPI, Starlette,
+            pydantic-settings):
             """
         ),
-        code(UNIT_SETUP_SOURCE),
-        md(
+        *setup_cells(
+            "6.3",
+            UNIT_SETUP_SOURCE,
             """
-            Part 2: helpers shared with Units 6.1–6.2 (`raised_error_name`, `raised_message`,
-            `interpreter_label`, `Timer`, `fresh_import`, `mask_dates`):
-            """
-        ),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
-            """
-            Part 3: the server helpers (`free_port`, `background_server`, `uvicorn_server`), the
-            Notes API helpers from Unit 6.2 (`reload_notes_api`, `validation_problems`,
-            `tidy_test_output`), and four new ones: `prune_notes_project(keep)` removes files
-            of other Notes API versions before a version is written (so re-running any unit
-            gives exactly that version), `notes_tree()` prints the project layout,
-            `run_in_notes(*command)` runs a command in the project folder, `show_response()`
+            Part 2: the shared helpers from [`phase6_helpers.py`](phase6_helpers.py): the error, timing and server helpers of
+            Unit 6.1, the Notes API helpers of Unit 6.2 (`reload_notes_api`,
+            `validation_problems`, `tidy_test_output`), and the ones this unit introduces:
+            `prune_notes_project(keep)` removes files of other Notes API versions before a
+            version is written (so re-running any unit gives exactly that version),
+            `notes_tree()` prints the project layout, `run_in_notes(*command)` runs a command in
+            the project folder, `lock_summary()` condenses `uv lock` output, `show_response()`
             prints a response compactly, and `temporary_env(**variables)` sets environment
             variables for one `with` block:
-            """
-        ),
-        code(
-            SERVER_HELPERS_SOURCE
-            + "\n"
-            + NOTES_HELPERS_SOURCE
-            + "\n"
-            + PRUNE_HELPER_SOURCE
-            + "\n"
-            + NOTES_PROJECT_HELPERS_SOURCE
+            """,
+            folders="*NOTES_FOLDERS",
         ),
     ]
 
@@ -6565,6 +6530,7 @@ def _notes_v2_intro_cells() -> list[NotebookNode]:
         ),
         md("The version moves to 0.2.0; `core/` gets a package marker:"),
         code(NOTES_V2_INIT_PY),
+        md("`core/` becomes a package (settings, errors, middleware and the lifespan live there):"),
         code(NOTES_V2_CORE_INIT_PY),
     ]
 
@@ -6774,6 +6740,7 @@ def _notes_v2_http_cells() -> list[NotebookNode]:
         ),
         md("The routers package and the health router:"),
         code(NOTES_V2_ROUTERS_INIT_PY),
+        md("The health router: an unversioned `/health` liveness probe:"),
         code(NOTES_V2_ROUTERS_HEALTH_PY),
         md(
             """
@@ -6830,8 +6797,11 @@ def _notes_v2_http_cells() -> list[NotebookNode]:
         ),
         md("The templates: a layout, the page, the list fragment and one note:"),
         code(NOTES_V2_TEMPLATES_BASE_HTML),
+        md("The page: the new-note form, the HTMX search box and the list:"),
         code(NOTES_V2_TEMPLATES_INDEX_HTML),
+        md("The list fragment, which HTMX swaps in after a search:"),
         code(NOTES_V2_TEMPLATES_NOTES_HTML),
+        md("One note, with a pin button that replaces only this item:"),
         code(NOTES_V2_TEMPLATES_NOTE_HTML),
         md("The stylesheet `StaticFiles` serves:"),
         code(NOTES_V2_STATIC_STYLE_CSS),
@@ -6873,6 +6843,7 @@ def _notes_v2_test_cells() -> list[NotebookNode]:
                 ),
             ],
         ),
+        md("`tests/helpers.py`: small functions the test modules share (create a note, list ids):"),
         code(NOTES_V2_TESTS_HELPERS_PY),
         md("The v1 behaviour tests, moved to `/api/v1` and Problem Details:"),
         *writefile_cells(
@@ -7012,13 +6983,15 @@ def _notes_v2_run_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            **Run the suite** with the kernel's environment (the root project has the same
-            packages):
+            **Run this version's tests** with the kernel's environment (the root project has the
+            same packages). Each unit runs only the test files its version adds or changes
+            (`NEW_TESTS`; in v2 that is every test file); the full suite runs once, in the Phase 6 Project:
             """
         ),
         code(
             r"""
-            pytest_run = run_in_notes(sys.executable, "-m", "pytest", "-p", "no:cacheprovider")
+            NEW_TESTS = __NEW_TESTS__
+            pytest_run = run_in_notes(sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *NEW_TESTS)
             print(tidy_test_output(pytest_run.stdout + pytest_run.stderr).splitlines()[-1])
             print(f"{pytest_run.returncode=}")
             """
@@ -7026,7 +6999,7 @@ def _notes_v2_run_cells() -> list[NotebookNode]:
         md(
             """
             And as its own uv project: `uv lock` adds `pydantic-settings` and `respx` to
-            `projects/notes_api/uv.lock`, and `uv run --frozen pytest` runs the suite in the
+            `projects/notes_api/uv.lock`, and `uv run --frozen pytest` runs the same tests in the
             project's own `.venv`:
             """
         ),
@@ -7036,7 +7009,9 @@ def _notes_v2_run_cells() -> list[NotebookNode]:
                 lock_run = run_in_notes("uv", "lock")
                 print(lock_summary(lock_run.stderr))
                 if lock_run.returncode == 0:
-                    uv_pytest = run_in_notes("uv", "run", "--frozen", "pytest", "-p", "no:cacheprovider")
+                    uv_pytest = run_in_notes(
+                        "uv", "run", "--frozen", "pytest", "-p", "no:cacheprovider", *NEW_TESTS
+                    )
                     print(
                         tidy_test_output(uv_pytest.stdout).splitlines()[-1],
                         f"(exit code {uv_pytest.returncode})",

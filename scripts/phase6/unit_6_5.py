@@ -1,10 +1,7 @@
 """Unit 6.5 — Authentication, Authorization and Security (with Lab 6.5 and Notes API v4)."""
 
+from helpers_module import setup_cells
 from nbformat import NotebookNode
-from unit_6_1 import SERVER_HELPERS_SOURCE, UNIT_SETUP_SOURCE_2  # one copy of the helpers
-from unit_6_2 import NOTES_HELPERS_SOURCE
-from unit_6_3 import NOTES_PROJECT_HELPERS_SOURCE, PRUNE_HELPER_SOURCE
-from unit_6_4 import DATABASE_HELPERS_SOURCE
 
 from nb_builder import code, md, predict_cells, writefile_cells
 
@@ -34,7 +31,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import sysconfig
 import textwrap
 import time
 import urllib.parse
@@ -42,7 +38,6 @@ import urllib.request
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import ModuleType
 from typing import Annotated, Any
 
 import alembic
@@ -79,24 +74,6 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, Validati
 from sqlalchemy import event, text
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 
-REPO_ROOT = find_repo_root()
-scratch_dir = REPO_ROOT / "notebooks" / "_scratch"  # git-ignored
-PHASE6_DIR = scratch_dir / "phase6"
-PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(REPO_ROOT / "notebooks")  # %%writefile cells use paths relative to notebooks/
-if str(PHASE6_DIR) not in sys.path:
-    sys.path.insert(0, str(PHASE6_DIR))
-CHILD_ENV = {**os.environ, "PYTHON_COLORS": "0", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1"}
-CHILD_ENV.pop("FORCE_COLOR", None)
-HAS_NODE = shutil.which("node") is not None
-HAS_UV = shutil.which("uv") is not None
-
-NOTES_API_DIR = REPO_ROOT / "projects" / "notes_api"  # the Notes API's own uv project
-NOTES_SRC = NOTES_API_DIR / "src"
-for folder in (NOTES_SRC / "notes_api", NOTES_API_DIR / "tests"):
-    folder.mkdir(parents=True, exist_ok=True)  # %%writefile does not create folders
-if str(NOTES_SRC) not in sys.path:
-    sys.path.insert(0, str(NOTES_SRC))
 """
 
 REDIS_HELPERS_SOURCE = r'''
@@ -124,6 +101,11 @@ def start_shared_redis() -> str | None:
         atexit.register(stop_shared_redis)  # testcontainers' Ryuk reaper only covers crashes
     host = redis_container.get_container_host_ip()
     return f"redis://{host}:{redis_container.get_exposed_port(6379)}/0"
+
+
+def shared_redis_id() -> str | None:
+    """The Docker id of the unit's Redis container, or None when none is running."""
+    return None if redis_container is None else redis_container.get_wrapped_container().id
 
 
 def make_redis(url: str | None) -> Any:
@@ -186,34 +168,23 @@ def _overview_cells() -> list[NotebookNode]:
             | `express-rate-limit` + `rate-limit-redis` | a Redis limiter dependency raising 429 | same algorithms (fixed / sliding window, token bucket) |
             | Jest + Supertest auth tests | pytest + `TestClient` with headers / cookies | `dependency_overrides` can swap the whole auth graph in tests |
 
-            Run the setup cells first. Part 1: imports (pwdlib, PyJWT, cryptography, fakeredis,
-            respx) and the project folders:
+            Run the setup cells first. Part 1: the imports (pwdlib, PyJWT, cryptography,
+            fakeredis, respx):
             """
         ),
-        code(UNIT_SETUP_SOURCE),
-        md("Part 2: helpers shared with Units 6.1–6.4:"),
-        code(UNIT_SETUP_SOURCE_2),
-        md(
+        *setup_cells(
+            "6.5",
+            UNIT_SETUP_SOURCE,
             """
-            Part 3: the server, Notes API and database helpers from Units 6.1–6.4, plus this
-            unit's Redis helpers: `start_shared_redis()` starts **one** Redis testcontainer for
-            the unit (stopped in the *Clean up* cell and by an `atexit` hook),
-            `make_redis(url)` returns a client for it or an in-memory fakeredis when Docker is
-            missing, and `fast_hasher()` is Argon2id with cheap parameters for demos:
-            """
-        ),
-        code(
-            SERVER_HELPERS_SOURCE
-            + "\n"
-            + NOTES_HELPERS_SOURCE
-            + "\n"
-            + PRUNE_HELPER_SOURCE
-            + "\n"
-            + NOTES_PROJECT_HELPERS_SOURCE
-            + "\n"
-            + DATABASE_HELPERS_SOURCE
-            + "\n"
-            + REDIS_HELPERS_SOURCE
+            Part 2: the shared helpers from [`phase6_helpers.py`](phase6_helpers.py) (server, Notes API and database helpers of
+            Units 6.1–6.4), including this unit's Redis helpers: `start_shared_redis()` starts
+            **one** Redis testcontainer for the unit (stopped in the *Clean up* cell and by an
+            `atexit` hook; `shared_redis_id()` gives its id), `make_redis(url)` returns a client
+            for it or an in-memory fakeredis
+            when Docker is missing, and `fast_hasher()` is Argon2id with cheap parameters for
+            demos:
+            """,
+            folders="*NOTES_FOLDERS",
         ),
     ]
 
@@ -2480,6 +2451,29 @@ def _injection_cells() -> list[NotebookNode]:
         ),
         md(
             """
+            The two headers that matter most, in full, as a client receives them over HTTPS
+            (browsers ignore HSTS on a plain-HTTP response, so the test client asks for
+            `https://testserver`), split into their parts:
+            """
+        ),
+        code(
+            r"""
+            with TestClient(headers_app, base_url="https://testserver") as client:
+                secured = client.get("/ping")
+            hsts = secured.headers["Strict-Transport-Security"]
+            csp = secured.headers["Content-Security-Policy"]
+            max_age_days = int(re.search(r"max-age=(\d+)", hsts)[1]) // 86_400
+            subdomains = "includesubdomains" in hsts.lower()
+            print(f"Strict-Transport-Security: {hsts}")
+            print(f"  -> HTTPS only for {max_age_days} days; subdomains too: {subdomains}")
+            print(f"Content-Security-Policy: {csp}")
+            for directive in csp.split(";"):
+                name, *sources = directive.split()
+                print(f"  {name:16} {' '.join(sources)}")
+            """
+        ),
+        md(
+            """
             **Secret management**
 
             | Do | Don't |
@@ -3873,14 +3867,16 @@ def _notes_v4_run_cells() -> list[NotebookNode]:
             (The successful login was the first attempt for this address and e-mail, so the
             fifth wrong password is the sixth attempt and gets the 429.)
 
-            **Run the suite.** With the kernel's environment, the fast tests only
+            **Run this version's tests.** `NEW_TESTS` lists the test files v4 adds or changes
+            (the full suite runs once, in the Phase 6 Project). With the kernel's environment, the fast ones among them
             (`-m "not postgres"`: SQLite and fakeredis):
             """
         ),
         code(
             r"""
+            NEW_TESTS = __NEW_TESTS__
             pytest_run = run_in_notes(
-                sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-m", "not postgres"
+                sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-m", "not postgres", *NEW_TESTS
             )
             print(tidy_test_output(pytest_run.stdout + pytest_run.stderr).splitlines()[-1])
             print(f"{pytest_run.returncode=}")
@@ -3888,9 +3884,9 @@ def _notes_v4_run_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            And the whole suite as its own uv project: `uv lock` adds `pwdlib`, `pyjwt` and
-            `redis` to `projects/notes_api/uv.lock`, then `uv run --frozen pytest` runs every
-            test, including the PostgreSQL tests in their own container:
+            And as its own uv project: `uv lock` adds `pwdlib`, `pyjwt` and `redis` to
+            `projects/notes_api/uv.lock`, then `uv run --frozen pytest` runs all of `NEW_TESTS`,
+            including the PostgreSQL tests in their own container:
             """
         ),
         code(
@@ -3899,7 +3895,9 @@ def _notes_v4_run_cells() -> list[NotebookNode]:
                 lock_run = run_in_notes("uv", "lock")
                 print(lock_summary(lock_run.stderr))
                 if lock_run.returncode == 0:
-                    uv_pytest = run_in_notes("uv", "run", "--frozen", "pytest", "-p", "no:cacheprovider", "-rs")
+                    uv_pytest = run_in_notes(
+                        "uv", "run", "--frozen", "pytest", "-p", "no:cacheprovider", "-rs", *NEW_TESTS
+                    )
                     summary = tidy_test_output(uv_pytest.stdout).splitlines()
                     print(summary[-1], f"(exit code {uv_pytest.returncode})")
                     print(*[line for line in summary if line.startswith("SKIPPED")], sep="\n")
@@ -3923,8 +3921,8 @@ def _notes_v4_run_cells() -> list[NotebookNode]:
         ),
         code(
             r"""
-            if redis_container is not None:
-                container_id = redis_container.get_wrapped_container().id
+            container_id = shared_redis_id()  # None when the unit started no container
+            if container_id is not None:
                 stop_shared_redis()
                 still_there = subprocess.run(
                     ["docker", "ps", "-aq", "--filter", f"id={container_id}"], capture_output=True, text=True
