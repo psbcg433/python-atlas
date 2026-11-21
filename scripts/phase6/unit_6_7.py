@@ -2246,7 +2246,7 @@ def _notes_v6_intro_cells() -> list[NotebookNode]:
             | `/health`, `/health/ready` (database) | `/health/live`, `/health/ready` (database + Redis, timeouts), `/health/startup` (migration revision) |
             | contract drift | fixed: problem+json documented, strict request JSON, non-nullable PATCH fields, `{note_id:int}`, id limits, a correct `Allow` header |
 
-            The cells write the 32 files that changed (of 86) plus the workflow; the OpenAPI
+            The cells write the 32 files that changed (of 90) plus the workflow; the OpenAPI
             snapshot is recorded by running its test. First, remove files of other versions
             (including the deployment files of Unit 6.8, when you re-run this section later):
             """
@@ -2281,6 +2281,7 @@ def _notes_v6_intro_cells() -> list[NotebookNode]:
             tests/test_observability.py tests/test_pages.py tests/test_pagination.py tests/test_postgres.py
             tests/test_postgres_rollback.py tests/test_realtime.py tests/test_redis_worker.py
             tests/test_repository.py tests/test_security.py tests/test_settings.py tests/test_worker.py
+            src/notes_api/manage.py src/notes_api/netguard.py tests/test_limits.py tests/test_netguard.py
             """.split()
             print("removed:", prune_notes_project(NOTES_V6_FILES))
             V7_ONLY = ["Dockerfile", ".dockerignore", "Procfile", "deploy", "load"]  # outside prune's areas
@@ -2889,11 +2890,11 @@ def _notes_v6_observability_cells() -> list[NotebookNode]:
                 ),
                 (
                     "async def database_revision(request: Request) -> str | None:",
-                    "Part 2: `database_revision()`, `report()`, `ready()` — SELECT 1, then the Alembic revision (None when the table does not exist).",
+                    "Part 2: `database_revision()`, `report()`, `ready()` — SELECT 1, then the Alembic revision (None when the table does not exist); a failed check reports only `unavailable` (the exception goes to the log, not to whoever calls the probe).",
                 ),
                 (
                     '@router.get("/health/startup")',
-                    "Part 3: `startup()` — Startup probe: the schema is migrated to SCHEMA_REVISION (when the check is enabled).",
+                    "Part 3: `startup()`, `migration_state()` — the schema must be at SCHEMA_REVISION **or newer**: after a rollback the database keeps the newer release's migrations (expand/contract), and the old code must still start.",
                 ),
             ],
         ),
@@ -2984,7 +2985,7 @@ def _notes_v6_api_cells() -> list[NotebookNode]:
                     "Part 2: `NOT_FOUND`, `WRITE_ERRORS`, `AUTH_ERRORS`, `CACHE_CONTROL`, `router`, ... — A strong validator: the version changes on every update.",
                 ),
                 (
-                    '@router.post("", response_model=NoteRead, status_code=status.HTTP_201_CREATED)',
+                    '@router.post(\n    "",\n    response_model=NoteRead,',
                     "Part 3: `create_note()`, `list_notes()` — Create a note; the Location header points at it.",
                 ),
                 (
@@ -2992,12 +2993,16 @@ def _notes_v6_api_cells() -> list[NotebookNode]:
                     "Part 4: `notes_feed()`, `get_note()` — Newest notes first, with keyset (cursor) pagination.",
                 ),
                 (
-                    '@router.put("/{note_id:int}", response_model=NoteRead, responses=WRITE_ERRORS)',
-                    "Part 5: `replace_note()`, `update_note()` — Replace every field of a note (omitted fields get their defaults).",
+                    '@router.put(\n    "/{note_id:int}",',
+                    "Part 5: `replace_note()` — Replace every field of a note (omitted fields get their defaults).",
                 ),
                 (
-                    '@router.delete("/{note_id:int}", status_code=status.HTTP_204_NO_CONTENT, responses=NOT_FOUND)',
-                    "Part 6: `delete_note()`, `note_links()` — Delete a note.",
+                    '@router.patch(\n    "/{note_id:int}",',
+                    "Part 6: `update_note()` — change only the fields sent; a stale `version` is a 409. Like every write, it spends the caller's write budget.",
+                ),
+                (
+                    '@router.delete(\n    "/{note_id:int}",',
+                    "Part 7: `delete_note()`, `note_links()` — Delete a note; link previews have their own, smaller budget.",
                 ),
             ],
         ),
@@ -3044,11 +3049,19 @@ def _notes_v6_api_cells() -> list[NotebookNode]:
                 ),
                 (
                     "def get_login_limiter(redis: RedisDep, settings: SettingsDep) -> FixedWindowRateLimiter:",
-                    "Part 6: `get_login_limiter()`, `LoginLimiterDep`, `get_oidc_client()`, `OidcClientDep`, `get_cookie_principal()`, ... — The login/registration rate limiter (shared by every worker through Redis).",
+                    "Part 6: `get_login_limiter()`, `LoginLimiterDep` — The login/registration rate limiter (shared by every worker through Redis).",
+                ),
+                (
+                    "def per_user_limit(bucket: str, scopes: list[str]) -> Any:",
+                    "Part 7: `per_user_limit()` and the route dependencies built with it (OWASP API4). The inner `enforce()` asks for the principal with the route's own scopes: FastAPI caches a dependency per function and scopes, so the limiter adds no second token check.",
+                ),
+                (
+                    "def get_oidc_client(settings: SettingsDep, client: HttpClientDep, redis: RedisDep) -> OidcClient:",
+                    "Part 8: `get_oidc_client()`, `OidcClientDep`, `get_cookie_principal()`, `CookiePrincipalDep`, `get_queue()` — The OpenID Connect client (the router checks settings.oauth_enabled first).",
                 ),
                 (
                     "def get_mailer() -> Mailer:",
-                    "Part 7: `get_mailer()`, `get_note_cache()`, `QueueDep`, `MailerDep`, `NoteCacheDep`, ... — Where emails go (tests override it with a fake that records messages).",
+                    "Part 9: `get_mailer()`, `get_note_cache()`, `QueueDep`, `MailerDep`, `NoteCacheDep`, ... — Where emails go (tests override it with a fake that records messages).",
                 ),
             ],
         ),
@@ -3072,11 +3085,11 @@ def _notes_v6_api_cells() -> list[NotebookNode]:
                 ),
                 (
                     "    async def import_notes(self, notes: list[NoteCreate]) -> list[Note]:",
-                    "Part 4 (continues `NoteService`): `import_notes()`; then `parse_import()`, `resolve_host()`, `is_public_address()` — Notes from a .json list or a .csv file (title, body, tags separated by ';', pinned).",
+                    "Part 4 (continues `NoteService`): `import_notes()`; then `parse_import()` — Notes from a .json list or a .csv file (title, body, tags separated by ';', pinned).",
                 ),
                 (
                     "class LinkPreviewer:",
-                    "Part 5: `LinkPreviewer` — Fetch the <title> of links in a note, refusing anything that is not a public web URL.",
+                    "Part 5: `LinkPreviewer` — Fetch the <title> of links in a note, refusing anything that is not a public web URL; the checks now live in `netguard.py`.",
                 ),
                 (
                     "    async def preview(self, url: str) -> LinkPreview:",
@@ -3099,7 +3112,7 @@ def _notes_v6_api_cells() -> list[NotebookNode]:
                 ),
                 (
                     "async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:",
-                    "Part 4: `deliver_webhook()` — POST one signed event; retry with exponential backoff; dead-letter after the last try.",
+                    "Part 4: `deliver_webhook()` — check the URL again (DNS may have changed since it was saved; a blocked URL is dead-lettered at once), POST one signed event through the public-only client, retry with exponential backoff, dead-letter after the last try.",
                 ),
                 (
                     "async def export_notes(",
@@ -3110,7 +3123,7 @@ def _notes_v6_api_cells() -> list[NotebookNode]:
                     "Part 6: `purge_expired_tokens()`, `WorkerSettings` — Daily: delete refresh tokens that expired more than a day ago (one worker at a time).",
                 ),
                 (
-                    "async def run_worker(burst: bool = False, settings: Settings | None = None) -> None:",
+                    "async def run_worker(",
                     "Part 7: `run_worker()` — Build the arq Worker inside a running event loop and run it (SIGTERM stops it cleanly).",
                 ),
             ],
@@ -3143,7 +3156,7 @@ def _notes_v6_test_cells() -> list[NotebookNode]:
                 ),
                 (
                     "@pytest.fixture\ndef anonymous(app: FastAPI) -> Iterator[TestClient]:",
-                    "Part 4: `anonymous()`, `client()`, `admin_headers()`, `async_client()` — A TestClient without credentials; entering it runs the lifespan.",
+                    "Part 4: `anonymous()`, `client()`, `admin_email()`, `admin_headers()`, `async_client()` — A TestClient without credentials; entering it runs the lifespan.",
                 ),
                 (
                     "async def async_auth_headers(http: httpx.AsyncClient, email: str) -> dict[str, str]:",
@@ -3167,15 +3180,19 @@ def _notes_v6_test_cells() -> list[NotebookNode]:
                 ),
                 (
                     "def register(client: TestClient, email: str, password: str = PASSWORD) -> Any:",
-                    "Part 2: `register()`, `login()`, `auth_headers()`, `fake_resolver()` — POST /auth/register (without the client's default credentials).",
+                    "Part 2: `register()`, `login()`, `auth_headers()`, `promote()` — POST /auth/register (without the client's default credentials), log in, and promote an account the way an operator does (`notes_api.manage.set_role`).",
+                ),
+                (
+                    "async def fake_resolver(host: str) -> list[str]:",
+                    "Part 3: `fake_resolver()` — DNS for tests: IP literals resolve to themselves, a few names to fixed addresses.",
                 ),
                 (
                     "async def create_tables(settings: Settings) -> None:",
-                    "Part 3: `create_tables()`, `FakeMailer`, `PROJECT_DIR`, `POSTGRES_IMAGE`, `REDIS_IMAGE`, ... — CREATE TABLE for every model (fast; the PostgreSQL tests run the Alembic migrations).",
+                    "Part 4: `create_tables()`, `FakeMailer`, `PROJECT_DIR`, `POSTGRES_IMAGE`, `REDIS_IMAGE`, ... — CREATE TABLE for every model (fast; the PostgreSQL tests run the Alembic migrations).",
                 ),
                 (
                     "def postgres_alembic_config(url: str) -> Config:",
-                    "Part 4: `postgres_alembic_config()` — alembic.ini pointed at a PostgreSQL URL.",
+                    "Part 5: `postgres_alembic_config()` — alembic.ini pointed at a PostgreSQL URL.",
                 ),
             ],
         ),
@@ -3266,15 +3283,19 @@ def _notes_v6_test_cells() -> list[NotebookNode]:
                 ),
                 (
                     "def test_readiness_fails_when_redis_is_down(client: TestClient, app: FastAPI) -> None:",
-                    "Part 4: `test_readiness_fails_when_redis_is_down()`, `test_startup_waits_for_migrations()` — 503 with the failing check named; liveness stays 200.",
+                    "Part 4: `test_readiness_fails_when_redis_is_down()`, `test_startup_waits_for_migrations()` — 503 with the failing check named (only `unavailable`, no exception name); liveness stays 200.",
+                ),
+                (
+                    '@pytest.mark.parametrize(\n    ("revision", "status_code", "migrations"),',
+                    "Part 5: `test_startup_accepts_a_newer_schema()`, `test_production_publishes_no_schema()` — a database ahead of the code (a rolled-back release migrated it) is ready, one behind is not; production serves no schema at all.",
                 ),
                 (
                     '@pytest.mark.skipif(importlib.util.find_spec("sentry_sdk") is None, reason="sentry-sdk missing")',
-                    "Part 5: `test_sentry_captures_errors_without_secrets()` — An unhandled error reaches Sentry's transport, with the Authorization header scrubbed.",
+                    "Part 6: `test_sentry_captures_errors_without_secrets()` — An unhandled error reaches Sentry's transport, with the Authorization header scrubbed.",
                 ),
                 (
                     "    transport = CapturingTransport()",
-                    "Part 6 (continues `test_sentry_captures_errors_without_secrets()`): the rest of it.",
+                    "Part 7 (continues `test_sentry_captures_errors_without_secrets()`): the rest of it.",
                 ),
             ],
         ),
@@ -3470,8 +3491,6 @@ NOTES_REDIS_URL=redis://localhost:6379/0
 NOTES_JWT_SECRET=change-me
 NOTES_ACCESS_TOKEN_MINUTES=15
 NOTES_REFRESH_TOKEN_DAYS=14
-# Accounts registered with these addresses become admins (JSON list).
-NOTES_ADMIN_EMAILS=[]
 NOTES_LOGIN_RATE_LIMIT=5
 NOTES_LOGIN_RATE_WINDOW_SECONDS=60
 # Set to false only for plain-HTTP local development (the session cookie needs HTTPS otherwise).
@@ -3537,7 +3556,8 @@ docker compose down                           # add -v to delete the data volume
 ```
 
 Local plain HTTP: set `NOTES_COOKIE_SECURE=false`, or the browser will not send the session
-cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
+cookie. Every account starts as an ordinary user; promote one with
+`uv run python -m notes_api.manage promote-admin <email>` (a command, never an HTTP request).
 
 Observability: every log line is JSON with `request_id`, `trace_id` and `span_id`
 (`NOTES_LOG_JSON=false` for console output); Prometheus scrapes `GET /metrics`;
@@ -3562,7 +3582,7 @@ testcontainers only when those are not set.
 | `POST` | `/api/v1/auth/refresh` | refresh token | rotation: each refresh token works once; reuse revokes the family |
 | `POST` | `/api/v1/auth/logout` | refresh token (+ bearer) | revokes the family and denies the access token |
 | `GET` | `/api/v1/auth/oauth/login`, `/oauth/callback` | none | OpenID Connect (Authorization Code + PKCE); 404 unless configured |
-| `GET` | `/api/v1/users/me` | bearer or key | the current user |
+| `GET/DELETE` | `/api/v1/users/me` | bearer or key | the current user; DELETE removes the account and everything it owns |
 | `POST/GET/DELETE` | `/api/v1/users/me/api-keys[/{id}]` | bearer | keys are shown once, stored as SHA-256, limited to scopes |
 | `POST/GET` | `/api/v1/notes` | `notes:write` / `notes:read` | only the caller's notes |
 | `GET` | `/api/v1/notes/feed` | `notes:read` | keyset pagination |
@@ -3571,7 +3591,7 @@ testcontainers only when those are not set.
 | `GET/PUT/DELETE` | `/api/v1/users/me/webhook` | bearer | a public URL; PUT returns the signing secret once |
 | `POST` | `/api/v1/exports` | any user | 202 + `Location`; an ARQ job builds the export |
 | `GET` | `/api/v1/exports/{id}`, `/download`, `/events` | owner | status, JSON file, `text/event-stream` progress (`Last-Event-ID`) |
-| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth |
+| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth or over 5 sockets per user |
 | `POST/GET/DELETE` | `/api/v1/admin/import`, `/export`, `/notes` | admin role + `admin` scope | bulk operations |
 | `GET/POST` | `/api/v1/admin/cache-stats`, `/webhooks/dead[/{id}/retry]` | admin | cache hit rate; dead-letter list and replay |
 | `GET/POST` | `/login`, `/logout`, `/`, `/notes`, `/notes/{id}/pin` | session cookie + CSRF token | HTML (Jinja2 + HTMX) |
@@ -3580,7 +3600,8 @@ Credentials: `Authorization: Bearer <access token>` or `X-API-Key: nk_...`. Erro
 `application/problem+json` (RFC 9457). Every response carries `X-Request-ID`,
 `Server-Timing` and security headers (HSTS, CSP, `X-Content-Type-Options`, `X-Frame-Options`).
 `GET /api/v1/notes/{id}` sends `ETag` and `Cache-Control: private, no-cache` and answers
-`If-None-Match` with 304. Webhooks carry `X-Notes-Event-Id` and
+`If-None-Match` with 304. Per-user budgets (429 + `Retry-After`): 120 writes, 10 link-preview
+calls and 5 exports a minute (`NOTES_WRITE_RATE_LIMIT` etc.). Webhooks carry `X-Notes-Event-Id` and
 `X-Notes-Signature: t=<unix time>,v1=<HMAC-SHA256 of "t.body">`.
 
 
@@ -3754,7 +3775,6 @@ class Settings(BaseSettings):
     refresh_token_days: int = Field(default=14, ge=1)
     password_time_cost: int = Field(default=3, ge=1)  # Argon2id parameters (tests lower them)
     password_memory_kib: int = Field(default=65_536, ge=32)  # Argon2 needs 8 KiB per lane (4)
-    admin_emails: list[str] = []  # these addresses get the admin role when they register
     login_rate_limit: int = Field(default=5, ge=1)  # attempts per window, per IP + email
     login_rate_window_seconds: int = Field(default=60, ge=1)
     cookie_secure: bool = True  # session cookie only over HTTPS (False for local HTTP)
@@ -3773,6 +3793,13 @@ class Settings(BaseSettings):
     webhook_max_attempts: int = Field(default=5, ge=1)  # then the event is dead-lettered
     cache_ttl_seconds: int = Field(default=60, ge=1)
     ws_heartbeat_seconds: float = Field(default=20.0, gt=0)
+    ws_connections_per_user: int = Field(default=5, ge=1)  # open sockets per user, all replicas
+
+    # Per-user budgets per window on expensive routes (OWASP API4); a 429 when one is spent
+    write_rate_limit: int = Field(default=120, ge=1)  # note, key and webhook writes; admin actions
+    link_preview_rate_limit: int = Field(default=10, ge=1)  # each call fetches up to 5 URLs
+    export_rate_limit: int = Field(default=5, ge=1)  # POST /exports and GET /admin/export
+    user_rate_window_seconds: int = Field(default=60, ge=1)
     export_ttl_seconds: int = Field(default=3600, ge=60)
 
     # Observability (Unit 6.7)
@@ -4425,6 +4452,7 @@ from fastapi import FastAPI
 from notes_api import __version__
 from notes_api.core.config import Settings
 from notes_api.db import create_engine_from_settings, make_session_factory
+from notes_api.netguard import public_only_client
 
 
 @asynccontextmanager
@@ -4440,13 +4468,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The ARQ client (bytes, pickled jobs) for enqueuing background work; lazy as well
     app.state.queue = ArqRedis.from_url(settings.redis_url.get_secret_value())
     try:
-        async with httpx.AsyncClient(
-            timeout=settings.http_timeout_seconds,
-            follow_redirects=False,  # a redirect could lead a server-side fetch somewhere private
-            headers={"User-Agent": f"notes-api/{__version__}"},
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        ) as http_client:
-            app.state.http_client = http_client
+        async with (
+            httpx.AsyncClient(
+                timeout=settings.http_timeout_seconds,
+                follow_redirects=False,  # a redirect could lead a fetch somewhere private
+                headers={"User-Agent": f"notes-api/{__version__}"},
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            ) as http_client,
+            public_only_client(
+                settings.http_timeout_seconds, f"notes-api/{__version__}"
+            ) as outbound_client,
+        ):
+            app.state.http_client = http_client  # configured endpoints (the OIDC provider)
+            app.state.outbound_client = outbound_client  # user-supplied URLs (link previews)
             yield
     finally:
         await app.state.queue.aclose()
@@ -4476,7 +4510,8 @@ from sqlalchemy.types import TypeDecorator
 from notes_api.core.config import Settings
 
 # Predictable constraint names, so Alembic can find (and drop) them later.
-SCHEMA_REVISION = "0006"  # the Alembic revision this code expects (/health/startup checks it)
+SCHEMA_REVISIONS = ("0001", "0002", "0003", "0004", "0005", "0006")  # this code's migrations
+SCHEMA_REVISION = SCHEMA_REVISIONS[-1]  # the revision it expects (/health/startup checks it)
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -4550,19 +4585,23 @@ NOTES_V6_ROUTERS_HEALTH_PY = r'''
 - /health and /health/live: liveness. The process answers; no dependency is touched, so a
   database outage never makes the orchestrator restart every API process.
 - /health/ready: readiness. The database and Redis answer; until then, send no traffic here.
-- /health/startup: startup. The database schema is at the revision this code needs.
+- /health/startup: startup. The database schema is at the revision this code needs, or newer.
+
+Probe answers are public, so a failed check says only "unavailable"; the reason goes to the log.
 """
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from notes_api.db import SCHEMA_REVISION
+from notes_api.db import SCHEMA_REVISION, SCHEMA_REVISIONS
 from notes_api.dependencies import RedisDep, SettingsDep
 
 router = APIRouter(tags=["health"])
+logger = logging.getLogger("notes_api.health")
 CHECK_TIMEOUT_SECONDS = 2.0
 
 
@@ -4604,28 +4643,38 @@ async def ready(request: Request, redis: RedisDep) -> JSONResponse:
     try:
         await database_revision(request)
         checks["database"] = "ok"
-    except Exception as error:
-        checks["database"] = f"unavailable: {type(error).__name__}"
+    except Exception:
+        logger.warning("readiness: database check failed", exc_info=True)
+        checks["database"] = "unavailable"
     try:
         async with asyncio.timeout(CHECK_TIMEOUT_SECONDS):
             await redis.ping()
         checks["redis"] = "ok"
-    except Exception as error:
-        checks["redis"] = f"unavailable: {type(error).__name__}"
+    except Exception:
+        logger.warning("readiness: redis check failed", exc_info=True)
+        checks["redis"] = "unavailable"
     return report(checks)
 
 
 @router.get("/health/startup")
 async def startup(request: Request, settings: SettingsDep) -> JSONResponse:
-    """Startup probe: the schema is migrated to SCHEMA_REVISION (when the check is enabled)."""
+    """Startup probe: the schema is at SCHEMA_REVISION or newer (when the check is enabled)."""
     try:
         revision = await database_revision(request)
-    except Exception as error:
-        return report({"database": f"unavailable: {type(error).__name__}"})
+    except Exception:
+        logger.warning("startup: database check failed", exc_info=True)
+        return report({"database": "unavailable"})
     if not settings.check_migrations:
         return report({"database": "ok", "migrations": "ok"})
-    migrations = "ok" if revision == SCHEMA_REVISION else f"at {revision}, need {SCHEMA_REVISION}"
-    return report({"database": "ok", "migrations": migrations})
+    return report({"database": "ok", "migrations": migration_state(revision)})
+
+
+def migration_state(revision: str | None) -> str:
+    """Ok at this code's revision or at one it does not know (a newer release migrated, then
+    was rolled back: expand/contract keeps this code working); else what is missing."""
+    if revision == SCHEMA_REVISION or (revision is not None and revision not in SCHEMA_REVISIONS):
+        return "ok"
+    return f"at {revision}, need {SCHEMA_REVISION}"
 '''
 
 NOTES_V6_MAIN_PY = r'''
@@ -4734,6 +4783,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="Built step by step in Phase 6 of the course. Errors are RFC 9457 problems.",
         debug=settings.debug,
         lifespan=lifespan,
+        openapi_url=None if settings.environment == "production" else "/openapi.json",
         docs_url=None if settings.environment == "production" else "/docs",
         redoc_url=None if settings.environment == "production" else "/redoc",
         generate_unique_id_function=operation_id,
@@ -5043,6 +5093,8 @@ from fastapi import APIRouter, BackgroundTasks, Header, Path, Query, Request, Re
 
 from notes_api.core.errors import PROBLEM_JSON, ProblemDetail
 from notes_api.dependencies import (
+    LINK_PREVIEW_LIMIT,
+    NOTE_WRITE_LIMIT,
     LinkPreviewerDep,
     NoteCacheDep,
     QueueDep,
@@ -5106,7 +5158,12 @@ def after_write(background: BackgroundTasks, queue: Any, cache: Any, note_id: in
     background.add_task(kick_relay, queue)
 
 
-@router.post("", response_model=NoteRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=NoteRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def create_note(
     note: NoteCreate,
     service: WriterServiceDep,
@@ -5170,7 +5227,12 @@ async def get_note(
     return note
 
 
-@router.put("/{note_id:int}", response_model=NoteRead, responses=WRITE_ERRORS)
+@router.put(
+    "/{note_id:int}",
+    response_model=NoteRead,
+    responses=WRITE_ERRORS,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def replace_note(
     note_id: NoteId,
     note: NoteCreate,
@@ -5186,7 +5248,12 @@ async def replace_note(
     return replaced
 
 
-@router.patch("/{note_id:int}", response_model=NoteRead, responses=WRITE_ERRORS)
+@router.patch(
+    "/{note_id:int}",
+    response_model=NoteRead,
+    responses=WRITE_ERRORS,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def update_note(
     note_id: NoteId,
     changes: NoteUpdate,
@@ -5202,7 +5269,12 @@ async def update_note(
     return updated
 
 
-@router.delete("/{note_id:int}", status_code=status.HTTP_204_NO_CONTENT, responses=NOT_FOUND)
+@router.delete(
+    "/{note_id:int}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=NOT_FOUND,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def delete_note(
     note_id: NoteId,
     service: WriterServiceDep,
@@ -5216,7 +5288,12 @@ async def delete_note(
     after_write(background, queue, cache, note_id)
 
 
-@router.get("/{note_id:int}/links", response_model=list[LinkPreview], responses=NOT_FOUND)
+@router.get(
+    "/{note_id:int}/links",
+    response_model=list[LinkPreview],
+    responses=NOT_FOUND,
+    dependencies=[LINK_PREVIEW_LIMIT],
+)
 async def note_links(
     note_id: NoteId, service: ReaderServiceDep, previewer: LinkPreviewerDep
 ) -> list[LinkPreview]:
@@ -5342,7 +5419,7 @@ import contextlib
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 from arq.connections import ArqRedis
@@ -5355,14 +5432,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from notes_api.auth import AuthService
 from notes_api.cache import NoteCache
 from notes_api.core.config import Settings
-from notes_api.exceptions import AuthenticationError, PermissionDeniedError
+from notes_api.exceptions import AuthenticationError, PermissionDeniedError, RateLimitedError
 from notes_api.mailer import LogMailer, Mailer
 from notes_api.models import utc_now
+from notes_api.netguard import Resolver, resolve_host
 from notes_api.oauth import OidcClient
 from notes_api.ratelimit import FixedWindowRateLimiter
 from notes_api.repositories import NoteRepository, SqlNoteRepository, SqlUserRepository
 from notes_api.security import ALL_SCOPES, Principal, TokenService
-from notes_api.services import LinkPreviewer, NoteService, Resolver, resolve_host
+from notes_api.services import LinkPreviewer, NoteService
 
 
 def get_app_settings(connection: HTTPConnection) -> Settings:
@@ -5434,7 +5512,6 @@ def get_auth_service(
         redis,
         request.app.state.session_factory,
         timedelta(days=settings.refresh_token_days),
-        settings.admin_emails,
     )
 
 
@@ -5494,10 +5571,10 @@ WriterServiceDep = Annotated[NoteService, Security(get_note_service, scopes=["no
 
 
 def get_link_previewer(
-    client: HttpClientDep, resolver: Annotated[Resolver, Depends(get_resolver)]
+    request: Request, resolver: Annotated[Resolver, Depends(get_resolver)]
 ) -> LinkPreviewer:
-    """A LinkPreviewer on the shared HTTP client, with SSRF checks."""
-    return LinkPreviewer(client, resolver)
+    """A LinkPreviewer on the public-only client (it refuses private addresses on connect)."""
+    return LinkPreviewer(request.app.state.outbound_client, resolver)
 
 
 LinkPreviewerDep = Annotated[LinkPreviewer, Depends(get_link_previewer)]
@@ -5511,6 +5588,35 @@ def get_login_limiter(redis: RedisDep, settings: SettingsDep) -> FixedWindowRate
 
 
 LoginLimiterDep = Annotated[FixedWindowRateLimiter, Depends(get_login_limiter)]
+
+
+def per_user_limit(bucket: str, scopes: list[str]) -> Any:
+    """A route dependency that spends one unit of the caller's budget for `bucket` (OWASP
+    API4). `scopes` repeats the route's scopes: FastAPI caches a dependency per (function,
+    scopes), so the principal is still resolved once per request."""
+
+    async def enforce(
+        principal: Annotated[Principal, Security(get_current_principal, scopes=scopes)],
+        redis: RedisDep,
+        settings: SettingsDep,
+    ) -> None:
+        """429 with Retry-After once this user's budget for the window is spent."""
+        limit = getattr(settings, f"{bucket}_rate_limit")
+        window = settings.user_rate_window_seconds
+        limiter = FixedWindowRateLimiter(redis, limit, window, f"user-{bucket}")
+        result = await limiter.hit(str(principal.user_id))
+        if not result.allowed:
+            raise RateLimitedError(result.retry_after)
+
+    return Depends(enforce)
+
+
+NOTE_WRITE_LIMIT = per_user_limit("write", ["notes:write"])  # POST/PUT/PATCH/DELETE notes
+LINK_PREVIEW_LIMIT = per_user_limit("link_preview", ["notes:read"])  # up to 5 fetches each
+ACCOUNT_WRITE_LIMIT = per_user_limit("write", [])  # /users/me: keys, webhook, account
+ADMIN_WRITE_LIMIT = per_user_limit("write", ["admin"])  # imports, wipes, retries
+EXPORT_LIMIT = per_user_limit("export", [])  # POST /exports (a worker job each)
+ADMIN_EXPORT_LIMIT = per_user_limit("export", ["admin"])  # GET /admin/export (every note)
 
 
 def get_oidc_client(settings: SettingsDep, client: HttpClientDep, redis: RedisDep) -> OidcClient:
@@ -5569,12 +5675,9 @@ NOTES_V6_SERVICES_PY = r'''
 import asyncio
 import csv
 import io
-import ipaddress
 import json
 import re
-import socket
-import urllib.parse
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
@@ -5586,6 +5689,7 @@ from notes_api.core.metrics import NOTES_WRITTEN
 from notes_api.events import new_event
 from notes_api.exceptions import NoteNotFoundError, UploadRejectedError, VersionConflictError
 from notes_api.models import Note
+from notes_api.netguard import BLOCKED, Resolver, check_public_url, resolve_host
 from notes_api.pagination import decode_cursor, encode_cursor
 from notes_api.repositories import NoteRepository
 from notes_api.schemas import LinkPreview, NoteCreate, NoteFilters, NoteRead, NoteUpdate
@@ -5697,47 +5801,24 @@ def parse_import(filename: str, content: bytes) -> list[NoteCreate]:
         raise UploadRejectedError(reason, HTTPStatus.UNPROCESSABLE_CONTENT) from error
 
 
-type Resolver = Callable[[str], Awaitable[list[str]]]
-
-
-async def resolve_host(host: str) -> list[str]:
-    """Every IP address a host name resolves to (getaddrinfo runs in a worker thread)."""
-    infos = await asyncio.to_thread(socket.getaddrinfo, host, None, type=socket.SOCK_STREAM)
-    return sorted({str(info[4][0]) for info in infos})
-
-
-def is_public_address(address: str) -> bool:
-    """False for loopback, private, link-local, reserved, multicast and unspecified addresses."""
-    ip = ipaddress.ip_address(address)
-    return ip.is_global and not ip.is_multicast
-
-
 class LinkPreviewer:
     """Fetch the <title> of links in a note, refusing anything that is not a public web URL.
 
     Server-side request forgery (OWASP API7): a note body is user input, so a link could point
-    at 127.0.0.1, the cloud metadata service (169.254.169.254) or a private network. Each host
-    is resolved first and every address must be public; redirects are not followed (a public
+    at 127.0.0.1, the cloud metadata service (169.254.169.254) or a private network.
+    check_url() gives an early, readable answer; the client (netguard.public_only_client)
+    enforces the rule where it matters, when it connects. Redirects are not followed (a public
     URL could redirect to a private one); at most MAX_PREVIEW_BYTES of a page are read.
     """
 
     def __init__(self, client: httpx.AsyncClient, resolver: Resolver = resolve_host) -> None:
-        """Use the pooled client created by the lifespan and an injectable DNS resolver."""
+        """Use the lifespan's public-only client and an injectable DNS resolver."""
         self.client = client
         self.resolver = resolver
 
     async def check_url(self, url: str) -> str | None:
         """None if the URL may be fetched, else the reason it may not."""
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return "only public http(s) URLs are fetched"
-        try:
-            addresses = await self.resolver(parsed.hostname)
-        except OSError:
-            return "host does not resolve"
-        if not addresses or not all(is_public_address(address) for address in addresses):
-            return "blocked: not a public address"
-        return None
+        return await check_public_url(url, self.resolver)
 
     async def preview(self, url: str) -> LinkPreview:
         """One link: its status and title, or why it was not fetched (never raises)."""
@@ -5751,8 +5832,9 @@ class LinkPreviewer:
                     size += len(chunk)
                     if size >= MAX_PREVIEW_BYTES:
                         break
-        except httpx.HTTPError as error:
-            return LinkPreview(url=url, error=type(error).__name__)
+        except httpx.HTTPError as error:  # BLOCKED: the DNS answer changed after check_url()
+            reason = BLOCKED if str(error).startswith(BLOCKED) else type(error).__name__
+            return LinkPreview(url=url, error=reason)
         if response.is_redirect:
             return LinkPreview(
                 url=url, status_code=response.status_code, error="redirect not followed"
@@ -5800,6 +5882,7 @@ from notes_api.events import (
 )
 from notes_api.exports import add_progress, owner_key, result_key
 from notes_api.models import Note, OutboxEvent, RefreshToken, User
+from notes_api.netguard import BLOCKED, Resolver, check_public_url, public_only_client, resolve_host
 from notes_api.schemas import NoteRead
 
 RELAY_BATCH = 100
@@ -5821,10 +5904,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["text_redis"] = redis_asyncio.from_url(
         settings.redis_url.get_secret_value(), decode_responses=True
     )
-    ctx["http"] = httpx.AsyncClient(
-        timeout=settings.webhook_timeout_seconds,
-        follow_redirects=False,
-        headers={"User-Agent": f"notes-api-webhooks/{__version__}"},
+    ctx.setdefault("resolver", resolve_host)  # tests pass a fake DNS
+    ctx["http"] = public_only_client(  # connects only to the public address it checked
+        settings.webhook_timeout_seconds,
+        f"notes-api-webhooks/{__version__}",
+        resolver=ctx["resolver"],
     )
 
 
@@ -5869,7 +5953,8 @@ async def relay_outbox(ctx: dict[str, Any]) -> int:
 
 
 async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:
-    """POST one signed event; retry with exponential backoff; dead-letter after the last try."""
+    """POST one signed event; retry with backoff; dead-letter after the last try. The URL is
+    checked again first: DNS may have changed since it was saved."""
     settings: Settings = ctx["settings"]
     async with ctx["session_factory"]() as session, session.begin():
         event = await session.get(OutboxEvent, event_id)
@@ -5885,11 +5970,15 @@ async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:
             SIGNATURE_HEADER: sign_webhook(user.webhook_secret, int(time.time()), body),
         }
         event.webhook_attempts += 1
+        if blocked := await check_public_url(user.webhook_url, ctx["resolver"]):
+            event.webhook_status, event.last_error = "dead", blocked  # no retry; an admin can
+            await ctx["text_redis"].lpush(DEAD_LETTERS, str(event.id))
+            return "blocked"
         try:
             response = await ctx["http"].post(user.webhook_url, content=body, headers=headers)
             error = None if response.is_success else f"HTTP {response.status_code}"
-        except httpx.HTTPError as exc:
-            error = type(exc).__name__
+        except httpx.HTTPError as exc:  # BLOCKED: the DNS answer changed since the check
+            error = BLOCKED if str(exc).startswith(BLOCKED) else type(exc).__name__
         if error is None:
             event.webhook_status, event.last_error = "delivered", None
             return "delivered"
@@ -5963,7 +6052,9 @@ class WorkerSettings:
     keep_result = 300
 
 
-async def run_worker(burst: bool = False, settings: Settings | None = None) -> None:
+async def run_worker(
+    burst: bool = False, settings: Settings | None = None, resolver: Resolver | None = None
+) -> None:
     """Build the arq Worker inside a running event loop and run it (SIGTERM stops it cleanly).
 
     `arq notes_api.worker.WorkerSettings` is the usual command, but arq 0.25's CLI calls
@@ -5981,7 +6072,7 @@ async def run_worker(burst: bool = False, settings: Settings | None = None) -> N
         ),
         on_startup=startup,
         on_shutdown=shutdown,
-        ctx={"settings": settings} if settings else {},
+        ctx={"settings": settings, "resolver": resolver or resolve_host} if settings else {},
         burst=burst,
         poll_delay=0.1,
         max_tries=WorkerSettings.max_tries if settings is None else settings.webhook_max_attempts,
@@ -6019,6 +6110,7 @@ from hypothesis import settings as hypothesis_settings
 from pydantic import SecretStr
 
 from helpers import (
+    ADMIN_EMAIL,
     PASSWORD,
     POSTGRES_IMAGE,
     REDIS_IMAGE,
@@ -6029,6 +6121,7 @@ from helpers import (
     docker_available,
     fake_resolver,
     postgres_alembic_config,
+    promote,
 )
 from notes_api.core.config import Settings
 from notes_api.dependencies import get_mailer, get_queue, get_redis, get_resolver
@@ -6057,8 +6150,10 @@ def settings(tmp_path: Path) -> Settings:
         jwt_secret=SecretStr(secrets.token_urlsafe(32)),
         password_time_cost=1,
         password_memory_kib=64,
-        admin_emails=["admin@example.com"],
         login_rate_limit=10,
+        write_rate_limit=10_000,  # tests make many requests per user; test_limits.py checks
+        link_preview_rate_limit=10_000,  # the per-user budgets with small values
+        export_rate_limit=10_000,
         cookie_secure=False,  # TestClient talks plain HTTP
         check_migrations=False,  # the test schema comes from create_all, not Alembic
         otel_exporter="memory",  # spans are kept on app.state.span_exporter
@@ -6121,9 +6216,16 @@ def client(anonymous: TestClient) -> TestClient:
 
 
 @pytest.fixture
-def admin_headers(anonymous: TestClient) -> dict[str, str]:
-    """Bearer headers of an admin (admin@example.com is in admin_emails)."""
-    return auth_headers(anonymous, "admin@example.com")
+def admin_email(anonymous: TestClient) -> str:
+    """Register ADMIN_EMAIL as an ordinary user, then promote it the way an operator does."""
+    promote(anonymous, ADMIN_EMAIL)
+    return ADMIN_EMAIL
+
+
+@pytest.fixture
+def admin_headers(anonymous: TestClient, admin_email: str) -> dict[str, str]:
+    """Bearer headers of the promoted admin (logged in after the promotion)."""
+    return auth_headers(anonymous, admin_email)
 
 
 @pytest.fixture
@@ -6189,8 +6291,10 @@ from fastapi.testclient import TestClient
 
 from notes_api.core.config import Settings
 from notes_api.db import Base, create_engine_from_settings
+from notes_api.manage import set_role
 
 USER_EMAIL = "user@example.com"
+ADMIN_EMAIL = "admin@example.com"  # promoted by the admin_email fixture
 PASSWORD = "correct horse battery staple"
 ANONYMOUS = {"Authorization": ""}  # overrides the client's default header
 FAKE_DNS = {
@@ -6234,6 +6338,14 @@ def auth_headers(client: TestClient, email: str, scope: str = "") -> dict[str, s
     response = login(client, email, scope=scope)
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def promote(client: TestClient, email: str) -> None:
+    """Register `email` (if needed) as an ordinary user, then make it an admin the way an
+    operator does (notes_api.manage.set_role); tokens issued afterwards carry the admin scope."""
+    register(client, email)
+    session_factory = client.app.state.session_factory  # type: ignore[attr-defined]
+    assert client.portal.call(set_role, session_factory, email, "admin")
 
 
 async def fake_resolver(host: str) -> list[str]:
@@ -6574,6 +6686,7 @@ import importlib.util
 import io
 import json
 import logging
+import sqlite3
 from typing import Any
 
 import pytest
@@ -6585,6 +6698,7 @@ from pydantic import SecretStr
 from helpers import create
 from notes_api.core.logging import configure_logging
 from notes_api.dependencies import get_redis
+from notes_api.main import create_app
 
 
 def json_lines(buffer: io.StringIO) -> list[dict[str, Any]]:
@@ -6670,7 +6784,7 @@ def test_readiness_fails_when_redis_is_down(client: TestClient, app: FastAPI) ->
     app.dependency_overrides[get_redis] = BrokenRedis
     response = client.get("/health/ready")
     assert response.status_code == 503
-    assert response.json()["checks"]["redis"] == "unavailable: ConnectionError"
+    assert response.json()["checks"]["redis"] == "unavailable"  # no exception name in public
     assert client.get("/health/live").status_code == 200
 
 
@@ -6681,6 +6795,33 @@ def test_startup_waits_for_migrations(settings: Any, app: FastAPI) -> None:
         response = anonymous.get("/health/startup")
     assert response.status_code == 503
     assert response.json()["checks"]["migrations"] == "at None, need 0006"
+
+
+@pytest.mark.parametrize(
+    ("revision", "status_code", "migrations"),
+    [("0007", 200, "ok"), ("0005", 503, "at 0005, need 0006")],
+)
+def test_startup_accepts_a_newer_schema(
+    settings: Any, app: FastAPI, revision: str, status_code: int, migrations: str
+) -> None:
+    """Ahead of the code (a rolled-back release migrated it): ready. Behind: not ready."""
+    database = settings.database_url.get_secret_value().removeprefix("sqlite+aiosqlite:///")
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        connection.execute("INSERT INTO alembic_version VALUES (?)", (revision,))
+    app.state.settings = settings.model_copy(update={"check_migrations": True})
+    with TestClient(app) as anonymous:
+        response = anonymous.get("/health/startup")
+    checks = response.json()["checks"]
+    assert (response.status_code, checks["migrations"]) == (status_code, migrations)
+
+
+def test_production_publishes_no_schema(settings: Any) -> None:
+    """No /openapi.json, /docs or /redoc in production (OWASP API9: keep the inventory private)."""
+    production = settings.model_copy(update={"environment": "production"})
+    with TestClient(create_app(production)) as anonymous:
+        codes = [anonymous.get(path).status_code for path in ("/openapi.json", "/docs", "/redoc")]
+    assert codes == [404, 404, 404]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("sentry_sdk") is None, reason="sentry-sdk missing")
@@ -7108,10 +7249,11 @@ def test_schema_revision_is_the_newest_migration() -> None:
     """The revision /health/startup expects is the head of the migration history."""
     from alembic.script import ScriptDirectory
 
-    from notes_api.db import SCHEMA_REVISION
+    from notes_api.db import SCHEMA_REVISION, SCHEMA_REVISIONS
 
-    head = ScriptDirectory.from_config(alembic_config(PROJECT_DIR / "unused.db")).get_current_head()
-    assert head == SCHEMA_REVISION
+    script = ScriptDirectory.from_config(alembic_config(PROJECT_DIR / "unused.db"))
+    chain = tuple(revision.revision for revision in script.walk_revisions())[::-1]
+    assert (script.get_current_head(), chain) == (SCHEMA_REVISION, SCHEMA_REVISIONS)
 '''
 
 NOTES_V6_TESTS_TEST_POSTGRES_PY = r'''
@@ -7297,7 +7439,7 @@ def real_settings(settings: Settings, redis_url: str) -> Settings:
 
 def burst(settings: Settings) -> None:
     """Process every queued job (and the jobs they queue), then stop."""
-    asyncio.run(run_worker(burst=True, settings=settings))
+    asyncio.run(run_worker(burst=True, settings=settings, resolver=fake_resolver))
 
 
 @respx.mock

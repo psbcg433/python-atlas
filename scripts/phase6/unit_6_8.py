@@ -2484,7 +2484,7 @@ def _notes_v7_intro_cells() -> list[NotebookNode]:
             | CI: lint and tests | **CI/CD**: lint, types (mypy), tests, build + smoke test, scan (Trivy, pip-audit), push to GHCR, deploy |
             | — | `load/locustfile.py` (p95 < 200 ms gate), `test_shutdown.py`, `test_deploy.py` |
 
-            The cells write the 25 files that change or are new (of 102) plus the workflow, and
+            The cells write the 25 files that change or are new (of 106) plus the workflow, and
             re-record the OpenAPI snapshot (the version changed). First, remove files of other
             versions:
             """
@@ -2524,6 +2524,7 @@ def _notes_v7_intro_cells() -> list[NotebookNode]:
             tests/test_pagination.py tests/test_postgres.py tests/test_postgres_rollback.py
             tests/test_realtime.py tests/test_redis_worker.py tests/test_repository.py
             tests/test_security.py tests/test_settings.py tests/test_shutdown.py tests/test_worker.py
+            src/notes_api/manage.py src/notes_api/netguard.py tests/test_limits.py tests/test_netguard.py
             """.split()
             print("removed:", prune_notes_project(NOTES_V7_FILES))
             print(f"{len(NOTES_V7_FILES)} files in v7")
@@ -3188,11 +3189,15 @@ def _notes_v7_code_cells() -> list[NotebookNode]:
                 ),
                 (
                     "    # Observability (Unit 6.7)",
-                    "Part 3 (continues `Settings`): `oauth_enabled()`, `require_real_secrets_in_production()`; then `SECRETS_DIR` — True when every OpenID Connect setting is present.",
+                    "Part 3 (continues `Settings`): `oauth_enabled()`, `require_real_secrets_in_production()` — True when every OpenID Connect setting is present.",
+                ),
+                (
+                    '    @model_validator(mode="after")\n    def add_redis_password(self) -> Settings:',
+                    "Part 4 (continues `Settings`): `add_redis_password()`; then `SECRETS_DIR` — production Redis requires a password (`requirepass`); it comes from the secret file `notes_redis_password` and is added to `redis_url`, which therefore never holds a secret.",
                 ),
                 (
                     "@lru_cache",
-                    "Part 4: `get_settings()` — The process-wide settings, read once and cached (12-factor: config from the environment).",
+                    "Part 5: `get_settings()` — The process-wide settings, read once and cached (12-factor: config from the environment).",
                 ),
             ],
         ),
@@ -3230,7 +3235,7 @@ def _notes_v7_code_cells() -> list[NotebookNode]:
                 ),
                 (
                     "async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:",
-                    "Part 4: `deliver_webhook()` — POST one signed event; retry with exponential backoff; dead-letter after the last try.",
+                    "Part 4: `deliver_webhook()` — check the URL again (DNS may have changed since it was saved; a blocked URL is dead-lettered at once), POST one signed event through the public-only client, retry with exponential backoff, dead-letter after the last try.",
                 ),
                 (
                     "async def export_notes(",
@@ -3241,7 +3246,7 @@ def _notes_v7_code_cells() -> list[NotebookNode]:
                     "Part 6: `purge_expired_tokens()`, `WorkerSettings` — Daily: delete refresh tokens that expired more than a day ago (one worker at a time).",
                 ),
                 (
-                    "async def run_worker(burst: bool = False, settings: Settings | None = None) -> None:",
+                    "async def run_worker(",
                     "Part 7: `run_worker()`, `HEALTH_CHECK_KEY`, `HEALTH_CHECK_SECONDS` — Build the arq Worker inside a running event loop and run it (SIGTERM stops it cleanly).",
                 ),
                 (
@@ -3399,11 +3404,15 @@ def _notes_v7_test_cells() -> list[NotebookNode]:
                 ),
                 (
                     "def test_proxy_blocks_metrics_and_procfile_has_three_processes() -> None:",
-                    "Part 3: `test_proxy_blocks_metrics_and_procfile_has_three_processes()`, `test_secrets_are_read_from_files()`, `test_pgbouncer_mode_disables_statement_caches()` — Caddy hides /metrics; the PaaS Procfile declares web, worker and release.",
+                    "Part 3: `test_proxy_blocks_metrics_and_procfile_has_three_processes()`, `test_secrets_are_read_from_files()`, `test_redis_password_file_goes_into_the_url()` — Caddy hides /metrics; the PaaS Procfile declares web, worker and release.",
+                ),
+                (
+                    "def test_pgbouncer_mode_disables_statement_caches(monkeypatch: pytest.MonkeyPatch) -> None:",
+                    "Part 4: `test_pgbouncer_mode_disables_statement_caches()` — Behind PgBouncer in transaction mode, asyncpg must not cache prepared statements.",
                 ),
                 (
                     "async def test_worker_health_check(monkeypatch: pytest.MonkeyPatch) -> None:",
-                    "Part 4: `test_worker_health_check()`, `_noop()` — --check passes while a worker keeps its health key fresh, fails when it is gone.",
+                    "Part 5: `test_worker_health_check()`, `_noop()` — --check passes while a worker keeps its health key fresh, fails when it is gone.",
                 ),
             ],
         ),
@@ -3947,6 +3956,7 @@ NOTES_V7_CORE_CONFIG_PY = r'''
 %%writefile ../projects/notes_api/src/notes_api/core/config.py
 """Application settings: environment variables (prefix NOTES_) and an optional .env file."""
 
+import urllib.parse
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -3980,6 +3990,7 @@ class Settings(BaseSettings):
     database_max_overflow: int = Field(default=10, ge=0)
     database_pgbouncer: bool = False  # behind PgBouncer (transaction pooling): no statement cache
     redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
+    redis_password: SecretStr | None = None  # production: the secret file notes_redis_password
 
     # Authentication: an HS256 secret (required in production; a random one per process otherwise)
     jwt_secret: SecretStr | None = None
@@ -3989,7 +4000,6 @@ class Settings(BaseSettings):
     refresh_token_days: int = Field(default=14, ge=1)
     password_time_cost: int = Field(default=3, ge=1)  # Argon2id parameters (tests lower them)
     password_memory_kib: int = Field(default=65_536, ge=32)  # Argon2 needs 8 KiB per lane (4)
-    admin_emails: list[str] = []  # these addresses get the admin role when they register
     login_rate_limit: int = Field(default=5, ge=1)  # attempts per window, per IP + email
     login_rate_window_seconds: int = Field(default=60, ge=1)
     cookie_secure: bool = True  # session cookie only over HTTPS (False for local HTTP)
@@ -4008,6 +4018,13 @@ class Settings(BaseSettings):
     webhook_max_attempts: int = Field(default=5, ge=1)  # then the event is dead-lettered
     cache_ttl_seconds: int = Field(default=60, ge=1)
     ws_heartbeat_seconds: float = Field(default=20.0, gt=0)
+    ws_connections_per_user: int = Field(default=5, ge=1)  # open sockets per user, all replicas
+
+    # Per-user budgets per window on expensive routes (OWASP API4); a 429 when one is spent
+    write_rate_limit: int = Field(default=120, ge=1)  # note, key and webhook writes; admin actions
+    link_preview_rate_limit: int = Field(default=10, ge=1)  # each call fetches up to 5 URLs
+    export_rate_limit: int = Field(default=5, ge=1)  # POST /exports and GET /admin/export
+    user_rate_window_seconds: int = Field(default=60, ge=1)
     export_ttl_seconds: int = Field(default=3600, ge=60)
 
     # Observability (Unit 6.7)
@@ -4040,6 +4057,19 @@ class Settings(BaseSettings):
             )
         if not self.cookie_secure:
             raise ValueError("NOTES_COOKIE_SECURE must be true in production")
+        return self
+
+    @model_validator(mode="after")
+    def add_redis_password(self) -> Settings:
+        """Put redis_password into redis_url (redis://:<password>@host) unless it has one, so
+        the URL in compose.yaml stays free of secrets and the password lives in a file."""
+        url = urllib.parse.urlsplit(self.redis_url.get_secret_value())
+        if self.redis_password is None or url.password:
+            return self
+        password = urllib.parse.quote(self.redis_password.get_secret_value(), safe="")
+        host = f"{url.hostname}:{url.port}" if url.port else str(url.hostname)
+        netloc = f"{url.username or ''}:{password}@{host}"
+        self.redis_url = SecretStr(url._replace(netloc=netloc).geturl())
         return self
 
 
@@ -4080,7 +4110,8 @@ from sqlalchemy.types import TypeDecorator
 from notes_api.core.config import Settings
 
 # Predictable constraint names, so Alembic can find (and drop) them later.
-SCHEMA_REVISION = "0006"  # the Alembic revision this code expects (/health/startup checks it)
+SCHEMA_REVISIONS = ("0001", "0002", "0003", "0004", "0005", "0006")  # this code's migrations
+SCHEMA_REVISION = SCHEMA_REVISIONS[-1]  # the revision it expects (/health/startup checks it)
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -4189,6 +4220,7 @@ from notes_api.events import (
 )
 from notes_api.exports import add_progress, owner_key, result_key
 from notes_api.models import Note, OutboxEvent, RefreshToken, User
+from notes_api.netguard import BLOCKED, Resolver, check_public_url, public_only_client, resolve_host
 from notes_api.schemas import NoteRead
 
 RELAY_BATCH = 100
@@ -4210,10 +4242,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["text_redis"] = redis_asyncio.from_url(
         settings.redis_url.get_secret_value(), decode_responses=True
     )
-    ctx["http"] = httpx.AsyncClient(
-        timeout=settings.webhook_timeout_seconds,
-        follow_redirects=False,
-        headers={"User-Agent": f"notes-api-webhooks/{__version__}"},
+    ctx.setdefault("resolver", resolve_host)  # tests pass a fake DNS
+    ctx["http"] = public_only_client(  # connects only to the public address it checked
+        settings.webhook_timeout_seconds,
+        f"notes-api-webhooks/{__version__}",
+        resolver=ctx["resolver"],
     )
 
 
@@ -4258,7 +4291,8 @@ async def relay_outbox(ctx: dict[str, Any]) -> int:
 
 
 async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:
-    """POST one signed event; retry with exponential backoff; dead-letter after the last try."""
+    """POST one signed event; retry with backoff; dead-letter after the last try. The URL is
+    checked again first: DNS may have changed since it was saved."""
     settings: Settings = ctx["settings"]
     async with ctx["session_factory"]() as session, session.begin():
         event = await session.get(OutboxEvent, event_id)
@@ -4274,11 +4308,15 @@ async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:
             SIGNATURE_HEADER: sign_webhook(user.webhook_secret, int(time.time()), body),
         }
         event.webhook_attempts += 1
+        if blocked := await check_public_url(user.webhook_url, ctx["resolver"]):
+            event.webhook_status, event.last_error = "dead", blocked  # no retry; an admin can
+            await ctx["text_redis"].lpush(DEAD_LETTERS, str(event.id))
+            return "blocked"
         try:
             response = await ctx["http"].post(user.webhook_url, content=body, headers=headers)
             error = None if response.is_success else f"HTTP {response.status_code}"
-        except httpx.HTTPError as exc:
-            error = type(exc).__name__
+        except httpx.HTTPError as exc:  # BLOCKED: the DNS answer changed since the check
+            error = BLOCKED if str(exc).startswith(BLOCKED) else type(exc).__name__
         if error is None:
             event.webhook_status, event.last_error = "delivered", None
             return "delivered"
@@ -4352,7 +4390,9 @@ class WorkerSettings:
     keep_result = 300
 
 
-async def run_worker(burst: bool = False, settings: Settings | None = None) -> None:
+async def run_worker(
+    burst: bool = False, settings: Settings | None = None, resolver: Resolver | None = None
+) -> None:
     """Build the arq Worker inside a running event loop and run it (SIGTERM stops it cleanly).
 
     `arq notes_api.worker.WorkerSettings` is the usual command, but arq 0.25's CLI calls
@@ -4370,7 +4410,7 @@ async def run_worker(burst: bool = False, settings: Settings | None = None) -> N
         ),
         on_startup=startup,
         on_shutdown=shutdown,
-        ctx={"settings": settings} if settings else {},
+        ctx={"settings": settings, "resolver": resolver or resolve_host} if settings else {},
         burst=burst,
         poll_delay=0.1,
         health_check_interval=HEALTH_CHECK_SECONDS,  # arq's default is an hour
@@ -4920,7 +4960,8 @@ docker compose down                           # add -v to delete the data volume
 ```
 
 Local plain HTTP: set `NOTES_COOKIE_SECURE=false`, or the browser will not send the session
-cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
+cookie. Every account starts as an ordinary user; promote one with
+`uv run python -m notes_api.manage promote-admin <email>` (a command, never an HTTP request).
 
 Observability: every log line is JSON with `request_id`, `trace_id` and `span_id`
 (`NOTES_LOG_JSON=false` for console output); Prometheus scrapes `GET /metrics`;
@@ -4963,7 +5004,7 @@ systemd unit and a Cloud Run service; `Procfile` covers Heroku-style platforms. 
 | `POST` | `/api/v1/auth/refresh` | refresh token | rotation: each refresh token works once; reuse revokes the family |
 | `POST` | `/api/v1/auth/logout` | refresh token (+ bearer) | revokes the family and denies the access token |
 | `GET` | `/api/v1/auth/oauth/login`, `/oauth/callback` | none | OpenID Connect (Authorization Code + PKCE); 404 unless configured |
-| `GET` | `/api/v1/users/me` | bearer or key | the current user |
+| `GET/DELETE` | `/api/v1/users/me` | bearer or key | the current user; DELETE removes the account and everything it owns |
 | `POST/GET/DELETE` | `/api/v1/users/me/api-keys[/{id}]` | bearer | keys are shown once, stored as SHA-256, limited to scopes |
 | `POST/GET` | `/api/v1/notes` | `notes:write` / `notes:read` | only the caller's notes |
 | `GET` | `/api/v1/notes/feed` | `notes:read` | keyset pagination |
@@ -4972,7 +5013,7 @@ systemd unit and a Cloud Run service; `Procfile` covers Heroku-style platforms. 
 | `GET/PUT/DELETE` | `/api/v1/users/me/webhook` | bearer | a public URL; PUT returns the signing secret once |
 | `POST` | `/api/v1/exports` | any user | 202 + `Location`; an ARQ job builds the export |
 | `GET` | `/api/v1/exports/{id}`, `/download`, `/events` | owner | status, JSON file, `text/event-stream` progress (`Last-Event-ID`) |
-| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth |
+| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth or over 5 sockets per user |
 | `POST/GET/DELETE` | `/api/v1/admin/import`, `/export`, `/notes` | admin role + `admin` scope | bulk operations |
 | `GET/POST` | `/api/v1/admin/cache-stats`, `/webhooks/dead[/{id}/retry]` | admin | cache hit rate; dead-letter list and replay |
 | `GET/POST` | `/login`, `/logout`, `/`, `/notes`, `/notes/{id}/pin` | session cookie + CSRF token | HTML (Jinja2 + HTMX) |
@@ -4981,7 +5022,8 @@ Credentials: `Authorization: Bearer <access token>` or `X-API-Key: nk_...`. Erro
 `application/problem+json` (RFC 9457). Every response carries `X-Request-ID`,
 `Server-Timing` and security headers (HSTS, CSP, `X-Content-Type-Options`, `X-Frame-Options`).
 `GET /api/v1/notes/{id}` sends `ETag` and `Cache-Control: private, no-cache` and answers
-`If-None-Match` with 304. Webhooks carry `X-Notes-Event-Id` and
+`If-None-Match` with 304. Per-user budgets (429 + `Retry-After`): 120 writes, 10 link-preview
+calls and 5 exports a minute (`NOTES_WRITE_RATE_LIMIT` etc.). Webhooks carry `X-Notes-Event-Id` and
 `X-Notes-Signature: t=<unix time>,v1=<HMAC-SHA256 of "t.body">`.
 
 
@@ -5322,6 +5364,17 @@ def test_secrets_are_read_from_files(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, _secrets_dir=tmp_path)
     assert settings.jwt_secret is not None
     assert settings.jwt_secret.get_secret_value().startswith("from-a-secret-file-")
+
+
+def test_redis_password_file_goes_into_the_url(tmp_path: Path) -> None:
+    """notes_redis_password (a secret file) completes NOTES_REDIS_URL; a URL with one wins."""
+    (tmp_path / "notes_redis_password").write_text("s3cret/+", encoding="utf-8")
+    url = SecretStr("redis://redis:6379/0")
+    settings = Settings(_env_file=None, _secrets_dir=tmp_path, redis_url=url)
+    assert settings.redis_url.get_secret_value() == "redis://:s3cret%2F%2B@redis:6379/0"
+    explicit = SecretStr("redis://:other@redis:6379/0")
+    settings = Settings(_env_file=None, _secrets_dir=tmp_path, redis_url=explicit)
+    assert settings.redis_url.get_secret_value() == "redis://:other@redis:6379/0"
 
 
 def test_pgbouncer_mode_disables_statement_caches(monkeypatch: pytest.MonkeyPatch) -> None:

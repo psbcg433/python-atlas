@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import logging
+import sqlite3
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from pydantic import SecretStr
 from helpers import create
 from notes_api.core.logging import configure_logging
 from notes_api.dependencies import get_redis
+from notes_api.main import create_app
 
 
 def json_lines(buffer: io.StringIO) -> list[dict[str, Any]]:
@@ -100,7 +102,7 @@ def test_readiness_fails_when_redis_is_down(client: TestClient, app: FastAPI) ->
     app.dependency_overrides[get_redis] = BrokenRedis
     response = client.get("/health/ready")
     assert response.status_code == 503
-    assert response.json()["checks"]["redis"] == "unavailable: ConnectionError"
+    assert response.json()["checks"]["redis"] == "unavailable"  # no exception name in public
     assert client.get("/health/live").status_code == 200
 
 
@@ -111,6 +113,33 @@ def test_startup_waits_for_migrations(settings: Any, app: FastAPI) -> None:
         response = anonymous.get("/health/startup")
     assert response.status_code == 503
     assert response.json()["checks"]["migrations"] == "at None, need 0006"
+
+
+@pytest.mark.parametrize(
+    ("revision", "status_code", "migrations"),
+    [("0007", 200, "ok"), ("0005", 503, "at 0005, need 0006")],
+)
+def test_startup_accepts_a_newer_schema(
+    settings: Any, app: FastAPI, revision: str, status_code: int, migrations: str
+) -> None:
+    """Ahead of the code (a rolled-back release migrated it): ready. Behind: not ready."""
+    database = settings.database_url.get_secret_value().removeprefix("sqlite+aiosqlite:///")
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+        connection.execute("INSERT INTO alembic_version VALUES (?)", (revision,))
+    app.state.settings = settings.model_copy(update={"check_migrations": True})
+    with TestClient(app) as anonymous:
+        response = anonymous.get("/health/startup")
+    checks = response.json()["checks"]
+    assert (response.status_code, checks["migrations"]) == (status_code, migrations)
+
+
+def test_production_publishes_no_schema(settings: Any) -> None:
+    """No /openapi.json, /docs or /redoc in production (OWASP API9: keep the inventory private)."""
+    production = settings.model_copy(update={"environment": "production"})
+    with TestClient(create_app(production)) as anonymous:
+        codes = [anonymous.get(path).status_code for path in ("/openapi.json", "/docs", "/redoc")]
+    assert codes == [404, 404, 404]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("sentry_sdk") is None, reason="sentry-sdk missing")

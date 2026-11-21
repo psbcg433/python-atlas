@@ -9,8 +9,10 @@ from fastapi.testclient import TestClient
 
 from notes_api.core.config import Settings
 from notes_api.db import Base, create_engine_from_settings
+from notes_api.manage import set_role
 
 USER_EMAIL = "user@example.com"
+ADMIN_EMAIL = "admin@example.com"  # promoted by the admin_email fixture
 PASSWORD = "correct horse battery staple"
 ANONYMOUS = {"Authorization": ""}  # overrides the client's default header
 FAKE_DNS = {
@@ -54,6 +56,14 @@ def auth_headers(client: TestClient, email: str, scope: str = "") -> dict[str, s
     response = login(client, email, scope=scope)
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def promote(client: TestClient, email: str) -> None:
+    """Register `email` (if needed) as an ordinary user, then make it an admin the way an
+    operator does (notes_api.manage.set_role); tokens issued afterwards carry the admin scope."""
+    register(client, email)
+    session_factory = client.app.state.session_factory  # type: ignore[attr-defined]
+    assert client.portal.call(set_role, session_factory, email, "admin")
 
 
 async def fake_resolver(host: str) -> list[str]:

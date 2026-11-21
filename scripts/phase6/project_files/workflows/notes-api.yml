@@ -7,10 +7,13 @@
 # Every push and pull request runs the checks. A push to main (or a manual run on main) also
 # pushes ghcr.io/<owner>/notes-api:<commit sha> (+ :latest) and deploys exactly that image:
 # rsync the Compose files to the server, run deploy/production/rollout.sh <sha> over SSH
-# (backup, migrations, zero-downtime swap), then smoke-test over HTTPS and roll back if it fails.
+# (backup, migrations, zero-downtime swap), then smoke-test over HTTPS: mark the release known
+# good if it passes, roll back to the last known-good release if it fails.
 # The deploy job is skipped until the NOTES_HOST repository variable exists.
 # Secrets of the "production" environment: DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS (see DEPLOY.md).
-# Actions are pinned to commit SHAs; the comment names the release.
+# On the server the CI key can run only deploy/production/ci-command's commands (rsync into
+# /srv/notes, registry-login/-logout, rollout, rollback, mark-good), nothing else.
+# Actions are pinned to commit SHAs and tools to versions (Trivy also by digest).
 name: notes-api
 
 on:
@@ -113,11 +116,12 @@ jobs:
       - run: gunzip -c image.tar.gz | docker load
       - name: Vulnerabilities in the image (OS packages and Python wheels)
         run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.1 \
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.58.1@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
             image --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed "$IMAGE:$GITHUB_SHA"
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
       - name: Known vulnerabilities in the locked dependencies
-        run: uv export --frozen --no-dev --no-hashes > requirements.txt && uvx pip-audit -r requirements.txt
+        run: uv export --frozen --no-dev --no-hashes > requirements.txt && uvx pip-audit==2.10.1 -r requirements.txt
 
   push:
     needs: scan
@@ -155,14 +159,18 @@ jobs:
           printf 'Host notes-prod\n  HostName %s\n  User deploy\n  IdentityFile ~/.ssh/deploy_key\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' \
             "$HOST" > ~/.ssh/config
       - name: Copy the Compose files and deploy scripts to /srv/notes
-        run: rsync -az --relative compose.yaml compose.prod.yaml deploy/Caddyfile deploy/production notes-prod:/srv/notes/
+        # "notes-prod:" is /srv/notes (the server's rrsync confines the key there); --delete
+        # removes files deleted from deploy/production; .env, .secrets and state are not touched
+        run: |
+          rsync -az --relative --delete compose.yaml compose.prod.yaml deploy/Caddyfile deploy/production notes-prod:
       - name: Roll out ${{ github.sha }} (backup, migrations, zero-downtime swap)
         env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
         run: |
-          trap 'ssh notes-prod docker logout ghcr.io > /dev/null || true' EXIT
-          echo "$GH_TOKEN" | ssh notes-prod docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          # shellcheck disable=SC2029  # $IMAGE and $GITHUB_SHA expand on the runner on purpose
-          ssh notes-prod "NOTES_IMAGE=$IMAGE /srv/notes/deploy/production/rollout.sh $GITHUB_SHA"
+          trap 'ssh notes-prod registry-logout > /dev/null || true' EXIT
+          # shellcheck disable=SC2029  # the values expand on the runner on purpose
+          echo "$GH_TOKEN" | ssh notes-prod "registry-login $GITHUB_ACTOR"
+          # shellcheck disable=SC2029
+          ssh notes-prod "rollout $IMAGE $GITHUB_SHA"
 
       - name: Smoke test over HTTPS
         id: smoke
@@ -177,6 +185,8 @@ jobs:
           if [[ $redirect != 308 ]]; then echo "HTTP answered $redirect, expected 308"; exit 1; fi
           curl --silent --head "https://$HOST/health/live" | grep -i '^strict-transport-security'
           echo "Deployed \`${GITHUB_SHA::12}\` to https://$HOST" >> "$GITHUB_STEP_SUMMARY"
-      - name: Roll back to the previous release
+      - name: Mark the release known good (a later rollback may return to it)
+        run: ssh notes-prod mark-good
+      - name: Roll back to the last known-good release
         if: failure() && steps.smoke.outcome == 'failure'
-        run: ssh notes-prod "SKIP_PULL=1 /srv/notes/deploy/production/rollout.sh rollback"
+        run: ssh notes-prod rollback

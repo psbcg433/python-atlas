@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from notes_api.dependencies import (
+    ADMIN_EXPORT_LIMIT,
+    ADMIN_WRITE_LIMIT,
     NoteCacheDep,
     QueueDep,
     RepositoryDep,
@@ -42,7 +44,12 @@ async def read_upload(upload: UploadFile, max_bytes: int) -> bytes:
     return content
 
 
-@router.post("/import", response_model=ImportReport, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/import",
+    response_model=ImportReport,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[ADMIN_WRITE_LIMIT],
+)
 async def import_notes(
     file: UploadFile, service: WriterServiceDep, settings: SettingsDep
 ) -> ImportReport:
@@ -54,7 +61,7 @@ async def import_notes(
     return ImportReport(filename=file.filename or "", imported=len(created), ids=ids)
 
 
-@router.get("/export")
+@router.get("/export", dependencies=[ADMIN_EXPORT_LIMIT])
 async def export_notes(repository: RepositoryDep) -> JSONResponse:
     """Every user's notes as a downloadable JSON file."""
     notes, _total = await repository.search(NoteFilters(limit=100, sort="created_at"), None)
@@ -63,7 +70,7 @@ async def export_notes(repository: RepositoryDep) -> JSONResponse:
     return JSONResponse(payload, headers=headers)
 
 
-@router.delete("/notes")
+@router.delete("/notes", dependencies=[ADMIN_WRITE_LIMIT])
 async def delete_all_notes(repository: RepositoryDep) -> dict[str, int]:
     """Remove every note of every user."""
     return {"deleted": await repository.delete_all()}
@@ -93,7 +100,11 @@ async def dead_webhooks(session: SessionDep) -> list[dict[str, object]]:
     ]
 
 
-@router.post("/webhooks/dead/{event_id}/retry", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/webhooks/dead/{event_id}/retry",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[ADMIN_WRITE_LIMIT],
+)
 async def retry_dead_webhook(
     event_id: int, session: SessionDep, queue: QueueDep
 ) -> dict[str, object]:

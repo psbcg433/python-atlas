@@ -6,6 +6,8 @@ from fastapi import APIRouter, BackgroundTasks, Header, Path, Query, Request, Re
 
 from notes_api.core.errors import PROBLEM_JSON, ProblemDetail
 from notes_api.dependencies import (
+    LINK_PREVIEW_LIMIT,
+    NOTE_WRITE_LIMIT,
     LinkPreviewerDep,
     NoteCacheDep,
     QueueDep,
@@ -69,7 +71,12 @@ def after_write(background: BackgroundTasks, queue: Any, cache: Any, note_id: in
     background.add_task(kick_relay, queue)
 
 
-@router.post("", response_model=NoteRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=NoteRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def create_note(
     note: NoteCreate,
     service: WriterServiceDep,
@@ -133,7 +140,12 @@ async def get_note(
     return note
 
 
-@router.put("/{note_id:int}", response_model=NoteRead, responses=WRITE_ERRORS)
+@router.put(
+    "/{note_id:int}",
+    response_model=NoteRead,
+    responses=WRITE_ERRORS,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def replace_note(
     note_id: NoteId,
     note: NoteCreate,
@@ -149,7 +161,12 @@ async def replace_note(
     return replaced
 
 
-@router.patch("/{note_id:int}", response_model=NoteRead, responses=WRITE_ERRORS)
+@router.patch(
+    "/{note_id:int}",
+    response_model=NoteRead,
+    responses=WRITE_ERRORS,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def update_note(
     note_id: NoteId,
     changes: NoteUpdate,
@@ -165,7 +182,12 @@ async def update_note(
     return updated
 
 
-@router.delete("/{note_id:int}", status_code=status.HTTP_204_NO_CONTENT, responses=NOT_FOUND)
+@router.delete(
+    "/{note_id:int}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=NOT_FOUND,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def delete_note(
     note_id: NoteId,
     service: WriterServiceDep,
@@ -179,7 +201,12 @@ async def delete_note(
     after_write(background, queue, cache, note_id)
 
 
-@router.get("/{note_id:int}/links", response_model=list[LinkPreview], responses=NOT_FOUND)
+@router.get(
+    "/{note_id:int}/links",
+    response_model=list[LinkPreview],
+    responses=NOT_FOUND,
+    dependencies=[LINK_PREVIEW_LIMIT],
+)
 async def note_links(
     note_id: NoteId, service: ReaderServiceDep, previewer: LinkPreviewerDep
 ) -> list[LinkPreview]:

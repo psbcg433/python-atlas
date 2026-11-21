@@ -31,7 +31,8 @@ docker compose down                           # add -v to delete the data volume
 ```
 
 Local plain HTTP: set `NOTES_COOKIE_SECURE=false`, or the browser will not send the session
-cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
+cookie. Every account starts as an ordinary user; promote one with
+`uv run python -m notes_api.manage promote-admin <email>` (a command, never an HTTP request).
 
 Observability: every log line is JSON with `request_id`, `trace_id` and `span_id`
 (`NOTES_LOG_JSON=false` for console output); Prometheus scrapes `GET /metrics`;
@@ -69,15 +70,18 @@ Caddy (automatic HTTPS from Let's Encrypt, HSTS), two API replicas, the worker, 
 Redis, Prometheus and Grafana. Every push to `main` that passes lint, types, tests, the image
 build and the scans is deployed by `.github/workflows/notes-api.yml` with
 `deploy/production/rollout.sh`: backup, migrations, then a zero-downtime swap of the replicas,
-an HTTPS smoke test and an automatic rollback if it fails. `notes-api-uptime.yml` checks the
-live API and its certificate every 15 minutes.
+an HTTPS smoke test, and an automatic rollback to the last known-good release if it fails (a
+rollback never migrates). On the server the CI key can run only `deploy/production/ci-command`.
+`notes-api-uptime.yml` checks the live API and its certificate every 15 minutes. Admins are
+promoted on the server with `python -m notes_api.manage promote-admin <email>`.
 
 | File | Purpose |
 | --- | --- |
 | [`DEPLOY.md`](DEPLOY.md) | the runbook: server, secrets, first deploy, HTTPS checks, monitoring, rollback |
 | [`LOAD_TEST.md`](LOAD_TEST.md) | the Locust scenario, the targets (p95 < 200 ms, < 1% errors, >= 100 req/s) and the results |
 | `compose.prod.yaml` | production overrides merged over `compose.yaml` |
-| `deploy/production/` | Caddyfile, Prometheus and alert rules, Grafana provisioning, `bootstrap.sh`, `rollout.sh`, `backup.sh`, `dc` |
+| `deploy/production/` | Caddyfile, Prometheus and alert rules, Grafana provisioning, `bootstrap.sh`, `ci-command`, `rollout.sh`, `backup.sh`, `dc` |
+| `load/accounts.py` | the load test's pool of throw-away accounts (registered at the allowed pace, deleted afterwards) |
 | `load/report.py` | turns a Locust CSV into the results section of `LOAD_TEST.md` |
 
 
@@ -93,7 +97,7 @@ live API and its certificate every 15 minutes.
 | `POST` | `/api/v1/auth/refresh` | refresh token | rotation: each refresh token works once; reuse revokes the family |
 | `POST` | `/api/v1/auth/logout` | refresh token (+ bearer) | revokes the family and denies the access token |
 | `GET` | `/api/v1/auth/oauth/login`, `/oauth/callback` | none | OpenID Connect (Authorization Code + PKCE); 404 unless configured |
-| `GET` | `/api/v1/users/me` | bearer or key | the current user |
+| `GET/DELETE` | `/api/v1/users/me` | bearer or key | the current user; DELETE removes the account and everything it owns |
 | `POST/GET/DELETE` | `/api/v1/users/me/api-keys[/{id}]` | bearer | keys are shown once, stored as SHA-256, limited to scopes |
 | `POST/GET` | `/api/v1/notes` | `notes:write` / `notes:read` | only the caller's notes |
 | `GET` | `/api/v1/notes/feed` | `notes:read` | keyset pagination |
@@ -102,7 +106,7 @@ live API and its certificate every 15 minutes.
 | `GET/PUT/DELETE` | `/api/v1/users/me/webhook` | bearer | a public URL; PUT returns the signing secret once |
 | `POST` | `/api/v1/exports` | any user | 202 + `Location`; an ARQ job builds the export |
 | `GET` | `/api/v1/exports/{id}`, `/download`, `/events` | owner | status, JSON file, `text/event-stream` progress (`Last-Event-ID`) |
-| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth |
+| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth or over 5 sockets per user |
 | `POST/GET/DELETE` | `/api/v1/admin/import`, `/export`, `/notes` | admin role + `admin` scope | bulk operations |
 | `GET/POST` | `/api/v1/admin/cache-stats`, `/webhooks/dead[/{id}/retry]` | admin | cache hit rate; dead-letter list and replay |
 | `GET/POST` | `/login`, `/logout`, `/`, `/notes`, `/notes/{id}/pin` | session cookie + CSRF token | HTML (Jinja2 + HTMX) |
@@ -111,7 +115,8 @@ Credentials: `Authorization: Bearer <access token>` or `X-API-Key: nk_...`. Erro
 `application/problem+json` (RFC 9457). Every response carries `X-Request-ID`,
 `Server-Timing` and security headers (HSTS, CSP, `X-Content-Type-Options`, `X-Frame-Options`).
 `GET /api/v1/notes/{id}` sends `ETag` and `Cache-Control: private, no-cache` and answers
-`If-None-Match` with 304. Webhooks carry `X-Notes-Event-Id` and
+`If-None-Match` with 304. Per-user budgets (429 + `Retry-After`): 120 writes, 10 link-preview
+calls and 5 exports a minute (`NOTES_WRITE_RATE_LIMIT` etc.). Webhooks carry `X-Notes-Event-Id` and
 `X-Notes-Signature: t=<unix time>,v1=<HMAC-SHA256 of "t.body">`.
 
 

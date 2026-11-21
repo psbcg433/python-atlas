@@ -3,26 +3,32 @@
     uv run locust -f load/locustfile.py --host https://<NOTES_HOST> --headless -u 50 -r 10 -t 2m \
         --csv load/results/live
 
-One account is created when the test starts (registration is rate-limited per address, as it
-should be) and every simulated user shares its token. Users mostly read (list, one note, the
-feed) and sometimes write. The run exits with code 1 when the 95th percentile is above
-P95_LIMIT_MS or more than MAX_FAILURE_RATIO of the requests fail: a pass/fail gate for CI.
+A pool of accounts is registered when the test starts, at the pace the API's registration
+limit allows (5 a minute per address), one account for every two simulated users, so the
+per-user limits (120 writes a minute) are never the bottleneck; NOTES_LOAD_ACCOUNTS overrides
+the size. The accounts delete themselves when the test stops. Users mostly read (list, one
+note, the feed) and sometimes write. The run exits with code 1 when the 95th percentile is
+above P95_LIMIT_MS or more than MAX_FAILURE_RATIO of the requests fail: a pass/fail gate.
 Certificates are verified, except for localhost (Caddy's local CA in the rehearsal stack).
 """
 
+import itertools
+import math
 import os
 import random
 import secrets
 from typing import Any
 from urllib.parse import urlsplit
 
-import requests
+from accounts import Account, delete_accounts, register_accounts
 from locust import HttpUser, between, events, task
 
 P95_LIMIT_MS = int(os.environ.get("NOTES_LOAD_P95_MS", "200"))
 MAX_FAILURE_RATIO = float(os.environ.get("NOTES_LOAD_MAX_FAILURE_RATIO", "0.01"))
+USERS_PER_ACCOUNT = 2  # about 40 writes a minute each: an account stays under its 120
 LOCAL_HOSTS = {"localhost", "127.0.0.1"}
-SHARED: dict[str, Any] = {}
+POOL: list[Account] = []
+TURN = itertools.count()
 
 
 def verify_tls(host: str) -> bool:
@@ -30,25 +36,27 @@ def verify_tls(host: str) -> bool:
     return urlsplit(host).hostname not in LOCAL_HOSTS
 
 
-@events.test_start.add_listener
-def create_account(environment: Any, **_kwargs: Any) -> None:
-    """Register one user (load-<random>@example.com) and log in once, before any user starts."""
-    email, password = f"load-{secrets.token_hex(4)}@example.com", secrets.token_urlsafe(16)
-    host, verify = environment.host, verify_tls(environment.host)
-    requests.post(
-        f"{host}/api/v1/auth/register",
-        json={"email": email, "password": password},
-        verify=verify,
-        timeout=10,
-    )
-    reply = requests.post(
-        f"{host}/api/v1/auth/token",
-        data={"username": email, "password": password},
-        verify=verify,
-        timeout=10,
-    )
-    SHARED["authorization"] = f"Bearer {reply.json()['access_token']}"
-    SHARED["verify"] = verify
+def pool_size(environment: Any) -> int:
+    """NOTES_LOAD_ACCOUNTS, else one account per USERS_PER_ACCOUNT simulated users."""
+    if configured := os.environ.get("NOTES_LOAD_ACCOUNTS"):
+        return int(configured)
+    users = getattr(environment.parsed_options, "num_users", None) or 50
+    return math.ceil(users / USERS_PER_ACCOUNT)
+
+
+@events.init.add_listener
+def create_accounts(environment: Any, **_kwargs: Any) -> None:
+    """Register and log in the pool when Locust starts: "init" finishes before the run (and
+    its --run-time clock) begins, so the minutes of registration do not eat into the test."""
+    host = environment.host
+    POOL[:] = register_accounts(host, pool_size(environment), verify_tls(host))
+
+
+@events.test_stop.add_listener
+def remove_accounts(environment: Any, **_kwargs: Any) -> None:
+    """Delete the pool's accounts (and with them every note the run wrote)."""
+    deleted = delete_accounts(environment.host, POOL, verify_tls(environment.host))
+    print(f"deleted {deleted}/{len(POOL)} load-test accounts")
 
 
 class NotesUser(HttpUser):
@@ -57,9 +65,10 @@ class NotesUser(HttpUser):
     wait_time = between(0.05, 0.2)
 
     def on_start(self) -> None:
-        """Use the shared token and the TLS setting chosen at test start."""
-        self.client.headers["Authorization"] = SHARED["authorization"]
-        self.client.verify = SHARED["verify"]
+        """Take the next account of the pool (round robin) and the TLS setting."""
+        account = POOL[next(TURN) % len(POOL)]
+        self.client.headers.update(account.headers)
+        self.client.verify = verify_tls(self.host)
         self.note_ids: list[int] = []
 
     @task(5)

@@ -78,6 +78,17 @@ def test_secrets_are_read_from_files(tmp_path: Path) -> None:
     assert settings.jwt_secret.get_secret_value().startswith("from-a-secret-file-")
 
 
+def test_redis_password_file_goes_into_the_url(tmp_path: Path) -> None:
+    """notes_redis_password (a secret file) completes NOTES_REDIS_URL; a URL with one wins."""
+    (tmp_path / "notes_redis_password").write_text("s3cret/+", encoding="utf-8")
+    url = SecretStr("redis://redis:6379/0")
+    settings = Settings(_env_file=None, _secrets_dir=tmp_path, redis_url=url)
+    assert settings.redis_url.get_secret_value() == "redis://:s3cret%2F%2B@redis:6379/0"
+    explicit = SecretStr("redis://:other@redis:6379/0")
+    settings = Settings(_env_file=None, _secrets_dir=tmp_path, redis_url=explicit)
+    assert settings.redis_url.get_secret_value() == "redis://:other@redis:6379/0"
+
+
 def test_pgbouncer_mode_disables_statement_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     """Behind PgBouncer in transaction mode, asyncpg must not cache prepared statements."""
     captured: dict[str, Any] = {}

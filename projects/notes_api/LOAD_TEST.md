@@ -11,7 +11,7 @@ It has two result sections:
 
 ## Scenario
 
-`load/locustfile.py` simulates users of one account who mostly read and sometimes write:
+`load/locustfile.py` simulates users who mostly read and sometimes write:
 
 | Task | Request | Weight | What it exercises |
 | --- | --- | ---: | --- |
@@ -22,9 +22,17 @@ It has two result sections:
 
 - **Think time:** each user waits 50–200 ms between requests (`between(0.05, 0.2)`), so 50 users
   offer roughly 250–400 requests per second.
-- **Setup:** one account (`load-<random>@example.com`) is registered and logged in once
-  before the users start. Registration and login are rate-limited per address, so users
-  share one token.
+- **Accounts:** a pool of throw-away accounts, `load-<run>-<n>@example.com`, one for every two
+  simulated users (25 for 50 users; `NOTES_LOAD_ACCOUNTS` overrides it). The API limits each
+  user to 120 writes a minute, and one shared account would measure that limit instead of
+  the server; raising the limit for the test would measure a server that is not the
+  production one. Each account writes about 40 times a minute, within its budget.
+- **Setup and clean-up:** `load/accounts.py` registers the pool before the users start, at
+  the pace the registration limit allows (5 a minute per client address: about five
+  minutes for 25 accounts; Locust's run time starts after that), then logs every account in.
+  When the test stops, each account deletes itself (`DELETE /api/v1/users/me`; its notes,
+  tokens and events cascade). The same file runs unchanged locally and against the live
+  server.
 - **Run (live):** 50 users, spawn rate 10 per second, 2 minutes, from a machine close to the
   server's region. Network round trips count in the client-side numbers; the server-side
   95th percentile from Prometheus does not include them.
@@ -57,28 +65,29 @@ uv run python load/report.py --stats load/results/live_stats.csv --section live 
 kill %1                                                  # close the tunnel
 ```
 
-`load/results/` is git-ignored. The run creates notes owned by the `load-…@example.com`
-account. [DEPLOY.md](DEPLOY.md) shows how to delete them.
+`load/results/` is git-ignored. The run deletes its own accounts and their notes at the
+end. Only if it was killed first, [DEPLOY.md](DEPLOY.md) (step 13) shows how to delete what
+is left. Keep a run under 10 minutes after the setup: access tokens last 15 minutes.
 
 ## Results — local rehearsal
 
 <!-- results:local:start -->
-Run at 2026-11-21 07:20 UTC against `https://localhost:58443`: 50 users, spawn rate 10/s, 15s.
+Run at 2026-11-21 13:25 UTC against `https://localhost:58443`: 50 users, spawn rate 10/s, 15s.
 
 | Endpoint | Requests | Failures | req/s | p50 ms | p95 ms | p99 ms | max ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GET `/api/v1/notes` | 2202 | 0 | 157.2 | 8 | 15 | 27 | 67 |
-| POST `/api/v1/notes` | 449 | 0 | 32.0 | 9 | 17 | 28 | 70 |
-| GET `/api/v1/notes/feed` | 470 | 0 | 33.5 | 7 | 15 | 28 | 61 |
-| GET `/api/v1/notes/{id}` | 1222 | 0 | 87.2 | 6 | 13 | 21 | 75 |
-| **All requests** | 4343 | 0 | 310.0 | 7 | 15 | 25 | 75 |
+| GET `/api/v1/notes` | 2470 | 0 | 164.6 | 7 | 13 | 25 | 58 |
+| POST `/api/v1/notes` | 530 | 0 | 35.3 | 9 | 20 | 31 | 68 |
+| GET `/api/v1/notes/feed` | 461 | 0 | 30.7 | 6 | 13 | 21 | 44 |
+| GET `/api/v1/notes/{id}` | 1290 | 0 | 85.9 | 5 | 11 | 16 | 28 |
+| **All requests** | 4751 | 0 | 316.5 | 7 | 14 | 24 | 68 |
 
 | Target | Measured | Verdict |
 | --- | ---: | --- |
-| p95 latency (client side) < 200 ms | 15 ms | **PASS** |
+| p95 latency (client side) < 200 ms | 14 ms | **PASS** |
 | failed requests < 1% | 0.00% | **PASS** |
-| throughput >= 100 req/s | 310 req/s | **PASS** |
-| p95 latency (server side, Prometheus) < 200 ms | 18 ms | **PASS** |
+| throughput >= 100 req/s | 317 req/s | **PASS** |
+| p95 latency (server side, Prometheus) < 200 ms | 13 ms | **PASS** |
 <!-- results:local:end -->
 
 ## Results — live

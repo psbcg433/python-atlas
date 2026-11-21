@@ -29,7 +29,7 @@ def real_settings(settings: Settings, redis_url: str) -> Settings:
 
 def burst(settings: Settings) -> None:
     """Process every queued job (and the jobs they queue), then stop."""
-    asyncio.run(run_worker(burst=True, settings=settings))
+    asyncio.run(run_worker(burst=True, settings=settings, resolver=fake_resolver))
 
 
 @respx.mock

@@ -2798,7 +2798,7 @@ def _notes_v5_intro_cells() -> list[NotebookNode]:
             | — | **`POST /api/v1/exports`** → 202 + `Location`; progress as **SSE** from a Redis Stream (resumable with `Last-Event-ID`); download |
             | every `GET` hits the database | `GET /notes/{id}`: Redis **cache-aside** (versioned keys, TTL jitter, stampede lock, hit/miss stats), strong **ETag**, **304**, `Cache-Control: private, no-cache`; lists `no-store` |
 
-            The cells write the 34 files that change or are new (of 77). First, remove files of
+            The cells write the 37 files that change or are new (of 81). First, remove files of
             other versions (nothing after a full run):
             """
         ),
@@ -2830,6 +2830,7 @@ def _notes_v5_intro_cells() -> list[NotebookNode]:
             tests/test_pages.py tests/test_pagination.py tests/test_postgres.py tests/test_realtime.py
             tests/test_redis_worker.py tests/test_repository.py tests/test_security.py
             tests/test_settings.py tests/test_worker.py
+            src/notes_api/manage.py src/notes_api/netguard.py tests/test_limits.py tests/test_netguard.py
             """.split()
             print("removed:", prune_notes_project(NOTES_V5_FILES))
             print(f"{len(NOTES_V5_FILES)} files in v5")
@@ -2867,7 +2868,6 @@ def _notes_v5_try_cells() -> list[NotebookNode]:
                 password_time_cost=1,
                 password_memory_kib=64,
                 cookie_secure=False,
-                admin_emails=["admin@example.com"],
             )
             schema_engine = notes_db.create_engine_from_settings(notes_settings)
             async with schema_engine.begin() as connection:
@@ -2900,9 +2900,12 @@ def _notes_v5_try_cells() -> list[NotebookNode]:
         ),
         code(
             r'''
-            def v5_login(client: TestClient, email: str) -> dict[str, str]:
-                """Register (ignoring 409) and log in; return a bearer header."""
+            def v5_login(client: TestClient, email: str, admin: bool = False) -> dict[str, str]:
+                """Register (ignoring 409), promote if asked (the operator command), log in."""
                 client.post("/api/v1/auth/register", json={"email": email, "password": "a-long-passphrase"})
+                if admin:
+                    set_role = importlib.import_module("notes_api.manage").set_role
+                    client.portal.call(set_role, client.app.state.session_factory, email, "admin")
                 tokens = client.post(
                     "/api/v1/auth/token", data={"username": email, "password": "a-long-passphrase"}
                 ).json()
@@ -2910,7 +2913,7 @@ def _notes_v5_try_cells() -> list[NotebookNode]:
 
 
             with TestClient(notes_app) as client:
-                as_admin = v5_login(client, "admin@example.com")
+                as_admin = v5_login(client, "admin@example.com", admin=True)
                 created = client.post("/api/v1/notes", json={"title": "Cached note"}, headers=as_admin).json()
                 note_url = f"/api/v1/notes/{created['id']}"
                 first = client.get(note_url, headers=as_admin)
@@ -3348,8 +3351,12 @@ def _notes_v5_data_cells() -> list[NotebookNode]:
                 ),
                 ('    app_name: str = "Notes API"', "Part 2 (continues `Settings`): more fields."),
                 (
+                    "    # Per-user budgets per window on expensive routes (OWASP API4); a 429 when one is spent",
+                    "Part 3 (continues `Settings`): the per-user budgets (writes, link previews, exports) and their window; with `ws_connections_per_user` above, the resource limits of OWASP API4.",
+                ),
+                (
                     "    @property",
-                    "Part 3 (continues `Settings`): `oauth_enabled()`, `require_real_secrets_in_production()`; then `get_settings()` — The process-wide settings, read from the environment once and then cached.",
+                    "Part 4 (continues `Settings`): `oauth_enabled()`, `require_real_secrets_in_production()`; then `get_settings()` — The process-wide settings, read from the environment once and then cached.",
                 ),
             ],
         ),
@@ -3514,7 +3521,51 @@ def _notes_v5_data_cells() -> list[NotebookNode]:
                 ),
                 (
                     "    async def add_refresh_token(self, token: RefreshToken) -> None:",
-                    "Part 7 (continues `SqlUserRepository`): `add_refresh_token()`, `refresh_token_by_hash()`, `revoke_family()`, `add_api_key()`, ... — Store a refresh token row.",
+                    "Part 7 (continues `SqlUserRepository`): `add_refresh_token()`, `refresh_token_by_hash()`, `revoke_family()` — Store a refresh token row.",
+                ),
+                (
+                    "    async def add_api_key(self, key: ApiKey) -> ApiKey:",
+                    "Part 8 (continues `SqlUserRepository`): `add_api_key()`, `api_key_by_hash()`, `api_keys_of()`, `delete_user()` — `delete_user()` (new) backs `DELETE /users/me`: one DELETE, and the foreign keys' ON DELETE CASCADE removes notes, tokens, keys and events.",
+                ),
+            ],
+        ),
+        md(
+            """
+            **`netguard.py`** (new): webhooks are a second place where the server fetches
+            a URL a user chose, so Unit 6.5's SSRF check moves into its own module and gets
+            stronger. `LinkPreviewer.check_url()` resolved the host, checked the addresses,
+            and then let httpx resolve the host *again* to connect. An attacker who controls
+            the DNS of their domain can answer the first lookup with a public address and the
+            second with `127.0.0.1` or `169.254.169.254` (**DNS rebinding**, with a TTL of
+            0). The fix is to check where the connection is made: `PublicAddressBackend` is
+            an httpcore network backend that resolves, refuses non-public addresses, and
+            connects to the address it checked. `public_only_client()` builds the client that
+            link previews and the worker's webhook deliveries use; the OIDC client keeps the
+            ordinary one (its endpoints come from configuration, not from users):
+            """
+        ),
+        *writefile_cells(
+            NOTES_V5_NETGUARD_PY,
+            [
+                (
+                    "",
+                    "Part 1 of `netguard.py`: the module docstring and imports, `resolve_host()`, `is_public_address()`.",
+                ),
+                (
+                    "async def check_public_url(url: str, resolver: Resolver = resolve_host) -> str | None:",
+                    "Part 2: `check_public_url()` — the early, readable answer that `PUT /users/me/webhook`, link previews and the worker (before every delivery) give.",
+                ),
+                (
+                    "class PublicAddressBackend(httpcore.AsyncNetworkBackend):",
+                    "Part 3: `PublicAddressBackend` — `connect_tcp()` resolves, checks every address and connects to the checked one.",
+                ),
+                (
+                    "    async def connect_unix_socket(",
+                    "Part 4 (continues `PublicAddressBackend`): `connect_unix_socket()` (always refused) and `sleep()`.",
+                ),
+                (
+                    "def public_only_client(",
+                    "Part 5: `public_only_client()` — the client on that backend (httpx has no public option for it, so the transport's pool is rebuilt), without proxies from the environment and without redirects.",
                 ),
             ],
         ),
@@ -3543,11 +3594,11 @@ def _notes_v5_data_cells() -> list[NotebookNode]:
                 ),
                 (
                     "    async def import_notes(self, notes: list[NoteCreate]) -> list[Note]:",
-                    "Part 4 (continues `NoteService`): `import_notes()`; then `parse_import()`, `resolve_host()`, `is_public_address()` — Notes from a .json list or a .csv file (title, body, tags separated by ';', pinned).",
+                    "Part 4 (continues `NoteService`): `import_notes()`; then `parse_import()` — Notes from a .json list or a .csv file (title, body, tags separated by ';', pinned).",
                 ),
                 (
                     "class LinkPreviewer:",
-                    "Part 5: `LinkPreviewer` — Fetch the <title> of links in a note, refusing anything that is not a public web URL.",
+                    "Part 5: `LinkPreviewer` — Fetch the <title> of links in a note, refusing anything that is not a public web URL; the checks now live in `netguard.py`.",
                 ),
                 (
                     "    async def preview(self, url: str) -> LinkPreview:",
@@ -3653,7 +3704,7 @@ def _notes_v5_background_cells() -> list[NotebookNode]:
                 ),
                 (
                     "async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:",
-                    "Part 4: `deliver_webhook()` — POST one signed event; retry with exponential backoff; dead-letter after the last try.",
+                    "Part 4: `deliver_webhook()` — check the URL again (DNS may have changed since it was saved; a blocked URL is dead-lettered at once), POST one signed event through the public-only client, retry with exponential backoff, dead-letter after the last try.",
                 ),
                 (
                     "async def export_notes(",
@@ -3664,7 +3715,7 @@ def _notes_v5_background_cells() -> list[NotebookNode]:
                     "Part 6: `purge_expired_tokens()`, `WorkerSettings` — Daily: delete refresh tokens that expired more than a day ago (one worker at a time).",
                 ),
                 (
-                    "async def run_worker(burst: bool = False, settings: Settings | None = None) -> None:",
+                    "async def run_worker(",
                     "Part 7: `run_worker()` — Build the arq Worker inside a running event loop and run it (SIGTERM stops it cleanly).",
                 ),
             ],
@@ -3698,11 +3749,19 @@ def _notes_v5_background_cells() -> list[NotebookNode]:
                 ),
                 (
                     "def get_login_limiter(redis: RedisDep, settings: SettingsDep) -> FixedWindowRateLimiter:",
-                    "Part 6: `get_login_limiter()`, `LoginLimiterDep`, `get_oidc_client()`, `OidcClientDep`, `get_cookie_principal()`, ... — The login/registration rate limiter (shared by every worker through Redis).",
+                    "Part 6: `get_login_limiter()`, `LoginLimiterDep` — The login/registration rate limiter (shared by every worker through Redis).",
+                ),
+                (
+                    "def per_user_limit(bucket: str, scopes: list[str]) -> Any:",
+                    "Part 7: `per_user_limit()` and the route dependencies built with it (OWASP API4). The inner `enforce()` asks for the principal with the route's own scopes: FastAPI caches a dependency per function and scopes, so the limiter adds no second token check.",
+                ),
+                (
+                    "def get_oidc_client(settings: SettingsDep, client: HttpClientDep, redis: RedisDep) -> OidcClient:",
+                    "Part 8: `get_oidc_client()`, `OidcClientDep`, `get_cookie_principal()`, `CookiePrincipalDep`, `get_queue()` — The OpenID Connect client (the router checks settings.oauth_enabled first).",
                 ),
                 (
                     "def get_mailer() -> Mailer:",
-                    "Part 7: `get_mailer()`, `get_note_cache()`, `QueueDep`, `MailerDep`, `NoteCacheDep`, ... — Where emails go (tests override it with a fake that records messages).",
+                    "Part 9: `get_mailer()`, `get_note_cache()`, `QueueDep`, `MailerDep`, `NoteCacheDep`, ... — Where emails go (tests override it with a fake that records messages).",
                 ),
             ],
         ),
@@ -3740,15 +3799,19 @@ def _notes_v5_router_cells() -> list[NotebookNode]:
             [
                 (
                     "",
-                    "Part 1 of `routers/users.py`: the module docstring and imports, then `me()`, `create_api_key()`.",
+                    "Part 1 of `routers/users.py`: the module docstring and imports, then `me()`.",
+                ),
+                (
+                    '@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT, dependencies=[ACCOUNT_WRITE_LIMIT])',
+                    "Part 2: `delete_me()` (new: an account can delete itself; the load test uses it to remove its accounts) and `create_api_key()`. Every write here spends the caller's write budget.",
                 ),
                 (
                     '@router.get("/me/api-keys", response_model=list[ApiKeyRead])',
-                    "Part 2: `list_api_keys()`, `revoke_api_key()`, `get_webhook()` — The caller's keys, without their secrets.",
+                    "Part 3: `list_api_keys()`, `revoke_api_key()`, `get_webhook()` — The caller's keys, without their secrets.",
                 ),
                 (
-                    '@router.put("/me/webhook")',
-                    "Part 3: `set_webhook()`, `delete_webhook()` — Register a public HTTPS/HTTP URL; returns a new signing secret, once.",
+                    '@router.put("/me/webhook", dependencies=[ACCOUNT_WRITE_LIMIT])',
+                    "Part 4: `set_webhook()`, `delete_webhook()` — Register a public HTTPS/HTTP URL; returns a new signing secret, once.",
                 ),
             ],
         ),
@@ -3782,11 +3845,11 @@ def _notes_v5_router_cells() -> list[NotebookNode]:
                     "Part 4: `get_note()` — Fetch one note through the cache; 304 when the client's copy is current.",
                 ),
                 (
-                    '@router.put("/{note_id}", response_model=NoteRead, responses=NOT_FOUND)',
+                    '@router.put(\n    "/{note_id}",',
                     "Part 5: `replace_note()`, `update_note()` — Replace every field of a note (omitted fields get their defaults).",
                 ),
                 (
-                    '@router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT, responses=NOT_FOUND)',
+                    '@router.delete(\n    "/{note_id}",',
                     "Part 6: `delete_note()`, `note_links()` — Delete a note.",
                 ),
             ],
@@ -3800,15 +3863,19 @@ def _notes_v5_router_cells() -> list[NotebookNode]:
                 ("", "Part 1 of `routers/admin.py`: the module docstring and imports."),
                 (
                     "async def read_upload(upload: UploadFile, max_bytes: int) -> bytes:",
-                    "Part 2: `read_upload()`, `import_notes()`, `export_notes()` — The file's bytes after checking its extension, content type and size.",
+                    "Part 2: `read_upload()`, `import_notes()` — The file's bytes after checking its extension, content type and size.",
                 ),
                 (
-                    '@router.delete("/notes")',
-                    "Part 3: `delete_all_notes()`, `cache_stats()`, `dead_webhooks()` — Remove every note of every user.",
+                    '@router.get("/export", dependencies=[ADMIN_EXPORT_LIMIT])',
+                    "Part 3: `export_notes()` — every note of every user in one response: it spends the admin's export budget.",
                 ),
                 (
-                    '@router.post("/webhooks/dead/{event_id}/retry", status_code=status.HTTP_202_ACCEPTED)',
-                    "Part 4: `retry_dead_webhook()` — Send a dead-lettered event again (after the receiver was fixed).",
+                    '@router.delete("/notes", dependencies=[ADMIN_WRITE_LIMIT])',
+                    "Part 4: `delete_all_notes()`, `cache_stats()`, `dead_webhooks()` — Remove every note of every user.",
+                ),
+                (
+                    '@router.post(\n    "/webhooks/dead/{event_id}/retry",',
+                    "Part 5: `retry_dead_webhook()` — Send a dead-lettered event again (after the receiver was fixed).",
                 ),
             ],
         ),
@@ -3828,7 +3895,7 @@ def _notes_v5_router_cells() -> list[NotebookNode]:
                     "Part 1 of `routers/exports.py`: the module docstring and imports, then `check_owner()`.",
                 ),
                 (
-                    '@router.post("", status_code=status.HTTP_202_ACCEPTED)',
+                    '@router.post("", status_code=status.HTTP_202_ACCEPTED, dependencies=[EXPORT_LIMIT])',
                     "Part 2: `start_export()`, `export_status()` — Queue an export of all the caller's notes; 202 Accepted with where to look.",
                 ),
                 (
@@ -3855,15 +3922,27 @@ def _notes_v5_router_cells() -> list[NotebookNode]:
                 ),
                 (
                     "    def remove(self, user_id: int, websocket: WebSocket) -> None:",
-                    "Part 2 (continues `ConnectionManager`): `remove()`, `count()`; then `authenticate()`, `forward_events()` — Check the access token sent as the first message, with a short-lived DB session.",
+                    "Part 2 (continues `ConnectionManager`): `remove()`, `count()`; then `authenticate()` — Check the access token sent as the first message, with a short-lived DB session.",
+                ),
+                (
+                    "def slots_key(user_id: int) -> str:",
+                    "Part 3: `slots_key()`, `claim_slot()` — the per-user WebSocket cap (OWASP API4) lives in Redis, so it holds across processes and replicas: one sorted-set entry per open socket, scored with its last heartbeat, so the sockets of a crashed process age out instead of blocking the user forever.",
+                ),
+                (
+                    "async def forward_events(",
+                    "Part 4: `forward_events()` — Redis → client plus heartbeats; each ping also refreshes this socket's entry in the per-user cap.",
                 ),
                 (
                     "async def read_client(websocket: WebSocket) -> None:",
-                    "Part 3: `read_client()` — Client → server: answer pings; any other message is ignored. Ends on disconnect.",
+                    "Part 5: `read_client()` — Client → server: answer pings; any other message is ignored. Ends on disconnect.",
                 ),
                 (
                     '@router.websocket("/ws")',
-                    'Part 4: `live_updates()` — Accept, authenticate with the first message ({"token": ...}), then stream events.',
+                    'Part 6: `live_updates()` — Accept, authenticate with the first message ({"token": ...}), claim a slot under the per-user cap (close 1008 when it is full), then stream events.',
+                ),
+                (
+                    "    async def keep_slot() -> None:",
+                    "Part 7 (continues `live_updates()`): `keep_slot()`, the two tasks, and the clean-up that also gives the slot back.",
                 ),
             ],
         ),
@@ -3914,8 +3993,8 @@ def _notes_v5_test_cells() -> list[NotebookNode]:
                     "Part 3: `mailer()`, `app()`, `anonymous()`, `client()` — Records emails instead of sending them.",
                 ),
                 (
-                    "@pytest.fixture\ndef admin_headers(anonymous: TestClient) -> dict[str, str]:",
-                    "Part 4: `admin_headers()` — Bearer headers of an admin (admin@example.com is in admin_emails).",
+                    "@pytest.fixture\ndef admin_email(anonymous: TestClient) -> str:",
+                    "Part 4: `admin_email()`, `admin_headers()` — an admin is an ordinary registration promoted with `notes_api.manage.set_role()`, as an operator would; the token is issued after the promotion.",
                 ),
             ],
         ),
@@ -3931,11 +4010,15 @@ def _notes_v5_test_cells() -> list[NotebookNode]:
                 ),
                 (
                     "def register(client: TestClient, email: str, password: str = PASSWORD) -> Any:",
-                    "Part 2: `register()`, `login()`, `auth_headers()`, `fake_resolver()` — POST /auth/register (without the client's default credentials).",
+                    "Part 2: `register()`, `login()`, `auth_headers()`, `promote()` — POST /auth/register (without the client's default credentials), log in, and promote an account the way an operator does (`notes_api.manage.set_role`).",
+                ),
+                (
+                    "async def fake_resolver(host: str) -> list[str]:",
+                    "Part 3: `fake_resolver()` — DNS for tests: IP literals resolve to themselves, a few names to fixed addresses.",
                 ),
                 (
                     "async def create_tables(settings: Settings) -> None:",
-                    "Part 3: `create_tables()`, `FakeMailer` — CREATE TABLE for every model (fast; the PostgreSQL tests run the Alembic migrations).",
+                    "Part 4: `create_tables()`, `FakeMailer` — CREATE TABLE for every model (fast; the PostgreSQL tests run the Alembic migrations).",
                 ),
             ],
         ),
@@ -3976,8 +4059,12 @@ def _notes_v5_test_cells() -> list[NotebookNode]:
                     "Part 6: `test_failing_webhook_retries_then_dead_letters()` — Failures raise Retry with growing delays; the last try marks the event dead.",
                 ),
                 (
+                    "@respx.mock\ndef test_webhook_url_is_checked_again_before_delivery(",
+                    "Part 7: `test_webhook_url_is_checked_again_before_delivery()` — the URL is checked again at delivery: a host that now resolves to a private address gets nothing, and the event is dead-lettered without retries.",
+                ),
+                (
                     "def test_relay_lock_prevents_overlap(",
-                    "Part 7: `test_relay_lock_prevents_overlap()`, `test_purge_expired_tokens()`, `test_webhook_url_must_be_public()` — While another relay holds the lock, a second one does nothing.",
+                    "Part 8: `test_relay_lock_prevents_overlap()`, `test_purge_expired_tokens()`, `test_webhook_url_must_be_public()` — While another relay holds the lock, a second one does nothing.",
                 ),
             ],
         ),
@@ -4056,6 +4143,56 @@ def _notes_v5_test_cells() -> list[NotebookNode]:
                 (
                     "def test_existing_notes_get_a_disabled_legacy_owner(tmp_path: Path) -> None:",
                     "Part 4: `test_existing_notes_get_a_disabled_legacy_owner()` — 0004 gives notes written before accounts existed to an owner that cannot log in.",
+                ),
+            ],
+        ),
+        md(
+            """
+            **`test_netguard.py`** (new): a real HTTP server on 127.0.0.1 plays the private
+            target. A rebinding resolver answers the check with a public address and the
+            connection with 127.0.0.1: the request never arrives. With loopback allowed (a
+            test-only switch), a name no DNS server knows still connects, which shows the
+            client used the checked address instead of a lookup of its own:
+            """
+        ),
+        *writefile_cells(
+            NOTES_V5_TESTS_TEST_NETGUARD_PY,
+            [
+                (
+                    "",
+                    "Part 1 of `tests/test_netguard.py`: the module docstring and imports, then `Recorder` (a handler that remembers each request's Host header).",
+                ),
+                (
+                    "@pytest.fixture\ndef internal_port() -> Iterator[int]:",
+                    "Part 2: `internal_port()`, `rebinding_dns()`.",
+                ),
+                (
+                    "async def test_rebinding_is_refused_at_connect_time(internal_port: int) -> None:",
+                    "Part 3: `test_rebinding_is_refused_at_connect_time()`, `test_link_preview_reports_the_rebinding()`.",
+                ),
+                (
+                    "async def test_the_connection_goes_to_the_checked_address(internal_port: int) -> None:",
+                    "Part 4: `test_the_connection_goes_to_the_checked_address()`, `test_private_ip_literals_are_refused()`.",
+                ),
+            ],
+        ),
+        md(
+            """
+            **`test_limits.py`** (new): the per-user budgets with small values (the
+            module overrides the `settings` fixture), the WebSocket cap, and
+            `DELETE /users/me`, which the load test uses to remove its accounts:
+            """
+        ),
+        *writefile_cells(
+            NOTES_V5_TESTS_TEST_LIMITS_PY,
+            [
+                (
+                    "",
+                    "Part 1 of `tests/test_limits.py`: the module docstring and imports, `settings()` (small budgets), `test_writes_are_limited_per_user()`, `test_link_previews_and_exports_have_their_own_budgets()`.",
+                ),
+                (
+                    "def test_websocket_cap_per_user(client: TestClient) -> None:",
+                    "Part 2: `test_websocket_cap_per_user()`, `test_deleting_the_account_removes_everything()`.",
                 ),
             ],
         ),
@@ -4153,8 +4290,6 @@ NOTES_REDIS_URL=redis://localhost:6379/0
 NOTES_JWT_SECRET=change-me
 NOTES_ACCESS_TOKEN_MINUTES=15
 NOTES_REFRESH_TOKEN_DAYS=14
-# Accounts registered with these addresses become admins (JSON list).
-NOTES_ADMIN_EMAILS=[]
 NOTES_LOGIN_RATE_LIMIT=5
 NOTES_LOGIN_RATE_WINDOW_SECONDS=60
 # Set to false only for plain-HTTP local development (the session cookie needs HTTPS otherwise).
@@ -4204,7 +4339,8 @@ docker compose down                           # add -v to delete the data volume
 ```
 
 Local plain HTTP: set `NOTES_COOKIE_SECURE=false`, or the browser will not send the session
-cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
+cookie. Every account starts as an ordinary user; promote one with
+`uv run python -m notes_api.manage promote-admin <email>` (a command, never an HTTP request).
 
 
 ## Endpoints
@@ -4217,7 +4353,7 @@ cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
 | `POST` | `/api/v1/auth/refresh` | refresh token | rotation: each refresh token works once; reuse revokes the family |
 | `POST` | `/api/v1/auth/logout` | refresh token (+ bearer) | revokes the family and denies the access token |
 | `GET` | `/api/v1/auth/oauth/login`, `/oauth/callback` | none | OpenID Connect (Authorization Code + PKCE); 404 unless configured |
-| `GET` | `/api/v1/users/me` | bearer or key | the current user |
+| `GET/DELETE` | `/api/v1/users/me` | bearer or key | the current user; DELETE removes the account and everything it owns |
 | `POST/GET/DELETE` | `/api/v1/users/me/api-keys[/{id}]` | bearer | keys are shown once, stored as SHA-256, limited to scopes |
 | `POST/GET` | `/api/v1/notes` | `notes:write` / `notes:read` | only the caller's notes |
 | `GET` | `/api/v1/notes/feed` | `notes:read` | keyset pagination |
@@ -4226,7 +4362,7 @@ cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
 | `GET/PUT/DELETE` | `/api/v1/users/me/webhook` | bearer | a public URL; PUT returns the signing secret once |
 | `POST` | `/api/v1/exports` | any user | 202 + `Location`; an ARQ job builds the export |
 | `GET` | `/api/v1/exports/{id}`, `/download`, `/events` | owner | status, JSON file, `text/event-stream` progress (`Last-Event-ID`) |
-| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth |
+| `WS` | `/api/v1/ws` | first message `{"token": ...}` | live note events; server pings; 1008 on bad auth or over 5 sockets per user |
 | `POST/GET/DELETE` | `/api/v1/admin/import`, `/export`, `/notes` | admin role + `admin` scope | bulk operations |
 | `GET/POST` | `/api/v1/admin/cache-stats`, `/webhooks/dead[/{id}/retry]` | admin | cache hit rate; dead-letter list and replay |
 | `GET/POST` | `/login`, `/logout`, `/`, `/notes`, `/notes/{id}/pin` | session cookie + CSRF token | HTML (Jinja2 + HTMX) |
@@ -4235,7 +4371,8 @@ Credentials: `Authorization: Bearer <access token>` or `X-API-Key: nk_...`. Erro
 `application/problem+json` (RFC 9457). Every response carries `X-Request-ID`,
 `Server-Timing` and security headers (HSTS, CSP, `X-Content-Type-Options`, `X-Frame-Options`).
 `GET /api/v1/notes/{id}` sends `ETag` and `Cache-Control: private, no-cache` and answers
-`If-None-Match` with 304. Webhooks carry `X-Notes-Event-Id` and
+`If-None-Match` with 304. Per-user budgets (429 + `Retry-After`): 120 writes, 10 link-preview
+calls and 5 exports a minute (`NOTES_WRITE_RATE_LIMIT` etc.). Webhooks carry `X-Notes-Event-Id` and
 `X-Notes-Signature: t=<unix time>,v1=<HMAC-SHA256 of "t.body">`.
 
 
@@ -4326,7 +4463,6 @@ class Settings(BaseSettings):
     refresh_token_days: int = Field(default=14, ge=1)
     password_time_cost: int = Field(default=3, ge=1)  # Argon2id parameters (tests lower them)
     password_memory_kib: int = Field(default=65_536, ge=32)  # Argon2 needs 8 KiB per lane (4)
-    admin_emails: list[str] = []  # these addresses get the admin role when they register
     login_rate_limit: int = Field(default=5, ge=1)  # attempts per window, per IP + email
     login_rate_window_seconds: int = Field(default=60, ge=1)
     cookie_secure: bool = True  # session cookie only over HTTPS (False for local HTTP)
@@ -4343,6 +4479,13 @@ class Settings(BaseSettings):
     webhook_max_attempts: int = Field(default=5, ge=1)  # then the event is dead-lettered
     cache_ttl_seconds: int = Field(default=60, ge=1)
     ws_heartbeat_seconds: float = Field(default=20.0, gt=0)
+    ws_connections_per_user: int = Field(default=5, ge=1)  # open sockets per user, all replicas
+
+    # Per-user budgets per window on expensive routes (OWASP API4); a 429 when one is spent
+    write_rate_limit: int = Field(default=120, ge=1)  # note, key and webhook writes; admin actions
+    link_preview_rate_limit: int = Field(default=10, ge=1)  # each call fetches up to 5 URLs
+    export_rate_limit: int = Field(default=5, ge=1)  # POST /exports and GET /admin/export
+    user_rate_window_seconds: int = Field(default=60, ge=1)
     export_ttl_seconds: int = Field(default=3600, ge=60)
 
     @property
@@ -4535,6 +4678,7 @@ from fastapi import FastAPI
 from notes_api import __version__
 from notes_api.core.config import Settings
 from notes_api.db import create_engine_from_settings, make_session_factory
+from notes_api.netguard import public_only_client
 
 
 @asynccontextmanager
@@ -4550,13 +4694,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The ARQ client (bytes, pickled jobs) for enqueuing background work; lazy as well
     app.state.queue = ArqRedis.from_url(settings.redis_url.get_secret_value())
     try:
-        async with httpx.AsyncClient(
-            timeout=settings.http_timeout_seconds,
-            follow_redirects=False,  # a redirect could lead a server-side fetch somewhere private
-            headers={"User-Agent": f"notes-api/{__version__}"},
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        ) as http_client:
-            app.state.http_client = http_client
+        async with (
+            httpx.AsyncClient(
+                timeout=settings.http_timeout_seconds,
+                follow_redirects=False,  # a redirect could lead a fetch somewhere private
+                headers={"User-Agent": f"notes-api/{__version__}"},
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            ) as http_client,
+            public_only_client(
+                settings.http_timeout_seconds, f"notes-api/{__version__}"
+            ) as outbound_client,
+        ):
+            app.state.http_client = http_client  # configured endpoints (the OIDC provider)
+            app.state.outbound_client = outbound_client  # user-supplied URLs (link previews)
             yield
     finally:
         await app.state.queue.aclose()
@@ -5277,6 +5427,137 @@ class SqlUserRepository:
         """A user's keys, newest first (revoked ones included)."""
         statement = select(ApiKey).where(ApiKey.user_id == user_id).order_by(ApiKey.id.desc())
         return list(await self.session.scalars(statement))
+
+    async def delete_user(self, user_id: int) -> None:
+        """DELETE the user; the database's ON DELETE CASCADE removes everything it owns."""
+        await self.session.execute(delete(User).where(User.id == user_id))
+'''
+
+NOTES_V5_NETGUARD_PY = r'''
+%%writefile ../projects/notes_api/src/notes_api/netguard.py
+"""Outbound requests to user-supplied URLs (link previews, webhooks) without SSRF.
+
+Checking a URL and then letting the HTTP client resolve the host again is not enough: the
+DNS answer can change between the two lookups (DNS rebinding), so a name that was public for
+the check can be 127.0.0.1 or 169.254.169.254 for the connection. PublicAddressBackend makes
+the check where the connection is made: it resolves the host, refuses if any address is not
+public, and connects to the address it checked. TLS still verifies the certificate against
+the URL's host name (httpcore passes it as server_hostname), so HTTPS keeps working.
+"""
+
+import asyncio
+import ipaddress
+import socket
+import urllib.parse
+from collections.abc import Awaitable, Callable, Iterable
+
+import httpcore
+import httpx
+
+type Resolver = Callable[[str], Awaitable[list[str]]]
+type AddressCheck = Callable[[str], bool]
+BLOCKED = "blocked: not a public address"
+
+
+async def resolve_host(host: str) -> list[str]:
+    """Every IP address a host name resolves to (getaddrinfo runs in a worker thread)."""
+    infos = await asyncio.to_thread(socket.getaddrinfo, host, None, type=socket.SOCK_STREAM)
+    return sorted({str(info[4][0]) for info in infos})
+
+
+def is_public_address(address: str) -> bool:
+    """False for loopback, private, link-local, reserved, multicast and unspecified addresses."""
+    ip = ipaddress.ip_address(address)
+    return ip.is_global and not ip.is_multicast
+
+
+async def check_public_url(url: str, resolver: Resolver = resolve_host) -> str | None:
+    """None if the URL may be fetched, else the reason (an early, readable answer; the
+    transport below enforces the same rule when it connects)."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "only public http(s) URLs are fetched"
+    try:
+        addresses = await resolver(parsed.hostname)
+    except OSError:
+        return "host does not resolve"
+    if not addresses or not all(is_public_address(address) for address in addresses):
+        return BLOCKED
+    return None
+
+
+class PublicAddressBackend(httpcore.AsyncNetworkBackend):
+    """An httpcore network backend that connects only to addresses it has just checked."""
+
+    def __init__(
+        self, resolver: Resolver = resolve_host, allowed: AddressCheck = is_public_address
+    ) -> None:
+        """Resolve with `resolver`; connect only if `allowed` accepts every address."""
+        self.resolver = resolver
+        self.allowed = allowed
+        self.backend = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        """Resolve, check every address, connect to the first one (never to a fresh lookup)."""
+        try:
+            addresses = await self.resolver(host)
+        except OSError as error:
+            raise httpcore.ConnectError(f"host does not resolve: {host}") from error
+        if not addresses or not all(self.allowed(address) for address in addresses):
+            raise httpcore.ConnectError(f"{BLOCKED}: {host}")
+        return await self.backend.connect_tcp(
+            addresses[0], port, timeout, local_address, socket_options
+        )
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        """Never: a user-supplied URL must not reach a local socket."""
+        raise httpcore.ConnectError(f"{BLOCKED}: unix socket {path}")
+
+    async def sleep(self, seconds: float) -> None:
+        """Used by httpcore between retries."""
+        await self.backend.sleep(seconds)
+
+
+def public_only_client(
+    timeout: float,
+    user_agent: str,
+    resolver: Resolver = resolve_host,
+    allowed: AddressCheck = is_public_address,
+) -> httpx.AsyncClient:
+    """An AsyncClient whose every connection goes through PublicAddressBackend.
+
+    httpx has no public option for the network backend, so the transport's connection pool is
+    rebuilt with one. trust_env=False: a proxy from HTTP(S)_PROXY would bypass the check, and
+    redirects are never followed (a public URL could redirect to a private one).
+    """
+    limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+    transport = httpx.AsyncHTTPTransport(limits=limits, trust_env=False)
+    transport._pool = httpcore.AsyncConnectionPool(  # replaces the pool built with the default
+        ssl_context=httpx.create_ssl_context(),
+        max_connections=limits.max_connections,
+        max_keepalive_connections=limits.max_keepalive_connections,
+        keepalive_expiry=limits.keepalive_expiry,
+        network_backend=PublicAddressBackend(resolver, allowed),
+    )
+    return httpx.AsyncClient(
+        transport=transport,
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+        headers={"User-Agent": user_agent},
+    )
 '''
 
 NOTES_V5_SERVICES_PY = r'''
@@ -5286,12 +5567,9 @@ NOTES_V5_SERVICES_PY = r'''
 import asyncio
 import csv
 import io
-import ipaddress
 import json
 import re
-import socket
-import urllib.parse
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
@@ -5302,6 +5580,7 @@ from pydantic import TypeAdapter, ValidationError
 from notes_api.events import new_event
 from notes_api.exceptions import NoteNotFoundError, UploadRejectedError, VersionConflictError
 from notes_api.models import Note
+from notes_api.netguard import BLOCKED, Resolver, check_public_url, resolve_host
 from notes_api.pagination import decode_cursor, encode_cursor
 from notes_api.repositories import NoteRepository
 from notes_api.schemas import LinkPreview, NoteCreate, NoteFilters, NoteRead, NoteUpdate
@@ -5412,47 +5691,24 @@ def parse_import(filename: str, content: bytes) -> list[NoteCreate]:
         raise UploadRejectedError(reason, HTTPStatus.UNPROCESSABLE_CONTENT) from error
 
 
-type Resolver = Callable[[str], Awaitable[list[str]]]
-
-
-async def resolve_host(host: str) -> list[str]:
-    """Every IP address a host name resolves to (getaddrinfo runs in a worker thread)."""
-    infos = await asyncio.to_thread(socket.getaddrinfo, host, None, type=socket.SOCK_STREAM)
-    return sorted({str(info[4][0]) for info in infos})
-
-
-def is_public_address(address: str) -> bool:
-    """False for loopback, private, link-local, reserved, multicast and unspecified addresses."""
-    ip = ipaddress.ip_address(address)
-    return ip.is_global and not ip.is_multicast
-
-
 class LinkPreviewer:
     """Fetch the <title> of links in a note, refusing anything that is not a public web URL.
 
     Server-side request forgery (OWASP API7): a note body is user input, so a link could point
-    at 127.0.0.1, the cloud metadata service (169.254.169.254) or a private network. Each host
-    is resolved first and every address must be public; redirects are not followed (a public
+    at 127.0.0.1, the cloud metadata service (169.254.169.254) or a private network.
+    check_url() gives an early, readable answer; the client (netguard.public_only_client)
+    enforces the rule where it matters, when it connects. Redirects are not followed (a public
     URL could redirect to a private one); at most MAX_PREVIEW_BYTES of a page are read.
     """
 
     def __init__(self, client: httpx.AsyncClient, resolver: Resolver = resolve_host) -> None:
-        """Use the pooled client created by the lifespan and an injectable DNS resolver."""
+        """Use the lifespan's public-only client and an injectable DNS resolver."""
         self.client = client
         self.resolver = resolver
 
     async def check_url(self, url: str) -> str | None:
         """None if the URL may be fetched, else the reason it may not."""
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return "only public http(s) URLs are fetched"
-        try:
-            addresses = await self.resolver(parsed.hostname)
-        except OSError:
-            return "host does not resolve"
-        if not addresses or not all(is_public_address(address) for address in addresses):
-            return "blocked: not a public address"
-        return None
+        return await check_public_url(url, self.resolver)
 
     async def preview(self, url: str) -> LinkPreview:
         """One link: its status and title, or why it was not fetched (never raises)."""
@@ -5466,8 +5722,9 @@ class LinkPreviewer:
                     size += len(chunk)
                     if size >= MAX_PREVIEW_BYTES:
                         break
-        except httpx.HTTPError as error:
-            return LinkPreview(url=url, error=type(error).__name__)
+        except httpx.HTTPError as error:  # BLOCKED: the DNS answer changed after check_url()
+            reason = BLOCKED if str(error).startswith(BLOCKED) else type(error).__name__
+            return LinkPreview(url=url, error=reason)
         if response.is_redirect:
             return LinkPreview(
                 url=url, status_code=response.status_code, error="redirect not followed"
@@ -5749,6 +6006,7 @@ from notes_api.events import (
 )
 from notes_api.exports import add_progress, owner_key, result_key
 from notes_api.models import Note, OutboxEvent, RefreshToken, User
+from notes_api.netguard import BLOCKED, Resolver, check_public_url, public_only_client, resolve_host
 from notes_api.schemas import NoteRead
 
 RELAY_BATCH = 100
@@ -5770,10 +6028,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["text_redis"] = redis_asyncio.from_url(
         settings.redis_url.get_secret_value(), decode_responses=True
     )
-    ctx["http"] = httpx.AsyncClient(
-        timeout=settings.webhook_timeout_seconds,
-        follow_redirects=False,
-        headers={"User-Agent": f"notes-api-webhooks/{__version__}"},
+    ctx.setdefault("resolver", resolve_host)  # tests pass a fake DNS
+    ctx["http"] = public_only_client(  # connects only to the public address it checked
+        settings.webhook_timeout_seconds,
+        f"notes-api-webhooks/{__version__}",
+        resolver=ctx["resolver"],
     )
 
 
@@ -5818,7 +6077,8 @@ async def relay_outbox(ctx: dict[str, Any]) -> int:
 
 
 async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:
-    """POST one signed event; retry with exponential backoff; dead-letter after the last try."""
+    """POST one signed event; retry with backoff; dead-letter after the last try. The URL is
+    checked again first: DNS may have changed since it was saved."""
     settings: Settings = ctx["settings"]
     async with ctx["session_factory"]() as session, session.begin():
         event = await session.get(OutboxEvent, event_id)
@@ -5834,11 +6094,15 @@ async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:
             SIGNATURE_HEADER: sign_webhook(user.webhook_secret, int(time.time()), body),
         }
         event.webhook_attempts += 1
+        if blocked := await check_public_url(user.webhook_url, ctx["resolver"]):
+            event.webhook_status, event.last_error = "dead", blocked  # no retry; an admin can
+            await ctx["text_redis"].lpush(DEAD_LETTERS, str(event.id))
+            return "blocked"
         try:
             response = await ctx["http"].post(user.webhook_url, content=body, headers=headers)
             error = None if response.is_success else f"HTTP {response.status_code}"
-        except httpx.HTTPError as exc:
-            error = type(exc).__name__
+        except httpx.HTTPError as exc:  # BLOCKED: the DNS answer changed since the check
+            error = BLOCKED if str(exc).startswith(BLOCKED) else type(exc).__name__
         if error is None:
             event.webhook_status, event.last_error = "delivered", None
             return "delivered"
@@ -5912,7 +6176,9 @@ class WorkerSettings:
     keep_result = 300
 
 
-async def run_worker(burst: bool = False, settings: Settings | None = None) -> None:
+async def run_worker(
+    burst: bool = False, settings: Settings | None = None, resolver: Resolver | None = None
+) -> None:
     """Build the arq Worker inside a running event loop and run it (SIGTERM stops it cleanly).
 
     `arq notes_api.worker.WorkerSettings` is the usual command, but arq 0.25's CLI calls
@@ -5928,7 +6194,7 @@ async def run_worker(burst: bool = False, settings: Settings | None = None) -> N
         ),
         on_startup=startup,
         on_shutdown=shutdown,
-        ctx={"settings": settings} if settings else {},
+        ctx={"settings": settings, "resolver": resolver or resolve_host} if settings else {},
         burst=burst,
         poll_delay=0.1,
         max_tries=WorkerSettings.max_tries if settings is None else settings.webhook_max_attempts,
@@ -5962,7 +6228,7 @@ import contextlib
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 from arq.connections import ArqRedis
@@ -5975,14 +6241,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from notes_api.auth import AuthService
 from notes_api.cache import NoteCache
 from notes_api.core.config import Settings
-from notes_api.exceptions import AuthenticationError, PermissionDeniedError
+from notes_api.exceptions import AuthenticationError, PermissionDeniedError, RateLimitedError
 from notes_api.mailer import LogMailer, Mailer
 from notes_api.models import utc_now
+from notes_api.netguard import Resolver, resolve_host
 from notes_api.oauth import OidcClient
 from notes_api.ratelimit import FixedWindowRateLimiter
 from notes_api.repositories import NoteRepository, SqlNoteRepository, SqlUserRepository
 from notes_api.security import ALL_SCOPES, Principal, TokenService
-from notes_api.services import LinkPreviewer, NoteService, Resolver, resolve_host
+from notes_api.services import LinkPreviewer, NoteService
 
 
 def get_app_settings(connection: HTTPConnection) -> Settings:
@@ -6054,7 +6321,6 @@ def get_auth_service(
         redis,
         request.app.state.session_factory,
         timedelta(days=settings.refresh_token_days),
-        settings.admin_emails,
     )
 
 
@@ -6114,10 +6380,10 @@ WriterServiceDep = Annotated[NoteService, Security(get_note_service, scopes=["no
 
 
 def get_link_previewer(
-    client: HttpClientDep, resolver: Annotated[Resolver, Depends(get_resolver)]
+    request: Request, resolver: Annotated[Resolver, Depends(get_resolver)]
 ) -> LinkPreviewer:
-    """A LinkPreviewer on the shared HTTP client, with SSRF checks."""
-    return LinkPreviewer(client, resolver)
+    """A LinkPreviewer on the public-only client (it refuses private addresses on connect)."""
+    return LinkPreviewer(request.app.state.outbound_client, resolver)
 
 
 LinkPreviewerDep = Annotated[LinkPreviewer, Depends(get_link_previewer)]
@@ -6131,6 +6397,35 @@ def get_login_limiter(redis: RedisDep, settings: SettingsDep) -> FixedWindowRate
 
 
 LoginLimiterDep = Annotated[FixedWindowRateLimiter, Depends(get_login_limiter)]
+
+
+def per_user_limit(bucket: str, scopes: list[str]) -> Any:
+    """A route dependency that spends one unit of the caller's budget for `bucket` (OWASP
+    API4). `scopes` repeats the route's scopes: FastAPI caches a dependency per (function,
+    scopes), so the principal is still resolved once per request."""
+
+    async def enforce(
+        principal: Annotated[Principal, Security(get_current_principal, scopes=scopes)],
+        redis: RedisDep,
+        settings: SettingsDep,
+    ) -> None:
+        """429 with Retry-After once this user's budget for the window is spent."""
+        limit = getattr(settings, f"{bucket}_rate_limit")
+        window = settings.user_rate_window_seconds
+        limiter = FixedWindowRateLimiter(redis, limit, window, f"user-{bucket}")
+        result = await limiter.hit(str(principal.user_id))
+        if not result.allowed:
+            raise RateLimitedError(result.retry_after)
+
+    return Depends(enforce)
+
+
+NOTE_WRITE_LIMIT = per_user_limit("write", ["notes:write"])  # POST/PUT/PATCH/DELETE notes
+LINK_PREVIEW_LIMIT = per_user_limit("link_preview", ["notes:read"])  # up to 5 fetches each
+ACCOUNT_WRITE_LIMIT = per_user_limit("write", [])  # /users/me: keys, webhook, account
+ADMIN_WRITE_LIMIT = per_user_limit("write", ["admin"])  # imports, wipes, retries
+EXPORT_LIMIT = per_user_limit("export", [])  # POST /exports (a worker job each)
+ADMIN_EXPORT_LIMIT = per_user_limit("export", ["admin"])  # GET /admin/export (every note)
 
 
 def get_oidc_client(settings: SettingsDep, client: HttpClientDep, redis: RedisDep) -> OidcClient:
@@ -6292,13 +6587,18 @@ async def oauth_callback(
 
 NOTES_V5_ROUTERS_USERS_PY = r'''
 %%writefile ../projects/notes_api/src/notes_api/routers/users.py
-"""/api/v1/users/me: the current user and their API keys."""
+"""/api/v1/users/me: the current user, their API keys and webhook; deleting the account."""
 
 from typing import Annotated
 
 from fastapi import APIRouter, Path, status
 
-from notes_api.dependencies import AuthServiceDep, CurrentPrincipal, LinkPreviewerDep
+from notes_api.dependencies import (
+    ACCOUNT_WRITE_LIMIT,
+    AuthServiceDep,
+    CurrentPrincipal,
+    LinkPreviewerDep,
+)
 from notes_api.exceptions import AuthenticationError, InvalidWebhookError, PermissionDeniedError
 from notes_api.models import ApiKey, User
 from notes_api.schemas import ApiKeyCreate, ApiKeyCreated, ApiKeyRead, UserRead, WebhookSettings
@@ -6316,7 +6616,21 @@ async def me(principal: CurrentPrincipal, auth: AuthServiceDep) -> User:
     return user
 
 
-@router.post("/me/api-keys", response_model=ApiKeyCreated, status_code=status.HTTP_201_CREATED)
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT, dependencies=[ACCOUNT_WRITE_LIMIT])
+async def delete_me(principal: CurrentPrincipal, auth: AuthServiceDep) -> None:
+    """Delete the caller's account; its notes, tokens, keys and events cascade with it.
+
+    The access token stops working at once: its user no longer exists.
+    """
+    await auth.users.delete_user(principal.user_id)
+
+
+@router.post(
+    "/me/api-keys",
+    response_model=ApiKeyCreated,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[ACCOUNT_WRITE_LIMIT],
+)
 async def create_api_key(
     data: ApiKeyCreate, principal: CurrentPrincipal, auth: AuthServiceDep
 ) -> dict[str, object]:
@@ -6333,7 +6647,11 @@ async def list_api_keys(principal: CurrentPrincipal, auth: AuthServiceDep) -> li
     return await auth.users.api_keys_of(principal.user_id)
 
 
-@router.delete("/me/api-keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/me/api-keys/{key_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[ACCOUNT_WRITE_LIMIT],
+)
 async def revoke_api_key(
     key_id: Annotated[int, Path(ge=1)], principal: CurrentPrincipal, auth: AuthServiceDep
 ) -> None:
@@ -6348,7 +6666,7 @@ async def get_webhook(principal: CurrentPrincipal, auth: AuthServiceDep) -> dict
     return {"url": user.webhook_url if user else None}
 
 
-@router.put("/me/webhook")
+@router.put("/me/webhook", dependencies=[ACCOUNT_WRITE_LIMIT])
 async def set_webhook(
     body: WebhookSettings,
     principal: CurrentPrincipal,
@@ -6365,7 +6683,9 @@ async def set_webhook(
     return {"url": user.webhook_url, "secret": user.webhook_secret}
 
 
-@router.delete("/me/webhook", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/me/webhook", status_code=status.HTTP_204_NO_CONTENT, dependencies=[ACCOUNT_WRITE_LIMIT]
+)
 async def delete_webhook(principal: CurrentPrincipal, auth: AuthServiceDep) -> None:
     """Stop sending webhooks."""
     user = await auth.users.user_by_id(principal.user_id)
@@ -6383,6 +6703,8 @@ from fastapi import APIRouter, BackgroundTasks, Header, Path, Query, Request, Re
 
 from notes_api.core.errors import PROBLEM_JSON, ProblemDetail
 from notes_api.dependencies import (
+    LINK_PREVIEW_LIMIT,
+    NOTE_WRITE_LIMIT,
     LinkPreviewerDep,
     NoteCacheDep,
     QueueDep,
@@ -6428,7 +6750,12 @@ def after_write(background: BackgroundTasks, queue: Any, cache: Any, note_id: in
     background.add_task(kick_relay, queue)
 
 
-@router.post("", response_model=NoteRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=NoteRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def create_note(
     note: NoteCreate,
     service: WriterServiceDep,
@@ -6488,7 +6815,9 @@ async def get_note(
     return note
 
 
-@router.put("/{note_id}", response_model=NoteRead, responses=NOT_FOUND)
+@router.put(
+    "/{note_id}", response_model=NoteRead, responses=NOT_FOUND, dependencies=[NOTE_WRITE_LIMIT]
+)
 async def replace_note(
     note_id: NoteId,
     note: NoteCreate,
@@ -6504,7 +6833,9 @@ async def replace_note(
     return replaced
 
 
-@router.patch("/{note_id}", response_model=NoteRead, responses=NOT_FOUND)
+@router.patch(
+    "/{note_id}", response_model=NoteRead, responses=NOT_FOUND, dependencies=[NOTE_WRITE_LIMIT]
+)
 async def update_note(
     note_id: NoteId,
     changes: NoteUpdate,
@@ -6520,7 +6851,12 @@ async def update_note(
     return updated
 
 
-@router.delete("/{note_id}", status_code=status.HTTP_204_NO_CONTENT, responses=NOT_FOUND)
+@router.delete(
+    "/{note_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=NOT_FOUND,
+    dependencies=[NOTE_WRITE_LIMIT],
+)
 async def delete_note(
     note_id: NoteId,
     service: WriterServiceDep,
@@ -6534,7 +6870,12 @@ async def delete_note(
     after_write(background, queue, cache, note_id)
 
 
-@router.get("/{note_id}/links", response_model=list[LinkPreview], responses=NOT_FOUND)
+@router.get(
+    "/{note_id}/links",
+    response_model=list[LinkPreview],
+    responses=NOT_FOUND,
+    dependencies=[LINK_PREVIEW_LIMIT],
+)
 async def note_links(
     note_id: NoteId, service: ReaderServiceDep, previewer: LinkPreviewerDep
 ) -> list[LinkPreview]:
@@ -6555,6 +6896,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from notes_api.dependencies import (
+    ADMIN_EXPORT_LIMIT,
+    ADMIN_WRITE_LIMIT,
     NoteCacheDep,
     QueueDep,
     RepositoryDep,
@@ -6589,7 +6932,12 @@ async def read_upload(upload: UploadFile, max_bytes: int) -> bytes:
     return content
 
 
-@router.post("/import", response_model=ImportReport, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/import",
+    response_model=ImportReport,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[ADMIN_WRITE_LIMIT],
+)
 async def import_notes(
     file: UploadFile, service: WriterServiceDep, settings: SettingsDep
 ) -> ImportReport:
@@ -6601,7 +6949,7 @@ async def import_notes(
     return ImportReport(filename=file.filename or "", imported=len(created), ids=ids)
 
 
-@router.get("/export")
+@router.get("/export", dependencies=[ADMIN_EXPORT_LIMIT])
 async def export_notes(repository: RepositoryDep) -> JSONResponse:
     """Every user's notes as a downloadable JSON file."""
     notes, _total = await repository.search(NoteFilters(limit=100, sort="created_at"), None)
@@ -6610,7 +6958,7 @@ async def export_notes(repository: RepositoryDep) -> JSONResponse:
     return JSONResponse(payload, headers=headers)
 
 
-@router.delete("/notes")
+@router.delete("/notes", dependencies=[ADMIN_WRITE_LIMIT])
 async def delete_all_notes(repository: RepositoryDep) -> dict[str, int]:
     """Remove every note of every user."""
     return {"deleted": await repository.delete_all()}
@@ -6640,7 +6988,11 @@ async def dead_webhooks(session: SessionDep) -> list[dict[str, object]]:
     ]
 
 
-@router.post("/webhooks/dead/{event_id}/retry", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/webhooks/dead/{event_id}/retry",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[ADMIN_WRITE_LIMIT],
+)
 async def retry_dead_webhook(
     event_id: int, session: SessionDep, queue: QueueDep
 ) -> dict[str, object]:
@@ -6666,7 +7018,7 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from notes_api.dependencies import CurrentPrincipal, QueueDep, RedisDep, SettingsDep
+from notes_api.dependencies import EXPORT_LIMIT, CurrentPrincipal, QueueDep, RedisDep, SettingsDep
 from notes_api.exceptions import ExportNotFoundError
 from notes_api.exports import add_progress, events_key, owner_key, progress_events, result_key
 
@@ -6679,7 +7031,7 @@ async def check_owner(redis: RedisDep, export_id: str, user_id: int) -> None:
         raise ExportNotFoundError(export_id)
 
 
-@router.post("", status_code=status.HTTP_202_ACCEPTED)
+@router.post("", status_code=status.HTTP_202_ACCEPTED, dependencies=[EXPORT_LIMIT])
 async def start_export(
     request: Request,
     response: Response,
@@ -6752,9 +7104,12 @@ import asyncio
 import contextlib
 import json
 import time
+import uuid
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from notes_api.dependencies import RedisDep, SettingsDep, get_auth_service, get_clock
@@ -6800,8 +7155,40 @@ async def authenticate(
         return await auth.principal_from_access_token(token)
 
 
-async def forward_events(websocket: WebSocket, pubsub: PubSub, heartbeat_seconds: float) -> None:
-    """Redis → client, plus a ping every heartbeat_seconds (dead connections show up fast)."""
+def slots_key(user_id: int) -> str:
+    """The Redis sorted set of a user's open sockets (member: connection id, score: last beat)."""
+    return f"ws:open:{user_id}"
+
+
+async def claim_slot(
+    redis: Redis, user_id: int, connection_id: str, limit: int, stale: float
+) -> bool:
+    """Count this socket against the user's cap, across every process (OWASP API4).
+
+    Entries older than `stale` seconds belong to sockets of a process that died without
+    cleaning up; they are dropped first. Over the cap: the claim is withdrawn, False.
+    """
+    key, now = slots_key(user_id), time.time()
+    async with redis.pipeline(transaction=True) as pipeline:
+        pipeline.zremrangebyscore(key, 0, now - stale)
+        pipeline.zadd(key, {connection_id: now})
+        pipeline.zcard(key)
+        pipeline.expire(key, int(stale) + 1)
+        _, _, open_sockets, _ = await pipeline.execute()
+    if open_sockets > limit:
+        await redis.zrem(key, connection_id)
+        return False
+    return True
+
+
+async def forward_events(
+    websocket: WebSocket,
+    pubsub: PubSub,
+    heartbeat_seconds: float,
+    keep_slot: Callable[[], Awaitable[None]],
+) -> None:
+    """Redis → client, plus a ping every heartbeat_seconds (dead connections show up fast);
+    each ping also refreshes the socket's entry in the per-user cap."""
     last_ping = time.monotonic()
     while True:
         message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
@@ -6809,6 +7196,7 @@ async def forward_events(websocket: WebSocket, pubsub: PubSub, heartbeat_seconds
             await websocket.send_text(message["data"])
         if time.monotonic() - last_ping >= heartbeat_seconds:
             await websocket.send_json({"type": "ping"})
+            await keep_slot()
             last_ping = time.monotonic()
 
 
@@ -6832,13 +7220,24 @@ async def live_updates(websocket: WebSocket, redis: RedisDep, settings: Settings
         return
     except WebSocketDisconnect:
         return
+    connection_id, stale = uuid.uuid4().hex, 3 * settings.ws_heartbeat_seconds
+    limit = settings.ws_connections_per_user
+    if not await claim_slot(redis, principal.user_id, connection_id, limit, stale):
+        await websocket.close(code=POLICY_VIOLATION, reason="too many open connections")
+        return
     manager: ConnectionManager = websocket.app.state.connections
     manager.add(principal.user_id, websocket)
     pubsub = redis.pubsub()
     await pubsub.subscribe(user_channel(principal.user_id))
     await websocket.send_json({"type": "ready", "user_id": principal.user_id})
+    beat = settings.ws_heartbeat_seconds
+
+    async def keep_slot() -> None:
+        """Refresh this socket's score (it is alive)."""
+        await redis.zadd(slots_key(principal.user_id), {connection_id: time.time()})
+
     tasks = [
-        asyncio.create_task(forward_events(websocket, pubsub, settings.ws_heartbeat_seconds)),
+        asyncio.create_task(forward_events(websocket, pubsub, beat, keep_slot)),
         asyncio.create_task(read_client(websocket)),
     ]
     try:
@@ -6849,6 +7248,7 @@ async def live_updates(websocket: WebSocket, redis: RedisDep, settings: Settings
         with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
             await asyncio.gather(*tasks)
         manager.remove(principal.user_id, websocket)
+        await redis.zrem(slots_key(principal.user_id), connection_id)
         await pubsub.unsubscribe()
         await pubsub.aclose()
 '''
@@ -6991,7 +7391,15 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from helpers import USER_EMAIL, FakeMailer, auth_headers, create_tables, fake_resolver
+from helpers import (
+    ADMIN_EMAIL,
+    USER_EMAIL,
+    FakeMailer,
+    auth_headers,
+    create_tables,
+    fake_resolver,
+    promote,
+)
 from notes_api.core.config import Settings
 from notes_api.dependencies import get_mailer, get_queue, get_redis, get_resolver
 from notes_api.main import create_app
@@ -7015,8 +7423,10 @@ def settings(tmp_path: Path) -> Settings:
         jwt_secret=SecretStr(secrets.token_urlsafe(32)),
         password_time_cost=1,
         password_memory_kib=64,
-        admin_emails=["admin@example.com"],
         login_rate_limit=10,
+        write_rate_limit=10_000,  # tests make many requests per user; test_limits.py checks
+        link_preview_rate_limit=10_000,  # the per-user budgets with small values
+        export_rate_limit=10_000,
         cookie_secure=False,  # TestClient talks plain HTTP
     )
 
@@ -7077,9 +7487,16 @@ def client(anonymous: TestClient) -> TestClient:
 
 
 @pytest.fixture
-def admin_headers(anonymous: TestClient) -> dict[str, str]:
-    """Bearer headers of an admin (admin@example.com is in admin_emails)."""
-    return auth_headers(anonymous, "admin@example.com")
+def admin_email(anonymous: TestClient) -> str:
+    """Register ADMIN_EMAIL as an ordinary user, then promote it the way an operator does."""
+    promote(anonymous, ADMIN_EMAIL)
+    return ADMIN_EMAIL
+
+
+@pytest.fixture
+def admin_headers(anonymous: TestClient, admin_email: str) -> dict[str, str]:
+    """Bearer headers of the promoted admin (logged in after the promotion)."""
+    return auth_headers(anonymous, admin_email)
 '''
 
 NOTES_V5_TESTS_HELPERS_PY = r'''
@@ -7093,8 +7510,10 @@ from fastapi.testclient import TestClient
 
 from notes_api.core.config import Settings
 from notes_api.db import Base, create_engine_from_settings
+from notes_api.manage import set_role
 
 USER_EMAIL = "user@example.com"
+ADMIN_EMAIL = "admin@example.com"  # promoted by the admin_email fixture
 PASSWORD = "correct horse battery staple"
 ANONYMOUS = {"Authorization": ""}  # overrides the client's default header
 FAKE_DNS = {
@@ -7138,6 +7557,14 @@ def auth_headers(client: TestClient, email: str, scope: str = "") -> dict[str, s
     response = login(client, email, scope=scope)
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def promote(client: TestClient, email: str) -> None:
+    """Register `email` (if needed) as an ordinary user, then make it an admin the way an
+    operator does (notes_api.manage.set_role); tokens issued afterwards carry the admin scope."""
+    register(client, email)
+    session_factory = client.app.state.session_factory  # type: ignore[attr-defined]
+    assert client.portal.call(set_role, session_factory, email, "admin")
 
 
 async def fake_resolver(host: str) -> list[str]:
@@ -7223,7 +7650,7 @@ from arq import Retry
 from arq.connections import ArqRedis
 from fastapi.testclient import TestClient
 
-from helpers import create
+from helpers import create, fake_resolver
 from notes_api.core.config import Settings
 from notes_api.db import create_engine_from_settings, make_session_factory
 from notes_api.events import SIGNATURE_HEADER, user_channel, verify_webhook
@@ -7248,6 +7675,7 @@ def ctx(
         "text_redis": fake_redis,
         "redis": fake_queue,
         "http": httpx.AsyncClient(timeout=1),
+        "resolver": fake_resolver,
         "job_try": 1,
     }
 
@@ -7367,6 +7795,25 @@ def test_failing_webhook_retries_then_dead_letters(
     assert (
         client.post("/api/v1/admin/webhooks/dead/1/retry", headers=admin_headers).status_code == 202
     )
+
+
+@respx.mock
+def test_webhook_url_is_checked_again_before_delivery(
+    client: TestClient, ctx: dict[str, Any], fake_redis: fakeredis.FakeAsyncRedis
+) -> None:
+    """The host now resolves to a private address: nothing is sent, the event is dead at once."""
+    with_webhook(client)
+    create(client)
+    route = respx.post(HOOK).respond(204)
+
+    async def changed_dns(host: str) -> list[str]:
+        """The DNS answer after the URL was saved (a rebinding attacker controls it)."""
+        return ["10.0.0.7"]
+
+    ctx["resolver"] = changed_dns
+    assert run(client, deliver_webhook, ctx, 1) == "blocked"
+    assert route.call_count == 0
+    assert run(client, fake_redis.lrange, DEAD_LETTERS, 0, -1) == ["1"]
 
 
 def test_relay_lock_prevents_overlap(
@@ -7717,6 +8164,184 @@ def test_existing_notes_get_a_disabled_legacy_owner(tmp_path: Path) -> None:
     engine.dispose()
 '''
 
+NOTES_V5_TESTS_TEST_NETGUARD_PY = r'''
+%%writefile ../projects/notes_api/tests/test_netguard.py
+"""netguard: the SSRF rule holds where the connection is made, even when DNS changes."""
+
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
+
+import httpx
+import pytest
+
+from notes_api.netguard import BLOCKED, Resolver, check_public_url, public_only_client
+from notes_api.services import LinkPreviewer
+
+pytestmark = pytest.mark.anyio
+
+
+class Recorder(BaseHTTPRequestHandler):
+    """Answers every GET with a page and remembers the Host header of each request."""
+
+    hosts: ClassVar[list[str]] = []
+
+    def do_GET(self) -> None:
+        """200 with a title."""
+        type(self).hosts.append(self.headers["Host"])
+        body = b"<title>internal admin</title>"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 (stdlib name)
+        """No access log on stderr."""
+
+
+@pytest.fixture
+def internal_port() -> Iterator[int]:
+    """A server on 127.0.0.1 standing in for something private (an admin page, metadata)."""
+    Recorder.hosts = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Recorder)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.server_address[1]
+    server.shutdown()
+    server.server_close()
+
+
+def rebinding_dns() -> Resolver:
+    """Public for the first lookup, 127.0.0.1 after it (what a rebinding attacker serves)."""
+    answers = iter([["93.184.216.34"]])
+
+    async def resolve(host: str) -> list[str]:
+        """The next answer."""
+        return next(answers, ["127.0.0.1"])
+
+    return resolve
+
+
+async def test_rebinding_is_refused_at_connect_time(internal_port: int) -> None:
+    """The check passes on the first answer; the connection is refused on the second."""
+    resolver, url = rebinding_dns(), f"http://rebind.example:{internal_port}/"
+    assert await check_public_url(url, resolver) is None
+    async with public_only_client(2, "test", resolver) as client:
+        with pytest.raises(httpx.ConnectError, match=BLOCKED):
+            await client.get(url)
+    assert Recorder.hosts == []  # nothing reached the internal server
+
+
+async def test_link_preview_reports_the_rebinding(internal_port: int) -> None:
+    """LinkPreviewer: check_url() sees a public address, the connection is refused."""
+    resolver, url = rebinding_dns(), f"http://rebind.example:{internal_port}/"
+    async with public_only_client(2, "test", resolver) as client:
+        preview = await LinkPreviewer(client, resolver).preview(url)
+    assert (preview.title, preview.error) == (None, BLOCKED)
+    assert Recorder.hosts == []
+
+
+async def test_the_connection_goes_to_the_checked_address(internal_port: int) -> None:
+    """With loopback allowed (tests only), a name no DNS server knows still works: the client
+    connected to the address the backend checked instead of looking the name up itself."""
+
+    async def pinned(host: str) -> list[str]:
+        """The only answer."""
+        return ["127.0.0.1"]
+
+    async with public_only_client(2, "test", pinned, allowed=lambda address: True) as client:
+        response = await client.get(f"http://pinned.invalid:{internal_port}/")
+    assert response.status_code == 200
+    assert Recorder.hosts == [f"pinned.invalid:{internal_port}"]  # the Host header keeps the name
+
+
+@pytest.mark.parametrize(
+    "url", ["http://127.0.0.1:9/", "http://169.254.169.254/latest/meta-data/", "http://[::1]:9/"]
+)
+async def test_private_ip_literals_are_refused(url: str) -> None:
+    """An IP literal is checked like any resolved address."""
+
+    async def literal(host: str) -> list[str]:
+        """IP literals resolve to themselves."""
+        return [host]
+
+    async with public_only_client(2, "test", literal) as client:
+        with pytest.raises(httpx.ConnectError, match=BLOCKED):
+            await client.get(url)
+'''
+
+NOTES_V5_TESTS_TEST_LIMITS_PY = r'''
+%%writefile ../projects/notes_api/tests/test_limits.py
+"""Per-user budgets on expensive routes, the per-user WebSocket cap, deleting an account."""
+
+import pytest
+from fastapi.testclient import TestClient
+from fastapi.websockets import WebSocketDisconnect
+
+from helpers import ANONYMOUS, USER_EMAIL, auth_headers, create, login, register
+from notes_api.core.config import Settings
+
+
+@pytest.fixture
+def settings(settings: Settings) -> Settings:
+    """Small budgets; a one-day window, so no window boundary falls inside a test."""
+    small = {"write_rate_limit": 3, "link_preview_rate_limit": 2, "export_rate_limit": 1}
+    return settings.model_copy(
+        update={**small, "user_rate_window_seconds": 86_400, "ws_connections_per_user": 2}
+    )
+
+
+def test_writes_are_limited_per_user(client: TestClient) -> None:
+    """The fourth write is a 429 with Retry-After; reads and other users are unaffected."""
+    for number in range(3):
+        create(client, title=f"note {number}")
+    refused = client.post("/api/v1/notes", json={"title": "one too many"})
+    assert (refused.status_code, refused.json()["type"]) == (429, "/problems/rate-limited")
+    assert int(refused.headers["Retry-After"]) > 0
+    assert client.get("/api/v1/notes").json()["total"] == 3
+    other = auth_headers(client, "other@example.com")
+    assert client.post("/api/v1/notes", json={"title": "mine"}, headers=other).status_code == 201
+
+
+def test_link_previews_and_exports_have_their_own_budgets(client: TestClient) -> None:
+    """Each link-preview call can fetch five URLs and each export is a worker job."""
+    note = create(client, body="no links here")
+    codes = [client.get(f"/api/v1/notes/{note['id']}/links").status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+    assert [client.post("/api/v1/exports").status_code for _ in range(2)] == [202, 429]
+
+
+def test_websocket_cap_per_user(client: TestClient) -> None:
+    """Two sockets are fine; the third is closed with 1008; closing one frees a slot."""
+    token = client.headers["authorization"].removeprefix("Bearer ")
+    with client.websocket_connect("/api/v1/ws") as first:
+        first.send_json({"token": token})
+        assert first.receive_json()["type"] == "ready"
+        with client.websocket_connect("/api/v1/ws") as second:
+            second.send_json({"token": token})
+            assert second.receive_json()["type"] == "ready"
+            with client.websocket_connect("/api/v1/ws") as third:
+                third.send_json({"token": token})
+                with pytest.raises(WebSocketDisconnect) as closed:
+                    third.receive_json()
+            assert (closed.value.code, closed.value.reason) == (1008, "too many open connections")
+        with client.websocket_connect("/api/v1/ws") as again:
+            again.send_json({"token": token})
+            assert again.receive_json()["type"] == "ready"
+
+
+def test_deleting_the_account_removes_everything(client: TestClient) -> None:
+    """204; the token and the password stop working; the address can register again, empty."""
+    create(client, title="private")
+    assert client.delete("/api/v1/users/me").status_code == 204
+    assert client.get("/api/v1/notes").status_code == 401
+    assert login(client, USER_EMAIL).status_code == 401
+    assert register(client, USER_EMAIL).status_code == 201
+    fresh = auth_headers(client, USER_EMAIL)
+    assert client.get("/api/v1/notes", headers=fresh).json()["total"] == 0
+    assert client.delete("/api/v1/users/me", headers=ANONYMOUS).status_code == 401
+'''
+
 NOTES_V5_TESTS_TEST_REDIS_WORKER_PY = r'''
 %%writefile ../projects/notes_api/tests/test_redis_worker.py
 """End to end on a real Redis (testcontainer) with the real ARQ worker in burst mode.
@@ -7765,7 +8390,7 @@ def real_settings(settings: Settings, redis_url: str) -> Settings:
 
 def burst(settings: Settings) -> None:
     """Process every queued job (and the jobs they queue), then stop."""
-    asyncio.run(run_worker(burst=True, settings=settings))
+    asyncio.run(run_worker(burst=True, settings=settings, resolver=fake_resolver))
 
 
 @respx.mock

@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from notes_api.dependencies import CurrentPrincipal, QueueDep, RedisDep, SettingsDep
+from notes_api.dependencies import EXPORT_LIMIT, CurrentPrincipal, QueueDep, RedisDep, SettingsDep
 from notes_api.exceptions import ExportNotFoundError
 from notes_api.exports import add_progress, events_key, owner_key, progress_events, result_key
 
@@ -20,7 +20,7 @@ async def check_owner(redis: RedisDep, export_id: str, user_id: int) -> None:
         raise ExportNotFoundError(export_id)
 
 
-@router.post("", status_code=status.HTTP_202_ACCEPTED)
+@router.post("", status_code=status.HTTP_202_ACCEPTED, dependencies=[EXPORT_LIMIT])
 async def start_export(
     request: Request,
     response: Response,

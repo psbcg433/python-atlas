@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# The only commands the CI key may run on the server. bootstrap.sh installs this file as
+# /usr/local/sbin/notes-ci-command (owned by root, outside /srv/notes, so a deploy cannot
+# change it) and binds the CI key to it in ~deploy/.ssh/authorized_keys:
+#     restrict,command="/usr/local/sbin/notes-ci-command" ssh-ed25519 AAAA... notes-deploy-ci
+# sshd then runs this script whatever the client asked for (no shell, no port forwarding,
+# no pty); the request is in SSH_ORIGINAL_COMMAND and is split into words, never evaluated.
+#   rsync --server ...              write-only into /srv/notes (rrsync), --delete allowed
+#   registry-login <github user>    docker login ghcr.io, the token on stdin
+#   registry-logout                 docker logout ghcr.io
+#   rollout <ghcr.io/owner/notes-api> <40-hex commit sha>
+#   rollback                        SKIP_PULL=1 rollout.sh rollback
+#   mark-good                       rollout.sh mark-good (after the smoke test passed)
+set -euo pipefail
+notes_dir=${NOTES_DIR:-/srv/notes} # tests set it; sshd never takes it from a client
+rollout="$notes_dir/deploy/production/rollout.sh"
+request=${SSH_ORIGINAL_COMMAND:-}
+read -r -a words <<<"$request"
+logger -t notes-ci-command -- "${request:0:300}" 2>/dev/null || true
+
+refuse() {
+    echo "notes-ci-command: not allowed: ${request:0:300}" >&2
+    exit 1
+}
+
+
+case ${words[0]:-} in
+rsync)
+    [[ ${words[1]:-} == --server ]] || refuse
+    exec rrsync -wo "$notes_dir"
+    ;;
+registry-login)
+    [[ ${#words[@]} -eq 2 && ${words[1]} =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || refuse
+    exec docker login ghcr.io --username "${words[1]}" --password-stdin
+    ;;
+registry-logout)
+    [[ ${#words[@]} -eq 1 ]] || refuse
+    exec docker logout ghcr.io
+    ;;
+rollout)
+    [[ ${#words[@]} -eq 3 ]] || refuse
+    [[ ${words[1]} =~ ^ghcr\.io/[a-z0-9][a-z0-9-]*/notes-api$ ]] || refuse
+    [[ ${words[2]} =~ ^[0-9a-f]{40}$ ]] || refuse
+    export NOTES_IMAGE=${words[1]}
+    exec "$rollout" "${words[2]}"
+    ;;
+rollback)
+    [[ ${#words[@]} -eq 1 ]] || refuse
+    export SKIP_PULL=1
+    exec "$rollout" rollback
+    ;;
+mark-good)
+    [[ ${#words[@]} -eq 1 ]] || refuse
+    exec "$rollout" mark-good
+    ;;
+*)
+    refuse
+    ;;
+esac

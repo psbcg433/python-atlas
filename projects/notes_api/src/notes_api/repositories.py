@@ -249,3 +249,7 @@ class SqlUserRepository:
         """A user's keys, newest first (revoked ones included)."""
         statement = select(ApiKey).where(ApiKey.user_id == user_id).order_by(ApiKey.id.desc())
         return list(await self.session.scalars(statement))
+
+    async def delete_user(self, user_id: int) -> None:
+        """DELETE the user; the database's ON DELETE CASCADE removes everything it owns."""
+        await self.session.execute(delete(User).where(User.id == user_id))

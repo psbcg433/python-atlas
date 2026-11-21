@@ -12,7 +12,7 @@ from arq import Retry
 from arq.connections import ArqRedis
 from fastapi.testclient import TestClient
 
-from helpers import create
+from helpers import create, fake_resolver
 from notes_api.core.config import Settings
 from notes_api.db import create_engine_from_settings, make_session_factory
 from notes_api.events import SIGNATURE_HEADER, user_channel, verify_webhook
@@ -37,6 +37,7 @@ def ctx(
         "text_redis": fake_redis,
         "redis": fake_queue,
         "http": httpx.AsyncClient(timeout=1),
+        "resolver": fake_resolver,
         "job_try": 1,
     }
 
@@ -156,6 +157,25 @@ def test_failing_webhook_retries_then_dead_letters(
     assert (
         client.post("/api/v1/admin/webhooks/dead/1/retry", headers=admin_headers).status_code == 202
     )
+
+
+@respx.mock
+def test_webhook_url_is_checked_again_before_delivery(
+    client: TestClient, ctx: dict[str, Any], fake_redis: fakeredis.FakeAsyncRedis
+) -> None:
+    """The host now resolves to a private address: nothing is sent, the event is dead at once."""
+    with_webhook(client)
+    create(client)
+    route = respx.post(HOOK).respond(204)
+
+    async def changed_dns(host: str) -> list[str]:
+        """The DNS answer after the URL was saved (a rebinding attacker controls it)."""
+        return ["10.0.0.7"]
+
+    ctx["resolver"] = changed_dns
+    assert run(client, deliver_webhook, ctx, 1) == "blocked"
+    assert route.call_count == 0
+    assert run(client, fake_redis.lrange, DEAD_LETTERS, 0, -1) == ["1"]
 
 
 def test_relay_lock_prevents_overlap(

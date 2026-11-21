@@ -18,7 +18,8 @@ from sqlalchemy.types import TypeDecorator
 from notes_api.core.config import Settings
 
 # Predictable constraint names, so Alembic can find (and drop) them later.
-SCHEMA_REVISION = "0006"  # the Alembic revision this code expects (/health/startup checks it)
+SCHEMA_REVISIONS = ("0001", "0002", "0003", "0004", "0005", "0006")  # this code's migrations
+SCHEMA_REVISION = SCHEMA_REVISIONS[-1]  # the revision it expects (/health/startup checks it)
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",

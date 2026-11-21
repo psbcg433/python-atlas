@@ -87,7 +87,8 @@ def test_schema_revision_is_the_newest_migration() -> None:
     """The revision /health/startup expects is the head of the migration history."""
     from alembic.script import ScriptDirectory
 
-    from notes_api.db import SCHEMA_REVISION
+    from notes_api.db import SCHEMA_REVISION, SCHEMA_REVISIONS
 
-    head = ScriptDirectory.from_config(alembic_config(PROJECT_DIR / "unused.db")).get_current_head()
-    assert head == SCHEMA_REVISION
+    script = ScriptDirectory.from_config(alembic_config(PROJECT_DIR / "unused.db"))
+    chain = tuple(revision.revision for revision in script.walk_revisions())[::-1]
+    assert (script.get_current_head(), chain) == (SCHEMA_REVISION, SCHEMA_REVISIONS)

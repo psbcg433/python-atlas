@@ -260,13 +260,14 @@ def _architecture_cells() -> list[NotebookNode]:
             | `worker` | the same image | — (it only connects out) | none | `python -m notes_api.worker --check` |
             | `migrate` | the same image | — | runs `alembic upgrade head`, exits | exit code 0 |
             | `db` | `postgres:18-alpine` | the private network only | `notes-db` volume | `pg_isready` |
-            | `redis` | `redis:7.4` | the private network only | `redis-data` volume (append-only file) | `redis-cli ping` |
+            | `redis` | `redis:7.4` | the private network only | `redis-data` volume (append-only file) | `redis-cli ping` (with the password) |
             | `prometheus` | `prom/prometheus:v3.5.0` | 127.0.0.1:9090 (SSH tunnel) | 15 days of metrics | `/-/ready` |
             | `grafana` | `grafana/grafana-oss:12.1.0` | 127.0.0.1:3000 (SSH tunnel) | `grafana-data` volume | `/api/health` |
 
             **A request's path:** the client resolves `203-0-113-10.sslip.io` to the server,
             Caddy terminates TLS, picks an API replica (round robin), and forwards the request
-            with `X-Forwarded-*` headers; Uvicorn trusts them (`FORWARDED_ALLOW_IPS`), so the
+            with `X-Forwarded-*` headers; Uvicorn trusts them from Caddy's address only
+            (`FORWARDED_ALLOW_IPS`), so the
             app sees the client's address and `https`. The response goes back the same way;
             Caddy adds HSTS and compresses it.
 
@@ -423,7 +424,10 @@ def _compose_cells() -> list[NotebookNode]:
             Part by part. The header, a logging anchor every service uses (JSON lines on disk,
             rotated at 5 × 10 MB, so logs can never fill the disk) and the environment shared by
             the three app services. `${VAR:?message}` makes Compose stop with that message when a
-            variable is missing, instead of starting with an empty password:
+            variable is missing, instead of starting with an empty password. Uvicorn trusts
+            `X-Forwarded-For` only from Caddy's fixed address (with `*`, any container on the
+            network could claim to be any client and get around the per-address login limit),
+            and the app services read two secret files:
             """
         ),
         *notes_file_cells(
@@ -434,15 +438,20 @@ def _compose_cells() -> list[NotebookNode]:
                     "services:",
                     """
                     The backing services: no host ports at all (`!reset []`); PostgreSQL gets a
-                    higher connection limit and the production password; Redis keeps an
-                    append-only file on a volume, so queued jobs survive a restart:
+                    higher connection limit and the production password. Redis requires a
+                    password (`requirepass`), read from a secret file into a config file at
+                    start, so it never appears in a command line, `docker inspect` or the
+                    environment (`$$` keeps Compose from expanding `$(...)`; the health check
+                    passes it to `redis-cli` as `REDISCLI_AUTH`), and keeps an append-only file
+                    on a volume, so queued jobs survive a restart:
                     """,
                 ),
                 (
                     "  migrate:",
                     """
                     The app services run the image CI pushed (`NOTES_IMAGE` and `TAG` come
-                    from `state/release.env`, written by `rollout.sh`). The API runs two
+                    from `state/release.env`, written by `rollout.sh`) with both secret files
+                    (the app adds the Redis password to `NOTES_REDIS_URL`). The API runs two
                     replicas of two Uvicorn processes each, and gets 30 s to stop gracefully:
                     """,
                 ),
@@ -452,7 +461,8 @@ def _compose_cells() -> list[NotebookNode]:
                     """
                     Caddy is the only public service. `!override` replaces Unit 6.8's
                     `127.0.0.1:8443` mapping instead of adding to it; the production Caddyfile
-                    is mounted at the same path as the local one, so it replaces it:
+                    is mounted at the same path as the local one, so it replaces it. Its fixed
+                    address is the one `FORWARDED_ALLOW_IPS` names:
                     """,
                 ),
                 (
@@ -464,7 +474,10 @@ def _compose_cells() -> list[NotebookNode]:
                     """,
                 ),
                 ("  grafana:", "Grafana, provisioned from files, on 127.0.0.1:3000:"),
-                ("volumes:", "The named volumes added by this file:"),
+                (
+                    "networks:",
+                    "The default network with a fixed subnet (so Caddy can have a fixed address), the Redis password's secret file, and the named volumes added by this file:",
+                ),
             ],
         )[1:],
         md(
@@ -589,8 +602,9 @@ def _https_cells() -> list[NotebookNode]:
                     "{$NOTES_SITE} {",
                     """
                     Part 2: the site. Security headers, `/metrics` hidden from the internet
-                    (Prometheus scrapes the replicas directly), retries for refused
-                    connections, and JSON access logs on stdout:
+                    (Prometheus scrapes the replicas directly), request bodies limited to 1 MB
+                    (a bigger body gets 413 at the proxy and never ties up a replica), retries
+                    for refused connections, and JSON access logs on stdout:
                     """,
                 ),
             ],
@@ -811,12 +825,13 @@ def _server_cells() -> list[NotebookNode]:
             """
             ### Step 6 — The server: bootstrap, deploy scripts and backups
 
-            Four shell scripts and a helper library run on the server. Shell, because the
+            Five shell scripts and a helper library run on the server. Shell, because the
             server needs nothing but Docker and bash, and every line maps to a command you
             could type yourself.
 
             **`bootstrap.sh`** runs once, as root, on a fresh Ubuntu server (`DEPLOY.md`,
-            step 7). Part 1: arguments and checks:
+            step 7). Part 1: arguments and checks. The CI public key must be exactly one key
+            (`ssh-keygen -l` parses it), and `ci-command` must have been copied along:
             """
         ),
         *notes_file_cells(
@@ -835,24 +850,64 @@ def _server_cells() -> list[NotebookNode]:
                     'echo "== the deploy user',
                     """
                     Part 3: the `deploy` user. Its `authorized_keys` holds your key (copied
-                    from root's) and the CI key. Membership of the `docker` group is
-                    root-equivalent, so both keys must be kept safe; `/srv/notes/.secrets` and
-                    `state/` are readable by `deploy` only:
+                    from root's) and the CI key, bound to `ci-command` with
+                    `restrict,command="..."`: whatever CI asks for, sshd runs that script,
+                    with no shell, pty or port forwarding. The script is installed as root,
+                    outside `/srv/notes`, so a deploy cannot change it. Membership of the
+                    `docker` group is root-equivalent, so keep your key safe; `deploy` may run
+                    one root command, `sudo reboot`; `/srv/notes/.secrets` and `state/` are
+                    readable by `deploy` only:
                     """,
                 ),
                 (
                     'echo "== 2 GB swap',
                     """
-                    Part 4: swap as a safety margin while old and new replicas overlap,
-                    key-only SSH, and the nightly database backup:
+                    Part 4: swap as a safety margin while old and new replicas overlap, and
+                    the nightly database backup:
+                    """,
+                ),
+                (
+                    'echo "== SSH: keys only',
+                    """
+                    Part 5: SSH, last (after this, root can no longer log in). sshd keeps the
+                    *first* value it reads for each keyword, and reads the drop-ins in name
+                    order, so the file is `00-notes.conf`: an earlier name such as
+                    `90-notes.conf` loses to `50-cloud-init.conf`, which may allow passwords.
+                    The script refuses to lock SSH down if `deploy` has no key of yours,
+                    checks the syntax (`sshd -t`) before the reload, and verifies the
+                    effective settings (`sshd -T`) after it. No `|| true`: a failed reload
+                    stops the script:
                     """,
                 ),
             ],
         )[1:],
         md(
             """
+            **`ci-command`** is the forced command of the CI key. sshd puts the request in
+            `SSH_ORIGINAL_COMMAND`; the script splits it into words (never evaluates it) and
+            accepts six shapes: `rsync --server ...` (handed to `rrsync -wo /srv/notes`, which
+            confines every path to that folder), `registry-login <user>`,
+            `registry-logout`, `rollout <ghcr.io image> <40-hex sha>`, `rollback` and
+            `mark-good`. Anything else, or anything extra, is refused. A stolen CI key can
+            still deploy (that is its job, and why `DEPLOY.md` makes the `production`
+            environment require your approval), but it gets no shell and no Docker:
+            """
+        ),
+        *notes_file_cells(
+            "deploy/production/ci-command",
+            [
+                ("", ""),
+                (
+                    "case ${words[0]:-} in",
+                    "Part 2: the allowed commands; everything else is refused:",
+                ),
+            ],
+        )[1:],
+        md(
+            """
             **`lib.sh`** is sourced by the other scripts: it moves to the project folder, finds
-            the state folder (`state/`: `release.env`, `history.log`, `backups/`; the rehearsal
+            the state folder (`state/`: `release.env`, `history.log`, `known-good.log`,
+            `rolled-back.log`, `backups/`; the rehearsal
             points `NOTES_STATE_DIR` somewhere else), and builds the compose command with both
             env files: `.env` (secrets) and `state/release.env` (which image is deployed):
             """
@@ -877,9 +932,16 @@ def _server_cells() -> list[NotebookNode]:
         *notes_file_cells("deploy/production/backup.sh", [("", "")])[1:],
         md(
             """
-            **`rollout.sh`** is the deploy itself (Step 7 explains the order). Part 1: which
-            release. CI passes the commit SHA and the image name; `rollback` picks the release
-            before the current one from `history.log`:
+            **`rollout.sh`** is the deploy itself (Step 7 explains the order). Part 1: the
+            usage, the state files and how a rollback chooses its target. An earlier version
+            took "the release before the current one" from `history.log`, and its rehearsal
+            in the audit showed two bugs: the rollback ran the *old* image's
+            `alembic upgrade head` against a database the new release had migrated (Alembic
+            stops: *Can't locate revision*), and a second rollback went back to the bad
+            release (A, B → rollback appends A → the release before A is B). Now CI marks a
+            release **known good** after its smoke test passes (`known-good.log`); a rollback
+            goes to the newest known-good release that is neither the current one nor one a
+            rollback left (`rolled-back.log`):
             """
         ),
         *notes_file_cells(
@@ -887,17 +949,28 @@ def _server_cells() -> list[NotebookNode]:
             [
                 ("", ""),
                 (
-                    "if [[ ${SKIP_PULL:-0} != 1 ]]; then",
+                    "target=${1:?usage: rollout.sh <image tag> | rollback | mark-good}",
                     """
-                    Part 2: pull the images, make sure the database is up, back it up, and
-                    run the migrations in a one-off container while the old replicas keep
-                    serving:
+                    Part 2: the three modes. `mark-good` records the current release (and
+                    makes a release that was rolled back a candidate again once it passes);
+                    `rollback` chooses its target and records the release it leaves:
+                    """,
+                ),
+                (
+                    "database_revision() {",
+                    """
+                    Part 3: pull, start the database, back it up, then migrate in a one-off
+                    container while the old replicas keep serving, **unless** this is a
+                    rollback, or the database is at a revision the image does not know
+                    (`alembic show` fails with *Can't locate revision*: the image is older than
+                    the database, for example a tag deployed by name). Expand/contract keeps
+                    the older code working on the newer schema:
                     """,
                 ),
                 (
                     "pin_upstreams() {",
                     """
-                    Part 3: the swap. Pin Caddy to the running replicas, start the new ones
+                    Part 4: the swap. Pin Caddy to the running replicas, start the new ones
                     next to them (`--no-recreate` keeps the old containers; `--wait` blocks
                     until Docker reports the new ones healthy), pin Caddy to the new ones
                     (the drain), wait for requests in flight, then stop the old replicas with
@@ -908,17 +981,19 @@ def _server_cells() -> list[NotebookNode]:
                 (
                     'log "worker"',
                     """
-                    Part 4: replace the worker (SIGTERM; with the Step 2 fix it stops within a
-                    second), apply the rest of the stack, let Caddy discover replicas again,
+                    Part 5: replace the worker (SIGTERM; with the Step 2 fix it stops within a
+                    second), apply the rest of the stack (every service **except** the one-off
+                    `migrate` job: a plain `up` would run it, and after a rollback the older
+                    image's `alembic upgrade head` fails), let Caddy discover replicas again,
                     have Prometheus re-read its files, check that every replica runs the new
-                    image, and record the release:
+                    image, and record the release (`history.log` marks rollbacks):
                     """,
                 ),
                 (
                     "if [[ ${PRUNE_IMAGES:-1} == 1 ]]; then",
                     """
-                    Part 5: keep the five newest images (rollbacks need no download) and
-                    remove the rest:
+                    Part 6: keep the five newest images and the three newest known-good ones
+                    (rollbacks need no download) and remove the rest:
                     """,
                 ),
             ],
@@ -932,7 +1007,7 @@ def _server_cells() -> list[NotebookNode]:
         ),
         code(
             r"""
-            SCRIPTS = ("dc", "backup.sh", "rollout.sh", "bootstrap.sh")
+            SCRIPTS = ("dc", "backup.sh", "rollout.sh", "bootstrap.sh", "ci-command")
             for script in SCRIPTS:
                 (PRODUCTION_DIR / script).chmod(0o755)
             (PRODUCTION_DIR / "lib.sh").chmod(0o644)  # sourced, never run
@@ -1041,7 +1116,9 @@ def _zero_downtime_cells() -> list[NotebookNode]:
 
             **Migrations run while the old code serves.** The migration step happens before
             the swap, so for a short time the *old* code runs on the *new* schema, and after a
-            rollback the old code runs on it for as long as you like. Every migration must
+            rollback the old code runs on it for as long as you like (a rollback never
+            migrates, and the startup probe accepts a schema *newer* than the code). Every
+            migration must
             therefore be backward compatible: **expand → migrate → contract**, spread over
             releases. Renaming `notes.title` to `heading`, for example:
 
@@ -1063,7 +1140,8 @@ def _zero_downtime_cells() -> list[NotebookNode]:
             | backup | nothing changed | `set -e` stops the script before the migration |
             | migration | schema possibly half-migrated (PostgreSQL runs each Alembic migration in a transaction, so usually untouched) | the job fails; old replicas keep serving; read `dc logs`, fix, push |
             | new replicas unhealthy | old replicas pinned and serving | the new containers are removed; the job fails |
-            | smoke test after the swap | the new release serves | the workflow runs `rollout.sh rollback` |
+            | smoke test after the swap | the new release serves | the workflow runs `rollout.sh rollback`: back to the newest *known-good* release, without migrating |
+            | smoke test passes | the new release serves | the workflow runs `rollout.sh mark-good`: the release becomes a rollback target |
             """
         ),
     ]
@@ -1138,8 +1216,10 @@ def _cicd_cells() -> list[NotebookNode]:
                 (
                     "  scan:",
                     """
-                    Part 5: scan the image and the locked dependencies, then push the image
-                    with the commit SHA as its tag (on `main`, or a manual run on `main`):
+                    Part 5: scan the image (Trivy, pinned by version **and** digest: a moved
+                    tag cannot change what runs) and the locked dependencies (`pip-audit`,
+                    pinned), then push the image with the commit SHA as its tag (on `main`, or
+                    a manual run on `main`):
                     """,
                 ),
                 (
@@ -1148,16 +1228,20 @@ def _cicd_cells() -> list[NotebookNode]:
                     Part 6: the deploy job. It runs only after `push`, only when the
                     `NOTES_HOST` variable exists (so pushing before the server is ready is
                     harmless), one at a time, in the `production` environment (whose secrets it
-                    can read and where you can require an approval). It copies the Compose
-                    files and logs the server in to GHCR with the job's short-lived token for
-                    as long as `rollout.sh` runs:
+                    can read and where `DEPLOY.md` makes an approval and the `main` branch
+                    mandatory). On the server the CI key reaches only `ci-command` (Step 6): it
+                    copies the Compose files with `rsync --delete` (files removed from
+                    `deploy/production` disappear on the server too) and logs the server in to
+                    GHCR with the job's short-lived token for as long as `rollout.sh` runs:
                     """,
                 ),
                 (
                     "      - name: Smoke test over HTTPS",
                     """
                     Part 7: the smoke test, from outside, over the public URL: ready, migrated,
-                    HTTP redirects with 308, HSTS present. If it fails, roll back:
+                    HTTP redirects with 308, HSTS present. If it passes, the release is marked
+                    **known good** (a future rollback may return to it); if it fails, roll back
+                    to the newest known-good release:
                     """,
                 ),
             ],
@@ -1255,25 +1339,55 @@ def _load_test_file_cells() -> list[NotebookNode]:
             """
             ### Step 9 — The load test and its report
 
-            The scenario is Unit 6.8's locustfile with two production changes: certificates
-            are verified for every host except `localhost` (the rehearsal's local CA), and the
-            pass/fail thresholds can be set from the environment. Part 1: the settings:
+            The scenario is Unit 6.8's locustfile with three production changes: certificates
+            are verified for every host except `localhost` (the rehearsal's local CA), the
+            pass/fail thresholds can be set from the environment, and the users share a
+            **pool of accounts**. The API limits every user (120 writes a minute) and
+            registration (5 a minute per address), so one shared account would measure the
+            limiter, not the server; raising the limits for the test would measure a server
+            that is not the production one. Instead the test registers one account per two
+            simulated users, at the pace the registration limit allows (about a minute per
+            five accounts), and deletes them at the end with `DELETE /users/me`; the same file
+            runs unchanged against the live server. **`load/accounts.py`**, Part 1: an
+            account and logging in:
             """
         ),
+        *notes_file_cells(
+            "load/accounts.py",
+            [
+                ("", ""),
+                (
+                    "def register_accounts(",
+                    """
+                    Part 2: register the pool, waiting the `Retry-After` seconds the API sends
+                    with each 429, then log every account in (so all tokens are fresh when
+                    the users start):
+                    """,
+                ),
+                (
+                    "def delete_accounts(",
+                    "Part 3: delete the accounts again (a fresh login when a token has expired):",
+                ),
+            ],
+        )[1:],
+        md("**`load/locustfile.py`**, Part 1: the settings:"),
         *notes_file_cells(
             "load/locustfile.py",
             [
                 ("", ""),
-                ("def verify_tls(", "Part 2: when to verify certificates:"),
                 (
-                    "@events.test_start.add_listener",
-                    "Part 3: one account for the whole run, created before the users start:",
+                    "def verify_tls(",
+                    "Part 2: when to verify certificates, and the size of the pool:",
+                ),
+                (
+                    "@events.init.add_listener",
+                    "Part 3: the pool is registered in Locust's `init` event (it finishes before the run and its `--run-time` clock start; in `test_start` the registration would eat the run) and deleted when the test stops:",
                 ),
                 (
                     "class NotesUser(HttpUser):",
                     """
-                    Part 4: the simulated user (weights 5 : 3 : 1 : 1 for list, read, create,
-                    feed):
+                    Part 4: the simulated user takes the next account of the pool (weights
+                    5 : 3 : 1 : 1 for list, read, create, feed):
                     """,
                 ),
                 (
@@ -1365,9 +1479,12 @@ def _tests_cells() -> list[NotebookNode]:
             Configuration is code, so it gets tests. `tests/test_production.py` reads the
             files and checks the properties that matter: nothing but the proxy is public, the
             app services never build, logs rotate, the connection budget fits during a rollout,
-            secrets are required (never defaulted), the alerts use metrics the app really
-            exports, the scripts are strict and executable, the rollout runs its steps in
-            order, the deploy job waits for every check and runs only on `main`. Part 1: imports
+            secrets are required (never defaulted), Redis has a password and only Caddy may
+            forward client addresses, the alerts use metrics the app really exports, the
+            scripts are strict and executable, the rollout runs its steps in order, a rollback
+            after a migration works (with a fake `docker`, so it runs everywhere), the CI key's
+            wrapper refuses everything but the deploy commands, the deploy job waits for every
+            check and runs only on `main`. Part 1: imports
             and paths (the workflows live at the repository root, two levels up):
             """
         ),
@@ -1390,21 +1507,70 @@ def _tests_cells() -> list[NotebookNode]:
                 ),
                 (
                     "def test_secrets_are_required_not_defaulted",
-                    "Part 6: secrets and Caddy:",
+                    "Part 6: secrets (and no admin-by-e-mail setting any more):",
+                ),
+                (
+                    "def test_redis_needs_a_password_and_only_caddy_may_forward",
+                    "Part 7: the Redis password, the trusted proxy, and the Caddyfile:",
                 ),
                 (
                     "def test_alert_rules_use_metrics_the_app_exports",
-                    "Part 7: the alert rules and Prometheus:",
+                    "Part 8: the alert rules and Prometheus:",
                 ),
-                ('@pytest.mark.parametrize("script", SCRIPTS)', "Part 8: the scripts:"),
+                ('@pytest.mark.parametrize("script", SCRIPTS)', "Part 9: the scripts:"),
                 (
                     "def test_rollout_order_backup_migrate_pin_start_drain_stop",
-                    "Part 9: the rollout's order:",
+                    "Part 10: the rollout's order:",
+                ),
+                (
+                    'FAKE_DOCKER = r"""',
+                    """
+                    Part 11: `rollout.sh`'s decisions without containers. A fake `docker` on
+                    `PATH` records every call and answers the three questions the script asks:
+                    the database's revision, whether the image knows a revision, and which
+                    image the replicas run:
+                    """,
+                ),
+                (
+                    "class FakeServer:",
+                    "Part 12: a server made of the real script, a temporary state folder and the fake `docker`:",
+                ),
+                (
+                    "    def run(",
+                    "Part 13 (continues `FakeServer`): run the script, return its exit code, output and Docker calls:",
+                ),
+                (
+                    "def migrated(calls: list[str]) -> bool:",
+                    """
+                    Part 14: the audit's failure as a test. Release B adds migration 0007 and
+                    passes its smoke test, then turns out bad: the rollback must not migrate,
+                    and a second rollback must not return to B. Against the old script this
+                    test fails exactly as the audit's rehearsal did:
+                    """,
+                ),
+                (
+                    "def test_an_image_older_than_the_database_does_not_migrate(tmp_path: Path) -> None:",
+                    "Part 15: an older tag deployed by name skips the migration too; a rollback needs a known-good release:",
+                ),
+                (
+                    "CI_COMMAND_STUBS = {",
+                    """
+                    Part 16: `ci-command` as sshd runs it for the CI key, with stand-ins for
+                    `rollout.sh`, `docker` and `rrsync` that only print how they were called:
+                    """,
+                ),
+                (
+                    '@pytest.mark.parametrize(\n    ("request_line", "expected"),',
+                    "Part 17: each command the workflow sends reaches exactly one program:",
+                ),
+                (
+                    '@pytest.mark.parametrize(\n    "request_line",',
+                    "Part 18: and everything else is refused:",
                 ),
                 (
                     "def start_worker(",
                     """
-                    Part 10: the Step 2 regression test. A helper starts the real worker
+                    Part 19: the Step 2 regression test. A helper starts the real worker
                     against Redis and waits until arq reports it started:
                     """,
                 ),
@@ -1418,13 +1584,13 @@ def _tests_cells() -> list[NotebookNode]:
                 (
                     "workflows_present = pytest.mark.skipif(",
                     """
-                    Part 11: the workflows (skipped when the Notes API is used outside this
+                    Part 20: the workflows (skipped when the Notes API is used outside this
                     repository):
                     """,
                 ),
                 (
                     "@workflows_present\ndef test_workflows_use_only_the_documented_secrets",
-                    "Part 12: the secrets and variables, and the uptime schedule:",
+                    "Part 21: the secrets and variables, and the uptime schedule:",
                 ),
             ],
         )[1:],
@@ -1489,11 +1655,11 @@ def rollout_log(run: subprocess.CompletedProcess[str]) -> list[str]:
 
 REHEARSAL_LOAD_SOURCE = r'''
 def send_one(client: httpx.Client, number: int) -> str:
-    """One request (every 4th a write). A request on an idle connection the server closed
+    """One request (every 10th a write). A request on an idle connection the server closed
     without answering is retried once, as browsers do; the outcome says so."""
     for attempt in (1, 2):
         try:
-            if number % 4 == 0:
+            if number % 10 == 0:
                 reply = client.post("/api/v1/notes", json={"title": f"rollout {number}"})
             else:
                 reply = client.get("/api/v1/notes?limit=5")
@@ -1510,13 +1676,14 @@ def send_one(client: httpx.Client, number: int) -> str:
 
 REHEARSAL_ROLLOUT_SOURCE = r'''
 def rollout_under_load(
-    target: str, token: str, users: int = 8
+    target: str, tokens: list[str]
 ) -> tuple[subprocess.CompletedProcess[str], TallyCounter[str]]:
-    """Run rollout.sh <target> while `users` threads keep sending requests; count outcomes."""
+    """Run rollout.sh <target> while one thread per account sends about ten requests a second
+    (a write a second: half the per-user budget); count the outcomes."""
     outcomes: TallyCounter[str] = TallyCounter()
     stop, lock = threading.Event(), threading.Lock()
 
-    def user_loop() -> None:
+    def user_loop(token: str) -> None:
         """Send requests until stopped, counting each outcome."""
         headers = {"Authorization": f"Bearer {token}"}
         with httpx.Client(
@@ -1528,8 +1695,9 @@ def rollout_under_load(
                 outcome = send_one(client, number)
                 with lock:
                     outcomes[outcome] += 1
+                time.sleep(0.1)
 
-    users_threads = [threading.Thread(target=user_loop) for _ in range(users)]
+    users_threads = [threading.Thread(target=user_loop, args=(token,)) for token in tokens]
     for thread in users_threads:
         thread.start()
     time.sleep(2)  # traffic flows before the rollout starts ...
@@ -1557,7 +1725,7 @@ def _rehearsal_cells() -> list[NotebookNode]:
             | hostname | `203-0-113-10.sslip.io`: Let's Encrypt certificate | `localhost`: Caddy's internal CA (clients use `verify=False`) |
             | public ports | 80 and 443 | 58080 and 58443 |
             | Prometheus / Grafana | 127.0.0.1:9090 / 3000 | 127.0.0.1:59090 / 53000 |
-            | images | pulled from GHCR, tagged with the commit SHA | built here, tagged `release-a` and `release-b` (`SKIP_PULL=1`) |
+            | images | pulled from GHCR, tagged with the commit SHA | built here, tagged `release-a`, `release-b` and `release-c` (`SKIP_PULL=1`) |
             | state folder | `/srv/notes/state` | `notebooks/_scratch/phase6/rehearsal_state` |
             | secrets | `/srv/notes/.env` | random values generated for this run (never printed) |
 
@@ -1571,16 +1739,17 @@ def _rehearsal_cells() -> list[NotebookNode]:
             **Two releases.** `release-a` is the 1.0.0 image built from `projects/notes_api/`;
             `release-b` is the same image with one extra label, so Docker sees a different
             image (as it would for the next commit). The JWT secret file is the one Unit 6.8
-            created (written again if it is missing):
+            created; the Redis password file is new (each is written if it is missing):
             """
         ),
         code(
             r"""
-            secret_file = NOTES_API_DIR / ".secrets" / "notes_jwt_secret"
-            if not secret_file.exists():
-                secret_file.parent.mkdir(exist_ok=True)
-                secret_file.write_text(secrets.token_urlsafe(32))
-                secret_file.chmod(0o444)
+            for secret_name in ("notes_jwt_secret", "notes_redis_password"):
+                secret_file = NOTES_API_DIR / ".secrets" / secret_name
+                if not secret_file.exists():
+                    secret_file.parent.mkdir(exist_ok=True)
+                    secret_file.write_text(secrets.token_hex(32))
+                    secret_file.chmod(0o444)  # the containers' users must read it
             if HAS_DOCKER:
                 started = time.perf_counter()
                 docker("build", "--quiet", "--tag", "notes-api:release-a", ".", cwd=NOTES_API_DIR)
@@ -1606,7 +1775,8 @@ def _rehearsal_cells() -> list[NotebookNode]:
             Redis, skips the backup (nothing to back up yet), runs the migrations, starts two
             API replicas, the worker, Caddy, Prometheus and Grafana. An exit hook takes the
             rehearsal stack down when the kernel stops, so a failing cell before the clean-up at
-            the end of this step cannot leave it (and ports 58080, 58443, 59090, 53000) behind:
+            the end of this step cannot leave it (and ports 58080, 58443, 59090, 53000) behind.
+            After CI's smoke test passes, it runs `mark-good`; the rehearsal does the same:
             """
         ),
         code(
@@ -1619,6 +1789,7 @@ def _rehearsal_cells() -> list[NotebookNode]:
                 first_deploy = production_script("rollout.sh", "release-a")
                 print(*rollout_log(first_deploy), sep="\n")
                 print(f"exit code {first_deploy.returncode} after {time.perf_counter() - started:.0f} s")
+                print(production_script("rollout.sh", "mark-good").stdout.strip())  # CI: smoke test passed
             """
         ),
         md(
@@ -1708,9 +1879,11 @@ def _rehearsal_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            **Zero downtime, measured.** Eight threads send requests as fast as they can (a
-            quarter are writes), through Caddy, while `rollout.sh release-b` replaces every API
-            replica and the worker. Every outcome is counted:
+            **Zero downtime, measured.** Eight threads, each with its own account, send about
+            ten requests a second (every tenth is a write), through Caddy, while
+            `rollout.sh release-b` replaces every API replica and the worker. One account per
+            thread: the API limits every user to 120 writes a minute, and one shared account
+            would measure that limit instead of the rollout. Every outcome is counted:
             """
         ),
         code(REHEARSAL_LOAD_SOURCE),
@@ -1721,21 +1894,36 @@ def _rehearsal_cells() -> list[NotebookNode]:
             """
         ),
         code(REHEARSAL_ROLLOUT_SOURCE),
-        md("A user for the traffic, then the rollout under load:"),
+        md(
+            """
+            The accounts come from `load/accounts.py` (Step 9), the module the load test
+            uses: it registers at the pace the registration limit allows (5 a minute per
+            address, so 8 accounts take about a minute) and deletes them afterwards:
+            """
+        ),
         code(
-            r'''
-            def rehearsal_token() -> str:
-                """Register a user on the rehearsal stack and return an access token."""
-                email, password = f"ops-{secrets.token_hex(3)}@example.com", "a-long-passphrase"
-                with httpx.Client(base_url=REHEARSAL_URL, verify=False, trust_env=False) as client:
-                    client.post("/api/v1/auth/register", json={"email": email, "password": password})
-                    reply = client.post("/api/v1/auth/token", data={"username": email, "password": password})
-                return reply.json()["access_token"]
+            r"""
+            import importlib.util
 
+            import urllib3
 
+            accounts_spec = importlib.util.spec_from_file_location(
+                "load_accounts", NOTES_API_DIR / "load" / "accounts.py"
+            )
+            load_accounts = importlib.util.module_from_spec(accounts_spec)
+            accounts_spec.loader.exec_module(load_accounts)
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # Caddy's local CA
             if HAS_DOCKER:
-                rehearsal_access_token = rehearsal_token()
-                second_deploy, outcomes = rollout_under_load("release-b", rehearsal_access_token)
+                rollout_pool = load_accounts.register_accounts(REHEARSAL_URL, 8, verify=False)
+            """
+        ),
+        md("The rollout under load; CI's smoke test would then pass, so `mark-good` follows:"),
+        code(
+            r"""
+            if HAS_DOCKER:
+                second_deploy, outcomes = rollout_under_load(
+                    "release-b", [account.token for account in rollout_pool]
+                )
                 print(*rollout_log(second_deploy), sep="\n")
                 total = sum(outcomes.values())
                 print(f"\n{total} requests during the rollout:")
@@ -1743,7 +1931,8 @@ def _rehearsal_cells() -> list[NotebookNode]:
                     print(f"  {count:>6}  {outcome}")
                 failed = sum(count for outcome, count in outcomes.items() if "20" not in outcome)
                 print(f"failed requests: {failed}")
-            '''
+                print(production_script("rollout.sh", "mark-good").stdout.strip())
+            """
         ),
         md(
             """
@@ -1770,18 +1959,115 @@ def _rehearsal_cells() -> list[NotebookNode]:
         ),
         md(
             """
-            **Rollback** is the same zero-downtime swap, to the release before the current
-            one, using the image already on the machine (`SKIP_PULL=1`, as `DEPLOY.md` shows):
+            **Rollback after a migration** — the case the audit found broken. `release-c` is
+            `release-b` plus migration `0007` (an *expand* step: a nullable column), built in
+            a context with two files:
+            """
+        ),
+        code(
+            r'''
+            MIGRATION_0007 = "\n".join(
+                [
+                    '"""Rehearsal only: release-c adds a nullable column (an expand step)."""',
+                    "",
+                    "import sqlalchemy as sa",
+                    "from alembic import op",
+                    "",
+                    'revision, down_revision, branch_labels, depends_on = "0007", "0006", None, None',
+                    "",
+                    "",
+                    "def upgrade() -> None:",
+                    '    """Expand: older releases ignore the new column."""',
+                    '    op.add_column("notes", sa.Column("color", sa.String(20), nullable=True))',
+                    "",
+                    "",
+                    "def downgrade() -> None:",
+                    '    """Contract again."""',
+                    '    op.drop_column("notes", "color")',
+                    "",
+                ]
+            )
+            if HAS_DOCKER:
+                release_c_dir = PHASE6_DIR / "release_c"
+                release_c_dir.mkdir(exist_ok=True)
+                (release_c_dir / "0007_rehearsal_color.py").write_text(MIGRATION_0007)
+                (release_c_dir / "Dockerfile").write_text(
+                    "FROM notes-api:release-b\nCOPY 0007_rehearsal_color.py /app/alembic/versions/\n"
+                )
+                docker("build", "--quiet", "--tag", "notes-api:release-c", ".", cwd=release_c_dir)
+                heads = docker(*"run --rm --entrypoint alembic notes-api:release-c heads".split())
+                print("release-c's migration head:", heads)
+            '''
+        ),
+        md(
+            """
+            Deploy it: the migration runs (the database moves to `0007`) and the swap is the
+            usual one. `migration_lines()` keeps a rollout's first line, its migration decision
+            and its last line:
+            """
+        ),
+        code(
+            r'''
+            def migration_lines(run: subprocess.CompletedProcess[str]) -> list[str]:
+                """The first log line, the migration decision and the last line of a rollout."""
+                steps = rollout_log(run)
+                return [steps[0], *[line for line in steps if "migrations" in line], steps[-1]]
+
+
+            def database_revision() -> str:
+                """The Alembic revision of the rehearsal database."""
+                query = "SELECT version_num FROM alembic_version"
+                psql = ("dc", "exec", "-T", "db", "psql", "-U", "notes", "-tAc", query)
+                return production_script(*psql).stdout.strip()
+
+
+            if HAS_DOCKER:
+                third_deploy = production_script("rollout.sh", "release-c")
+                print(*migration_lines(third_deploy), sep="\n")
+                print("database at:", database_revision())
+                assert third_deploy.returncode == 0, rollout_log(third_deploy)
+            '''
+        ),
+        md(
+            """
+            Say `release-c`'s smoke test fails: CI runs `rollout.sh rollback`. The target is
+            the newest *known-good* release, `release-b`; the rollback does **not** migrate,
+            the database stays at `0007`, and the old code is ready and reports the schema as
+            fine (a revision it does not know is newer: expand/contract). Before the fix this
+            step stopped with *Can't locate revision identified by '0007'*:
             """
         ),
         code(
             r"""
             if HAS_DOCKER:
                 rolled_back = production_script("rollout.sh", "rollback")
-                print(*rollout_log(rolled_back)[:1], *rollout_log(rolled_back)[-1:], sep="\n")
-                print("history.log:")
-                print((REHEARSAL_STATE / "history.log").read_text().strip())
+                print(*migration_lines(rolled_back), sep="\n")
+                assert rolled_back.returncode == 0, rollout_log(rolled_back)
+                print("database at:", database_revision())
+                with httpx.Client(base_url=REHEARSAL_URL, verify=False, trust_env=False) as client:
+                    print("ready  :", client.get("/health/ready").json())
+                    print("startup:", client.get("/health/startup").json())
+            """
+        ),
+        md(
+            """
+            **A second rollback** goes further back to `release-a` (the newest known-good
+            release that is neither the current one nor one a rollback left), never to
+            `release-c`. The state files tell the story; the rollout accounts are deleted:
+            """
+        ),
+        code(
+            r"""
+            if HAS_DOCKER:
+                second_rollback = production_script("rollout.sh", "rollback")
+                print(*migration_lines(second_rollback), sep="\n")
+                assert second_rollback.returncode == 0, rollout_log(second_rollback)
+                for name in ("history.log", "known-good.log", "rolled-back.log"):
+                    lines = (REHEARSAL_STATE / name).read_text().splitlines()
+                    print(f"{name}:", *(line.split(" ", 1)[1] for line in lines), sep="\n  ")
                 print("release.env:", (REHEARSAL_STATE / "release.env").read_text().split())
+                deleted = load_accounts.delete_accounts(REHEARSAL_URL, rollout_pool, verify=False)
+                print(f"deleted {deleted}/{len(rollout_pool)} rollout accounts")
             """
         ),
         md(
@@ -1813,7 +2099,9 @@ def _rehearsal_cells() -> list[NotebookNode]:
         md(
             """
             **The load test.** Locust runs the Step 9 scenario against the rehearsal stack (50
-            users, 15 s, through Caddy and TLS), then `load/report.py` writes the results into
+            users, 15 s, through Caddy and TLS). It first registers its pool of 25 accounts at
+            the pace the registration limit allows (about five minutes; the 15 s start after
+            that) and deletes them at the end. Then `load/report.py` writes the results into
             the *local rehearsal* section of `LOAD_TEST.md`, with the server-side p95 from the
             rehearsal's Prometheus:
             """
@@ -1830,9 +2118,11 @@ def _rehearsal_cells() -> list[NotebookNode]:
                     capture_output=True,
                     text=True,
                     env=CHILD_ENV,
-                    timeout=180,
+                    timeout=900,
                 )
                 print("locust exit code (0 = within the targets):", load_run.returncode)
+                output = (load_run.stdout + load_run.stderr).splitlines()
+                print(*[line for line in output if "accounts" in line][-2:], sep="\n")
                 time.sleep(16)  # one more Prometheus scrape after the last request
                 report_options = (
                     f"--stats {locust_prefix}_stats.csv --section local --host {REHEARSAL_URL} "
@@ -1847,6 +2137,10 @@ def _rehearsal_cells() -> list[NotebookNode]:
                 )
                 print("report exit code:", report.returncode, report.stderr[-300:])
                 display(Markdown(report.stdout))
+                query = "SELECT count(*) FROM users WHERE email LIKE 'load-%'"
+                left = production_script("dc", "exec", "-T", "db", "psql", "-U", "notes", "-tAc", query)
+                print("load-test accounts left in the database:", left.stdout.strip())
+                assert left.stdout.strip() == "0" and report.returncode == 0
             """
         ),
         md(
@@ -1856,7 +2150,7 @@ def _rehearsal_cells() -> list[NotebookNode]:
             scenario and the report work end to end, not what the server will do. The live
             run fills the second section of `LOAD_TEST.md` after the deploy.
 
-            **Clean up**: remove the rehearsal stack with its volumes, the two release tags,
+            **Clean up**: remove the rehearsal stack with its volumes, the three release tags,
             the shared PostgreSQL and Redis containers of Step 10, and confirm that no
             container is left running:
             """
@@ -1867,7 +2161,7 @@ def _rehearsal_cells() -> list[NotebookNode]:
                 down = remove_rehearsal_stack()
                 atexit.unregister(remove_rehearsal_stack)
                 print("rehearsal stack removed:", down.returncode == 0)
-                docker("rmi", "notes-api:release-b", "notes-api:release-a", check=False)
+                docker("rmi", "notes-api:release-c", "notes-api:release-b", "notes-api:release-a", check=False)
             stop_shared_postgres()
             stop_shared_redis()
             if shutil.which("docker"):
@@ -1891,15 +2185,18 @@ Caddy (automatic HTTPS from Let's Encrypt, HSTS), two API replicas, the worker, 
 Redis, Prometheus and Grafana. Every push to `main` that passes lint, types, tests, the image
 build and the scans is deployed by `.github/workflows/notes-api.yml` with
 `deploy/production/rollout.sh`: backup, migrations, then a zero-downtime swap of the replicas,
-an HTTPS smoke test and an automatic rollback if it fails. `notes-api-uptime.yml` checks the
-live API and its certificate every 15 minutes.
+an HTTPS smoke test, and an automatic rollback to the last known-good release if it fails (a
+rollback never migrates). On the server the CI key can run only `deploy/production/ci-command`.
+`notes-api-uptime.yml` checks the live API and its certificate every 15 minutes. Admins are
+promoted on the server with `python -m notes_api.manage promote-admin <email>`.
 
 | File | Purpose |
 | --- | --- |
 | [`DEPLOY.md`](DEPLOY.md) | the runbook: server, secrets, first deploy, HTTPS checks, monitoring, rollback |
 | [`LOAD_TEST.md`](LOAD_TEST.md) | the Locust scenario, the targets (p95 < 200 ms, < 1% errors, >= 100 req/s) and the results |
 | `compose.prod.yaml` | production overrides merged over `compose.yaml` |
-| `deploy/production/` | Caddyfile, Prometheus and alert rules, Grafana provisioning, `bootstrap.sh`, `rollout.sh`, `backup.sh`, `dc` |
+| `deploy/production/` | Caddyfile, Prometheus and alert rules, Grafana provisioning, `bootstrap.sh`, `ci-command`, `rollout.sh`, `backup.sh`, `dc` |
+| `load/accounts.py` | the load test's pool of throw-away accounts (registered at the allowed pace, deleted afterwards) |
 | `load/report.py` | turns a Locust CSV into the results section of `LOAD_TEST.md` |
 """  # noqa: E501  (markdown table rows)
 readme_path = NOTES_API_DIR / "README.md"

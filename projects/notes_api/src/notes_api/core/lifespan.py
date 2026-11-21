@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from notes_api import __version__
 from notes_api.core.config import Settings
 from notes_api.db import create_engine_from_settings, make_session_factory
+from notes_api.netguard import public_only_client
 
 
 @asynccontextmanager
@@ -26,13 +27,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The ARQ client (bytes, pickled jobs) for enqueuing background work; lazy as well
     app.state.queue = ArqRedis.from_url(settings.redis_url.get_secret_value())
     try:
-        async with httpx.AsyncClient(
-            timeout=settings.http_timeout_seconds,
-            follow_redirects=False,  # a redirect could lead a server-side fetch somewhere private
-            headers={"User-Agent": f"notes-api/{__version__}"},
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        ) as http_client:
-            app.state.http_client = http_client
+        async with (
+            httpx.AsyncClient(
+                timeout=settings.http_timeout_seconds,
+                follow_redirects=False,  # a redirect could lead a fetch somewhere private
+                headers={"User-Agent": f"notes-api/{__version__}"},
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            ) as http_client,
+            public_only_client(
+                settings.http_timeout_seconds, f"notes-api/{__version__}"
+            ) as outbound_client,
+        ):
+            app.state.http_client = http_client  # configured endpoints (the OIDC provider)
+            app.state.outbound_client = outbound_client  # user-supplied URLs (link previews)
             yield
     finally:
         await app.state.queue.aclose()

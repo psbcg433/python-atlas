@@ -3,12 +3,9 @@
 import asyncio
 import csv
 import io
-import ipaddress
 import json
 import re
-import socket
-import urllib.parse
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
@@ -20,6 +17,7 @@ from notes_api.core.metrics import NOTES_WRITTEN
 from notes_api.events import new_event
 from notes_api.exceptions import NoteNotFoundError, UploadRejectedError, VersionConflictError
 from notes_api.models import Note
+from notes_api.netguard import BLOCKED, Resolver, check_public_url, resolve_host
 from notes_api.pagination import decode_cursor, encode_cursor
 from notes_api.repositories import NoteRepository
 from notes_api.schemas import LinkPreview, NoteCreate, NoteFilters, NoteRead, NoteUpdate
@@ -131,47 +129,24 @@ def parse_import(filename: str, content: bytes) -> list[NoteCreate]:
         raise UploadRejectedError(reason, HTTPStatus.UNPROCESSABLE_CONTENT) from error
 
 
-type Resolver = Callable[[str], Awaitable[list[str]]]
-
-
-async def resolve_host(host: str) -> list[str]:
-    """Every IP address a host name resolves to (getaddrinfo runs in a worker thread)."""
-    infos = await asyncio.to_thread(socket.getaddrinfo, host, None, type=socket.SOCK_STREAM)
-    return sorted({str(info[4][0]) for info in infos})
-
-
-def is_public_address(address: str) -> bool:
-    """False for loopback, private, link-local, reserved, multicast and unspecified addresses."""
-    ip = ipaddress.ip_address(address)
-    return ip.is_global and not ip.is_multicast
-
-
 class LinkPreviewer:
     """Fetch the <title> of links in a note, refusing anything that is not a public web URL.
 
     Server-side request forgery (OWASP API7): a note body is user input, so a link could point
-    at 127.0.0.1, the cloud metadata service (169.254.169.254) or a private network. Each host
-    is resolved first and every address must be public; redirects are not followed (a public
+    at 127.0.0.1, the cloud metadata service (169.254.169.254) or a private network.
+    check_url() gives an early, readable answer; the client (netguard.public_only_client)
+    enforces the rule where it matters, when it connects. Redirects are not followed (a public
     URL could redirect to a private one); at most MAX_PREVIEW_BYTES of a page are read.
     """
 
     def __init__(self, client: httpx.AsyncClient, resolver: Resolver = resolve_host) -> None:
-        """Use the pooled client created by the lifespan and an injectable DNS resolver."""
+        """Use the lifespan's public-only client and an injectable DNS resolver."""
         self.client = client
         self.resolver = resolver
 
     async def check_url(self, url: str) -> str | None:
         """None if the URL may be fetched, else the reason it may not."""
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return "only public http(s) URLs are fetched"
-        try:
-            addresses = await self.resolver(parsed.hostname)
-        except OSError:
-            return "host does not resolve"
-        if not addresses or not all(is_public_address(address) for address in addresses):
-            return "blocked: not a public address"
-        return None
+        return await check_public_url(url, self.resolver)
 
     async def preview(self, url: str) -> LinkPreview:
         """One link: its status and title, or why it was not fetched (never raises)."""
@@ -185,8 +160,9 @@ class LinkPreviewer:
                     size += len(chunk)
                     if size >= MAX_PREVIEW_BYTES:
                         break
-        except httpx.HTTPError as error:
-            return LinkPreview(url=url, error=type(error).__name__)
+        except httpx.HTTPError as error:  # BLOCKED: the DNS answer changed after check_url()
+            reason = BLOCKED if str(error).startswith(BLOCKED) else type(error).__name__
+            return LinkPreview(url=url, error=reason)
         if response.is_redirect:
             return LinkPreview(
                 url=url, status_code=response.status_code, error="redirect not followed"

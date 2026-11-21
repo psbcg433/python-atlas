@@ -102,6 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="Built step by step in Phase 6 of the course. Errors are RFC 9457 problems.",
         debug=settings.debug,
         lifespan=lifespan,
+        openapi_url=None if settings.environment == "production" else "/openapi.json",
         docs_url=None if settings.environment == "production" else "/docs",
         redoc_url=None if settings.environment == "production" else "/redoc",
         generate_unique_id_function=operation_id,

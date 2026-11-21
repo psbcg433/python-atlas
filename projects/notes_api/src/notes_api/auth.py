@@ -46,7 +46,6 @@ class AuthService:
         redis: Redis,
         session_factory: SessionFactory,
         refresh_lifetime: timedelta,
-        admin_emails: list[str],
     ) -> None:
         """Keep the collaborators (built per request by dependencies.get_auth_service)."""
         self.users = users
@@ -56,19 +55,18 @@ class AuthService:
         self.redis = redis
         self.session_factory = session_factory
         self.refresh_lifetime = refresh_lifetime
-        self.admin_emails = {email.lower() for email in admin_emails}
 
     def now(self) -> datetime:
         """The token service's clock (one clock for every timestamp)."""
         return self.tokens.clock()
 
     async def register(self, data: UserCreate) -> User:
-        """Create an account; admin only for configured addresses, never from the request."""
-        role = "admin" if data.email.lower() in self.admin_emails else "user"
+        """Create an ordinary account. The admin role never comes from a request or an e-mail
+        address (anyone can register any address); an operator grants it with notes_api.manage."""
         password_hash = self.hasher.hash(data.password)
         try:
             async with self.users.session.begin_nested():
-                return await self.users.add_user(data.email, password_hash, role)
+                return await self.users.add_user(data.email, password_hash, "user")
         except IntegrityError as error:
             raise EmailTakenError(f"{data.email} is already registered") from error
 
@@ -129,8 +127,7 @@ class AuthService:
             if user is not None:
                 user.oidc_subject = subject  # the provider verified this address
             else:
-                role = "admin" if email in self.admin_emails else "user"
-                user = await self.users.add_user(email, None, role, oidc_subject=subject)
+                user = await self.users.add_user(email, None, "user", oidc_subject=subject)
         if not user.is_active:
             raise AuthenticationError("account disabled")
         return await self.issue_tokens(user, ROLE_SCOPES.get(user.role, set()))

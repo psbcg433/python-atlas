@@ -13,7 +13,7 @@ import contextlib
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 from arq.connections import ArqRedis
@@ -26,14 +26,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from notes_api.auth import AuthService
 from notes_api.cache import NoteCache
 from notes_api.core.config import Settings
-from notes_api.exceptions import AuthenticationError, PermissionDeniedError
+from notes_api.exceptions import AuthenticationError, PermissionDeniedError, RateLimitedError
 from notes_api.mailer import LogMailer, Mailer
 from notes_api.models import utc_now
+from notes_api.netguard import Resolver, resolve_host
 from notes_api.oauth import OidcClient
 from notes_api.ratelimit import FixedWindowRateLimiter
 from notes_api.repositories import NoteRepository, SqlNoteRepository, SqlUserRepository
 from notes_api.security import ALL_SCOPES, Principal, TokenService
-from notes_api.services import LinkPreviewer, NoteService, Resolver, resolve_host
+from notes_api.services import LinkPreviewer, NoteService
 
 
 def get_app_settings(connection: HTTPConnection) -> Settings:
@@ -105,7 +106,6 @@ def get_auth_service(
         redis,
         request.app.state.session_factory,
         timedelta(days=settings.refresh_token_days),
-        settings.admin_emails,
     )
 
 
@@ -165,10 +165,10 @@ WriterServiceDep = Annotated[NoteService, Security(get_note_service, scopes=["no
 
 
 def get_link_previewer(
-    client: HttpClientDep, resolver: Annotated[Resolver, Depends(get_resolver)]
+    request: Request, resolver: Annotated[Resolver, Depends(get_resolver)]
 ) -> LinkPreviewer:
-    """A LinkPreviewer on the shared HTTP client, with SSRF checks."""
-    return LinkPreviewer(client, resolver)
+    """A LinkPreviewer on the public-only client (it refuses private addresses on connect)."""
+    return LinkPreviewer(request.app.state.outbound_client, resolver)
 
 
 LinkPreviewerDep = Annotated[LinkPreviewer, Depends(get_link_previewer)]
@@ -182,6 +182,35 @@ def get_login_limiter(redis: RedisDep, settings: SettingsDep) -> FixedWindowRate
 
 
 LoginLimiterDep = Annotated[FixedWindowRateLimiter, Depends(get_login_limiter)]
+
+
+def per_user_limit(bucket: str, scopes: list[str]) -> Any:
+    """A route dependency that spends one unit of the caller's budget for `bucket` (OWASP
+    API4). `scopes` repeats the route's scopes: FastAPI caches a dependency per (function,
+    scopes), so the principal is still resolved once per request."""
+
+    async def enforce(
+        principal: Annotated[Principal, Security(get_current_principal, scopes=scopes)],
+        redis: RedisDep,
+        settings: SettingsDep,
+    ) -> None:
+        """429 with Retry-After once this user's budget for the window is spent."""
+        limit = getattr(settings, f"{bucket}_rate_limit")
+        window = settings.user_rate_window_seconds
+        limiter = FixedWindowRateLimiter(redis, limit, window, f"user-{bucket}")
+        result = await limiter.hit(str(principal.user_id))
+        if not result.allowed:
+            raise RateLimitedError(result.retry_after)
+
+    return Depends(enforce)
+
+
+NOTE_WRITE_LIMIT = per_user_limit("write", ["notes:write"])  # POST/PUT/PATCH/DELETE notes
+LINK_PREVIEW_LIMIT = per_user_limit("link_preview", ["notes:read"])  # up to 5 fetches each
+ACCOUNT_WRITE_LIMIT = per_user_limit("write", [])  # /users/me: keys, webhook, account
+ADMIN_WRITE_LIMIT = per_user_limit("write", ["admin"])  # imports, wipes, retries
+EXPORT_LIMIT = per_user_limit("export", [])  # POST /exports (a worker job each)
+ADMIN_EXPORT_LIMIT = per_user_limit("export", ["admin"])  # GET /admin/export (every note)
 
 
 def get_oidc_client(settings: SettingsDep, client: HttpClientDep, redis: RedisDep) -> OidcClient:

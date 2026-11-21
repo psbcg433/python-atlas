@@ -4,9 +4,12 @@ import asyncio
 import contextlib
 import json
 import time
+import uuid
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 
 from notes_api.dependencies import RedisDep, SettingsDep, get_auth_service, get_clock
@@ -52,8 +55,40 @@ async def authenticate(
         return await auth.principal_from_access_token(token)
 
 
-async def forward_events(websocket: WebSocket, pubsub: PubSub, heartbeat_seconds: float) -> None:
-    """Redis → client, plus a ping every heartbeat_seconds (dead connections show up fast)."""
+def slots_key(user_id: int) -> str:
+    """The Redis sorted set of a user's open sockets (member: connection id, score: last beat)."""
+    return f"ws:open:{user_id}"
+
+
+async def claim_slot(
+    redis: Redis, user_id: int, connection_id: str, limit: int, stale: float
+) -> bool:
+    """Count this socket against the user's cap, across every process (OWASP API4).
+
+    Entries older than `stale` seconds belong to sockets of a process that died without
+    cleaning up; they are dropped first. Over the cap: the claim is withdrawn, False.
+    """
+    key, now = slots_key(user_id), time.time()
+    async with redis.pipeline(transaction=True) as pipeline:
+        pipeline.zremrangebyscore(key, 0, now - stale)
+        pipeline.zadd(key, {connection_id: now})
+        pipeline.zcard(key)
+        pipeline.expire(key, int(stale) + 1)
+        _, _, open_sockets, _ = await pipeline.execute()
+    if open_sockets > limit:
+        await redis.zrem(key, connection_id)
+        return False
+    return True
+
+
+async def forward_events(
+    websocket: WebSocket,
+    pubsub: PubSub,
+    heartbeat_seconds: float,
+    keep_slot: Callable[[], Awaitable[None]],
+) -> None:
+    """Redis → client, plus a ping every heartbeat_seconds (dead connections show up fast);
+    each ping also refreshes the socket's entry in the per-user cap."""
     last_ping = time.monotonic()
     while True:
         message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
@@ -61,6 +96,7 @@ async def forward_events(websocket: WebSocket, pubsub: PubSub, heartbeat_seconds
             await websocket.send_text(message["data"])
         if time.monotonic() - last_ping >= heartbeat_seconds:
             await websocket.send_json({"type": "ping"})
+            await keep_slot()
             last_ping = time.monotonic()
 
 
@@ -84,13 +120,24 @@ async def live_updates(websocket: WebSocket, redis: RedisDep, settings: Settings
         return
     except WebSocketDisconnect:
         return
+    connection_id, stale = uuid.uuid4().hex, 3 * settings.ws_heartbeat_seconds
+    limit = settings.ws_connections_per_user
+    if not await claim_slot(redis, principal.user_id, connection_id, limit, stale):
+        await websocket.close(code=POLICY_VIOLATION, reason="too many open connections")
+        return
     manager: ConnectionManager = websocket.app.state.connections
     manager.add(principal.user_id, websocket)
     pubsub = redis.pubsub()
     await pubsub.subscribe(user_channel(principal.user_id))
     await websocket.send_json({"type": "ready", "user_id": principal.user_id})
+    beat = settings.ws_heartbeat_seconds
+
+    async def keep_slot() -> None:
+        """Refresh this socket's score (it is alive)."""
+        await redis.zadd(slots_key(principal.user_id), {connection_id: time.time()})
+
     tasks = [
-        asyncio.create_task(forward_events(websocket, pubsub, settings.ws_heartbeat_seconds)),
+        asyncio.create_task(forward_events(websocket, pubsub, beat, keep_slot)),
         asyncio.create_task(read_client(websocket)),
     ]
     try:
@@ -101,5 +148,6 @@ async def live_updates(websocket: WebSocket, redis: RedisDep, settings: Settings
         with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
             await asyncio.gather(*tasks)
         manager.remove(principal.user_id, websocket)
+        await redis.zrem(slots_key(principal.user_id), connection_id)
         await pubsub.unsubscribe()
         await pubsub.aclose()

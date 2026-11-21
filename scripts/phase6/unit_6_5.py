@@ -3629,7 +3629,7 @@ def _notes_v4_intro_cells() -> list[NotebookNode]:
             | — | `SecurityHeadersMiddleware` (HSTS, CSP, nosniff, frame denial), log redaction, production checks for secrets |
             | migrations `0001`–`0003` | `0004` users + ownership (with a legacy owner for existing notes), `0005` refresh tokens + API keys |
 
-            The cells write the 45 files that change or are new (of 63). First, remove files
+            The cells write the 46 files that change or are new (of 64). First, remove files
             of other versions (nothing after a full run; the Unit 6.6 files when you re-run
             this section later):
             """
@@ -3642,6 +3642,7 @@ def _notes_v4_intro_cells() -> list[NotebookNode]:
             alembic/versions/0003_version_and_search.py alembic/versions/0004_users_and_ownership.py
             alembic/versions/0005_refresh_tokens_and_api_keys.py compose.yaml pyproject.toml ruff.toml
             src/notes_api/__init__.py src/notes_api/auth.py src/notes_api/core/__init__.py
+            src/notes_api/manage.py
             src/notes_api/core/config.py src/notes_api/core/errors.py src/notes_api/core/lifespan.py
             src/notes_api/core/logging.py src/notes_api/core/middleware.py src/notes_api/db.py
             src/notes_api/dependencies.py src/notes_api/exceptions.py src/notes_api/main.py
@@ -4523,6 +4524,26 @@ def _notes_v4_security_cells() -> list[NotebookNode]:
         ),
         md(
             """
+            **`manage.py`** (new): who becomes an admin. Granting the role from the request
+            body is the obvious hole (mass assignment, OWASP API3/API5). Granting it to a
+            configured e-mail address looks safe but is not: the address is not verified, so
+            whoever registers it first after a deploy is an admin. The role is therefore
+            granted only by an operator command that runs next to the database, after the
+            account exists. `set_role()` is also what the tests' `admin_email` fixture uses:
+            """
+        ),
+        *writefile_cells(
+            NOTES_V4_MANAGE_PY,
+            [
+                ("", "Part 1 of `manage.py`: the module docstring and imports, then `set_role()`."),
+                (
+                    "async def change_role(settings: Settings, email: str, role: str) -> bool:",
+                    "Part 2: `change_role()` (a short-lived engine) and `main()`, the command line; exit code 1 when the account does not exist yet.",
+                ),
+            ],
+        ),
+        md(
+            """
             **`oauth.py`** (new): OpenID Connect login with Authorization Code + PKCE (6.5.8).
             `authorization_url()` stores state, nonce and the PKCE verifier in Redis for ten
             minutes; `finish()` consumes them once (`GETDEL`), exchanges the code and verifies
@@ -4788,7 +4809,11 @@ def _notes_v4_test_cells() -> list[NotebookNode]:
                 ),
                 (
                     "def register(client: TestClient, email: str, password: str = PASSWORD) -> Any:",
-                    "Part 2: `register()`, `login()`, `auth_headers()`, `fake_resolver()`, `create_tables()` — POST /auth/register (without the client's default credentials).",
+                    "Part 2: `register()`, `login()`, `auth_headers()`, `promote()` — POST /auth/register (without the client's default credentials), log in, and promote an account the way an operator does (`notes_api.manage.set_role`).",
+                ),
+                (
+                    "async def fake_resolver(host: str) -> list[str]:",
+                    "Part 3: `fake_resolver()`, `create_tables()` — DNS for tests: IP literals resolve to themselves, a few names to fixed addresses.",
                 ),
             ],
         ),
@@ -4934,7 +4959,7 @@ def _notes_v4_test_cells() -> list[NotebookNode]:
             ],
         ),
         md(
-            "`test_admin.py`: admin routes need the admin role **and** scope; a normal user gets 403:"
+            "`test_admin.py`: admin routes need the admin role **and** scope; a normal user gets 403; only the operator command grants the role:"
         ),
         *writefile_cells(
             NOTES_V4_TESTS_TEST_ADMIN_PY,
@@ -4944,12 +4969,16 @@ def _notes_v4_test_cells() -> list[NotebookNode]:
                     "Part 1 of `tests/test_admin.py`: the module docstring and imports, then `test_admin_routes_need_an_admin()`, `test_admin_token_without_the_admin_scope_is_refused()`.",
                 ),
                 (
+                    "def test_registration_never_grants_admin(anonymous: TestClient) -> None:",
+                    "Part 2: `test_registration_never_grants_admin()`, `test_manage_promotes_and_demotes()` — registration always creates a `user`; only the operator command (`notes_api.manage`) changes a role, and a demotion takes effect on the next request.",
+                ),
+                (
                     "@pytest.mark.parametrize(",
-                    "Part 2: `test_import_json_and_csv()` — Both formats create the same notes.",
+                    "Part 3: `test_import_json_and_csv()` — Both formats create the same notes.",
                 ),
                 (
                     '@pytest.mark.parametrize(\n    ("filename", "content", "content_type", "status"),',
-                    "Part 3: `test_import_rejects_bad_files()`, `test_export_and_delete_all()` — Wrong type → 415, too large → 413, invalid content → 422; nothing is imported.",
+                    "Part 4: `test_import_rejects_bad_files()`, `test_export_and_delete_all()` — Wrong type → 415, too large → 413, invalid content → 422; nothing is imported.",
                 ),
             ],
         ),
@@ -5131,8 +5160,6 @@ NOTES_REDIS_URL=redis://localhost:6379/0
 NOTES_JWT_SECRET=change-me
 NOTES_ACCESS_TOKEN_MINUTES=15
 NOTES_REFRESH_TOKEN_DAYS=14
-# Accounts registered with these addresses become admins (JSON list).
-NOTES_ADMIN_EMAILS=[]
 NOTES_LOGIN_RATE_LIMIT=5
 NOTES_LOGIN_RATE_WINDOW_SECONDS=60
 # Set to false only for plain-HTTP local development (the session cookie needs HTTPS otherwise).
@@ -5174,7 +5201,8 @@ docker compose down                           # add -v to delete the data volume
 ```
 
 Local plain HTTP: set `NOTES_COOKIE_SECURE=false`, or the browser will not send the session
-cookie. Register `NOTES_ADMIN_EMAILS` addresses to get admin accounts.
+cookie. Every account starts as an ordinary user; promote one with
+`uv run python -m notes_api.manage promote-admin <email>` (a command, never an HTTP request).
 
 
 ## Endpoints
@@ -5318,7 +5346,6 @@ class Settings(BaseSettings):
     refresh_token_days: int = Field(default=14, ge=1)
     password_time_cost: int = Field(default=3, ge=1)  # Argon2id parameters (tests lower them)
     password_memory_kib: int = Field(default=65_536, ge=32)  # Argon2 needs 8 KiB per lane (4)
-    admin_emails: list[str] = []  # these addresses get the admin role when they register
     login_rate_limit: int = Field(default=5, ge=1)  # attempts per window, per IP + email
     login_rate_window_seconds: int = Field(default=60, ge=1)
     cookie_secure: bool = True  # session cookie only over HTTPS (False for local HTTP)
@@ -7007,7 +7034,6 @@ class AuthService:
         redis: Redis,
         session_factory: SessionFactory,
         refresh_lifetime: timedelta,
-        admin_emails: list[str],
     ) -> None:
         """Keep the collaborators (built per request by dependencies.get_auth_service)."""
         self.users = users
@@ -7017,19 +7043,18 @@ class AuthService:
         self.redis = redis
         self.session_factory = session_factory
         self.refresh_lifetime = refresh_lifetime
-        self.admin_emails = {email.lower() for email in admin_emails}
 
     def now(self) -> datetime:
         """The token service's clock (one clock for every timestamp)."""
         return self.tokens.clock()
 
     async def register(self, data: UserCreate) -> User:
-        """Create an account; admin only for configured addresses, never from the request."""
-        role = "admin" if data.email.lower() in self.admin_emails else "user"
+        """Create an ordinary account. The admin role never comes from a request or an e-mail
+        address (anyone can register any address); an operator grants it with notes_api.manage."""
         password_hash = self.hasher.hash(data.password)
         try:
             async with self.users.session.begin_nested():
-                return await self.users.add_user(data.email, password_hash, role)
+                return await self.users.add_user(data.email, password_hash, "user")
         except IntegrityError as error:
             raise EmailTakenError(f"{data.email} is already registered") from error
 
@@ -7090,8 +7115,7 @@ class AuthService:
             if user is not None:
                 user.oidc_subject = subject  # the provider verified this address
             else:
-                role = "admin" if email in self.admin_emails else "user"
-                user = await self.users.add_user(email, None, role, oidc_subject=subject)
+                user = await self.users.add_user(email, None, "user", oidc_subject=subject)
         if not user.is_active:
             raise AuthenticationError("account disabled")
         return await self.issue_tokens(user, ROLE_SCOPES.get(user.role, set()))
@@ -7186,6 +7210,71 @@ class AuthService:
                 key.revoked_at = key.revoked_at or self.now()
                 return
         raise ApiKeyNotFoundError(key_id)
+'''
+
+NOTES_V4_MANAGE_PY = r'''
+%%writefile ../projects/notes_api/src/notes_api/manage.py
+"""Operator commands: run where the database is, never reachable over HTTP.
+
+    python -m notes_api.manage promote-admin you@example.com
+    python -m notes_api.manage demote-admin someone@example.com
+
+In production they run in a one-off container of the current image (deploy/production/dc run
+--rm --no-deps migrate python -m notes_api.manage ...), with the server's settings.
+"""
+
+import argparse
+import asyncio
+import sys
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from notes_api.core.config import Settings, get_settings
+from notes_api.db import create_engine_from_settings, make_session_factory
+from notes_api.models import User
+
+type SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+ROLES = {"promote-admin": "admin", "demote-admin": "user"}
+
+
+async def set_role(session_factory: SessionFactory, email: str, role: str) -> bool:
+    """Give the account with this e-mail a role; False when there is no such account."""
+    async with session_factory() as session, session.begin():
+        user = await session.scalar(select(User).where(User.email == email.lower()))
+        if user is None:
+            return False
+        user.role = role  # access tokens are checked against the stored role on every request
+        return True
+
+
+async def change_role(settings: Settings, email: str, role: str) -> bool:
+    """set_role() on a short-lived engine built from the settings."""
+    engine = create_engine_from_settings(settings)
+    try:
+        return await set_role(make_session_factory(engine), email, role)
+    finally:
+        await engine.dispose()
+
+
+def main(argv: list[str] | None = None, settings: Settings | None = None) -> int:
+    """Parse the command line, change the role, return the exit code (1: unknown account)."""
+    parser = argparse.ArgumentParser(prog="python -m notes_api.manage", description=__doc__)
+    parser.add_argument("command", choices=sorted(ROLES))
+    parser.add_argument("email")
+    arguments = parser.parse_args(argv)
+    role = ROLES[arguments.command]
+    if not asyncio.run(change_role(settings or get_settings(), arguments.email, role)):
+        print(f"no account with e-mail {arguments.email}: register it first", file=sys.stderr)
+        return 1
+    print(f"{arguments.email.lower()}: role {role}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 '''
 
 NOTES_V4_OAUTH_PY = r'''
@@ -7404,7 +7493,6 @@ def get_auth_service(
         redis,
         request.app.state.session_factory,
         timedelta(days=settings.refresh_token_days),
-        settings.admin_emails,
     )
 
 
@@ -8210,7 +8298,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from helpers import USER_EMAIL, auth_headers, create_tables, fake_resolver
+from helpers import ADMIN_EMAIL, USER_EMAIL, auth_headers, create_tables, fake_resolver, promote
 from notes_api.core.config import Settings
 from notes_api.dependencies import get_redis, get_resolver
 from notes_api.main import create_app
@@ -8234,7 +8322,6 @@ def settings(tmp_path: Path) -> Settings:
         jwt_secret=SecretStr(secrets.token_urlsafe(32)),
         password_time_cost=1,
         password_memory_kib=64,
-        admin_emails=["admin@example.com"],
         login_rate_limit=10,
         cookie_secure=False,  # TestClient talks plain HTTP
     )
@@ -8271,9 +8358,16 @@ def client(anonymous: TestClient) -> TestClient:
 
 
 @pytest.fixture
-def admin_headers(anonymous: TestClient) -> dict[str, str]:
-    """Bearer headers of an admin (admin@example.com is in admin_emails)."""
-    return auth_headers(anonymous, "admin@example.com")
+def admin_email(anonymous: TestClient) -> str:
+    """Register ADMIN_EMAIL as an ordinary user, then promote it the way an operator does."""
+    promote(anonymous, ADMIN_EMAIL)
+    return ADMIN_EMAIL
+
+
+@pytest.fixture
+def admin_headers(anonymous: TestClient, admin_email: str) -> dict[str, str]:
+    """Bearer headers of the promoted admin (logged in after the promotion)."""
+    return auth_headers(anonymous, admin_email)
 '''
 
 NOTES_V4_TESTS_HELPERS_PY = r'''
@@ -8287,8 +8381,10 @@ from fastapi.testclient import TestClient
 
 from notes_api.core.config import Settings
 from notes_api.db import Base, create_engine_from_settings
+from notes_api.manage import set_role
 
 USER_EMAIL = "user@example.com"
+ADMIN_EMAIL = "admin@example.com"  # promoted by the admin_email fixture
 PASSWORD = "correct horse battery staple"
 ANONYMOUS = {"Authorization": ""}  # overrides the client's default header
 FAKE_DNS = {
@@ -8331,6 +8427,14 @@ def auth_headers(client: TestClient, email: str, scope: str = "") -> dict[str, s
     response = login(client, email, scope=scope)
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def promote(client: TestClient, email: str) -> None:
+    """Register `email` (if needed) as an ordinary user, then make it an admin the way an
+    operator does (notes_api.manage.set_role); tokens issued afterwards carry the admin scope."""
+    register(client, email)
+    session_factory = client.app.state.session_factory  # type: ignore[attr-defined]
+    assert client.portal.call(set_role, session_factory, email, "admin")
 
 
 async def fake_resolver(host: str) -> list[str]:
@@ -8994,14 +9098,16 @@ def test_static_css_is_served(anonymous: TestClient) -> None:
 
 NOTES_V4_TESTS_TEST_ADMIN_PY = r'''
 %%writefile ../projects/notes_api/tests/test_admin.py
-"""The admin router: a router-level API key, uploads with validation, export and wipe."""
+"""The admin router (uploads with validation, export and wipe) and the operator command."""
 
 import json
 
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import ANONYMOUS, auth_headers, create
+from helpers import ADMIN_EMAIL, ANONYMOUS, auth_headers, create, register
+from notes_api import manage
+from notes_api.core.config import Settings
 
 IMPORT = "/api/v1/admin/import"
 NOTES_JSON = json.dumps([{"title": "Tea", "tags": ["shop"]}, {"title": "Rice", "pinned": True}])
@@ -9017,11 +9123,33 @@ def test_admin_routes_need_an_admin(client: TestClient, admin_headers: dict[str,
         assert client.request(method, path, headers=admin_headers).status_code == 200
 
 
-def test_admin_token_without_the_admin_scope_is_refused(anonymous: TestClient) -> None:
+def test_admin_token_without_the_admin_scope_is_refused(
+    anonymous: TestClient, admin_email: str
+) -> None:
     """The role is not enough: a token issued without the admin scope cannot use admin routes."""
-    narrow = auth_headers(anonymous, "admin@example.com", scope="notes:read notes:write")
+    narrow = auth_headers(anonymous, admin_email, scope="notes:read notes:write")
     response = anonymous.get("/api/v1/admin/export", headers=narrow)
     assert (response.status_code, response.json()["detail"]) == (403, "missing scope(s): admin")
+
+
+def test_registration_never_grants_admin(anonymous: TestClient) -> None:
+    """Anyone can register any address, so no address makes an account an admin."""
+    response = register(anonymous, ADMIN_EMAIL)
+    assert (response.status_code, response.json()["role"]) == (201, "user")
+
+
+def test_manage_promotes_and_demotes(
+    anonymous: TestClient, settings: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The operator command changes the role at once; an unknown address exits with 1."""
+    register(anonymous, "ops@example.com")
+    assert manage.main(["promote-admin", "OPS@example.com"], settings) == 0
+    headers = auth_headers(anonymous, "ops@example.com")
+    assert anonymous.get("/api/v1/admin/export", headers=headers).status_code == 200
+    assert manage.main(["demote-admin", "ops@example.com"], settings) == 0
+    assert anonymous.get("/api/v1/admin/export", headers=headers).status_code == 403
+    assert manage.main(["promote-admin", "nobody@example.com"], settings) == 1
+    assert "register it first" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

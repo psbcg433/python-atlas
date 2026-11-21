@@ -28,6 +28,7 @@ from notes_api.events import (
 )
 from notes_api.exports import add_progress, owner_key, result_key
 from notes_api.models import Note, OutboxEvent, RefreshToken, User
+from notes_api.netguard import BLOCKED, Resolver, check_public_url, public_only_client, resolve_host
 from notes_api.schemas import NoteRead
 
 RELAY_BATCH = 100
@@ -49,10 +50,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["text_redis"] = redis_asyncio.from_url(
         settings.redis_url.get_secret_value(), decode_responses=True
     )
-    ctx["http"] = httpx.AsyncClient(
-        timeout=settings.webhook_timeout_seconds,
-        follow_redirects=False,
-        headers={"User-Agent": f"notes-api-webhooks/{__version__}"},
+    ctx.setdefault("resolver", resolve_host)  # tests pass a fake DNS
+    ctx["http"] = public_only_client(  # connects only to the public address it checked
+        settings.webhook_timeout_seconds,
+        f"notes-api-webhooks/{__version__}",
+        resolver=ctx["resolver"],
     )
 
 
@@ -97,7 +99,8 @@ async def relay_outbox(ctx: dict[str, Any]) -> int:
 
 
 async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:
-    """POST one signed event; retry with exponential backoff; dead-letter after the last try."""
+    """POST one signed event; retry with backoff; dead-letter after the last try. The URL is
+    checked again first: DNS may have changed since it was saved."""
     settings: Settings = ctx["settings"]
     async with ctx["session_factory"]() as session, session.begin():
         event = await session.get(OutboxEvent, event_id)
@@ -113,11 +116,15 @@ async def deliver_webhook(ctx: dict[str, Any], event_id: int) -> str:
             SIGNATURE_HEADER: sign_webhook(user.webhook_secret, int(time.time()), body),
         }
         event.webhook_attempts += 1
+        if blocked := await check_public_url(user.webhook_url, ctx["resolver"]):
+            event.webhook_status, event.last_error = "dead", blocked  # no retry; an admin can
+            await ctx["text_redis"].lpush(DEAD_LETTERS, str(event.id))
+            return "blocked"
         try:
             response = await ctx["http"].post(user.webhook_url, content=body, headers=headers)
             error = None if response.is_success else f"HTTP {response.status_code}"
-        except httpx.HTTPError as exc:
-            error = type(exc).__name__
+        except httpx.HTTPError as exc:  # BLOCKED: the DNS answer changed since the check
+            error = BLOCKED if str(exc).startswith(BLOCKED) else type(exc).__name__
         if error is None:
             event.webhook_status, event.last_error = "delivered", None
             return "delivered"
@@ -191,7 +198,9 @@ class WorkerSettings:
     keep_result = 300
 
 
-async def run_worker(burst: bool = False, settings: Settings | None = None) -> None:
+async def run_worker(
+    burst: bool = False, settings: Settings | None = None, resolver: Resolver | None = None
+) -> None:
     """Build the arq Worker inside a running event loop and run it (SIGTERM stops it cleanly).
 
     `arq notes_api.worker.WorkerSettings` is the usual command, but arq 0.25's CLI calls
@@ -209,7 +218,7 @@ async def run_worker(burst: bool = False, settings: Settings | None = None) -> N
         ),
         on_startup=startup,
         on_shutdown=shutdown,
-        ctx={"settings": settings} if settings else {},
+        ctx={"settings": settings, "resolver": resolver or resolve_host} if settings else {},
         burst=burst,
         poll_delay=0.1,
         health_check_interval=HEALTH_CHECK_SECONDS,  # arq's default is an hour

@@ -2368,6 +2368,27 @@
       }
     },
     "/api/v1/users/me": {
+      "delete": {
+        "description": "Delete the caller's account; its notes, tokens, keys and events cascade with it.\n\nThe access token stops working at once: its user no longer exists.",
+        "operationId": "delete_me",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          },
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "summary": "Delete Me",
+        "tags": [
+          "users"
+        ]
+      },
       "get": {
         "description": "Who am I?",
         "operationId": "me",
@@ -2732,7 +2753,7 @@
     },
     "/health/startup": {
       "get": {
-        "description": "Startup probe: the schema is migrated to SCHEMA_REVISION (when the check is enabled).",
+        "description": "Startup probe: the schema is at SCHEMA_REVISION or newer (when the check is enabled).",
         "operationId": "startup",
         "responses": {
           "200": {

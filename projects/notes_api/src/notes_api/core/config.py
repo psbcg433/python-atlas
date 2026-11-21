@@ -1,5 +1,6 @@
 """Application settings: environment variables (prefix NOTES_) and an optional .env file."""
 
+import urllib.parse
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -33,6 +34,7 @@ class Settings(BaseSettings):
     database_max_overflow: int = Field(default=10, ge=0)
     database_pgbouncer: bool = False  # behind PgBouncer (transaction pooling): no statement cache
     redis_url: SecretStr = SecretStr("redis://localhost:6379/0")
+    redis_password: SecretStr | None = None  # production: the secret file notes_redis_password
 
     # Authentication: an HS256 secret (required in production; a random one per process otherwise)
     jwt_secret: SecretStr | None = None
@@ -42,7 +44,6 @@ class Settings(BaseSettings):
     refresh_token_days: int = Field(default=14, ge=1)
     password_time_cost: int = Field(default=3, ge=1)  # Argon2id parameters (tests lower them)
     password_memory_kib: int = Field(default=65_536, ge=32)  # Argon2 needs 8 KiB per lane (4)
-    admin_emails: list[str] = []  # these addresses get the admin role when they register
     login_rate_limit: int = Field(default=5, ge=1)  # attempts per window, per IP + email
     login_rate_window_seconds: int = Field(default=60, ge=1)
     cookie_secure: bool = True  # session cookie only over HTTPS (False for local HTTP)
@@ -61,6 +62,13 @@ class Settings(BaseSettings):
     webhook_max_attempts: int = Field(default=5, ge=1)  # then the event is dead-lettered
     cache_ttl_seconds: int = Field(default=60, ge=1)
     ws_heartbeat_seconds: float = Field(default=20.0, gt=0)
+    ws_connections_per_user: int = Field(default=5, ge=1)  # open sockets per user, all replicas
+
+    # Per-user budgets per window on expensive routes (OWASP API4); a 429 when one is spent
+    write_rate_limit: int = Field(default=120, ge=1)  # note, key and webhook writes; admin actions
+    link_preview_rate_limit: int = Field(default=10, ge=1)  # each call fetches up to 5 URLs
+    export_rate_limit: int = Field(default=5, ge=1)  # POST /exports and GET /admin/export
+    user_rate_window_seconds: int = Field(default=60, ge=1)
     export_ttl_seconds: int = Field(default=3600, ge=60)
 
     # Observability (Unit 6.7)
@@ -93,6 +101,19 @@ class Settings(BaseSettings):
             )
         if not self.cookie_secure:
             raise ValueError("NOTES_COOKIE_SECURE must be true in production")
+        return self
+
+    @model_validator(mode="after")
+    def add_redis_password(self) -> Settings:
+        """Put redis_password into redis_url (redis://:<password>@host) unless it has one, so
+        the URL in compose.yaml stays free of secrets and the password lives in a file."""
+        url = urllib.parse.urlsplit(self.redis_url.get_secret_value())
+        if self.redis_password is None or url.password:
+            return self
+        password = urllib.parse.quote(self.redis_password.get_secret_value(), safe="")
+        host = f"{url.hostname}:{url.port}" if url.port else str(url.hostname)
+        netloc = f"{url.username or ''}:{password}@{host}"
+        self.redis_url = SecretStr(url._replace(netloc=netloc).geturl())
         return self
 
 

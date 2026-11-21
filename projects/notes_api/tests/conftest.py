@@ -17,6 +17,7 @@ from hypothesis import settings as hypothesis_settings
 from pydantic import SecretStr
 
 from helpers import (
+    ADMIN_EMAIL,
     PASSWORD,
     POSTGRES_IMAGE,
     REDIS_IMAGE,
@@ -27,6 +28,7 @@ from helpers import (
     docker_available,
     fake_resolver,
     postgres_alembic_config,
+    promote,
 )
 from notes_api.core.config import Settings
 from notes_api.dependencies import get_mailer, get_queue, get_redis, get_resolver
@@ -55,8 +57,10 @@ def settings(tmp_path: Path) -> Settings:
         jwt_secret=SecretStr(secrets.token_urlsafe(32)),
         password_time_cost=1,
         password_memory_kib=64,
-        admin_emails=["admin@example.com"],
         login_rate_limit=10,
+        write_rate_limit=10_000,  # tests make many requests per user; test_limits.py checks
+        link_preview_rate_limit=10_000,  # the per-user budgets with small values
+        export_rate_limit=10_000,
         cookie_secure=False,  # TestClient talks plain HTTP
         check_migrations=False,  # the test schema comes from create_all, not Alembic
         otel_exporter="memory",  # spans are kept on app.state.span_exporter
@@ -119,9 +123,16 @@ def client(anonymous: TestClient) -> TestClient:
 
 
 @pytest.fixture
-def admin_headers(anonymous: TestClient) -> dict[str, str]:
-    """Bearer headers of an admin (admin@example.com is in admin_emails)."""
-    return auth_headers(anonymous, "admin@example.com")
+def admin_email(anonymous: TestClient) -> str:
+    """Register ADMIN_EMAIL as an ordinary user, then promote it the way an operator does."""
+    promote(anonymous, ADMIN_EMAIL)
+    return ADMIN_EMAIL
+
+
+@pytest.fixture
+def admin_headers(anonymous: TestClient, admin_email: str) -> dict[str, str]:
+    """Bearer headers of the promoted admin (logged in after the promotion)."""
+    return auth_headers(anonymous, admin_email)
 
 
 @pytest.fixture

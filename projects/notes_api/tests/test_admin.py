@@ -1,11 +1,13 @@
-"""The admin router: a router-level API key, uploads with validation, export and wipe."""
+"""The admin router (uploads with validation, export and wipe) and the operator command."""
 
 import json
 
 import pytest
 from fastapi.testclient import TestClient
 
-from helpers import ANONYMOUS, auth_headers, create
+from helpers import ADMIN_EMAIL, ANONYMOUS, auth_headers, create, register
+from notes_api import manage
+from notes_api.core.config import Settings
 
 IMPORT = "/api/v1/admin/import"
 NOTES_JSON = json.dumps([{"title": "Tea", "tags": ["shop"]}, {"title": "Rice", "pinned": True}])
@@ -21,11 +23,33 @@ def test_admin_routes_need_an_admin(client: TestClient, admin_headers: dict[str,
         assert client.request(method, path, headers=admin_headers).status_code == 200
 
 
-def test_admin_token_without_the_admin_scope_is_refused(anonymous: TestClient) -> None:
+def test_admin_token_without_the_admin_scope_is_refused(
+    anonymous: TestClient, admin_email: str
+) -> None:
     """The role is not enough: a token issued without the admin scope cannot use admin routes."""
-    narrow = auth_headers(anonymous, "admin@example.com", scope="notes:read notes:write")
+    narrow = auth_headers(anonymous, admin_email, scope="notes:read notes:write")
     response = anonymous.get("/api/v1/admin/export", headers=narrow)
     assert (response.status_code, response.json()["detail"]) == (403, "missing scope(s): admin")
+
+
+def test_registration_never_grants_admin(anonymous: TestClient) -> None:
+    """Anyone can register any address, so no address makes an account an admin."""
+    response = register(anonymous, ADMIN_EMAIL)
+    assert (response.status_code, response.json()["role"]) == (201, "user")
+
+
+def test_manage_promotes_and_demotes(
+    anonymous: TestClient, settings: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The operator command changes the role at once; an unknown address exits with 1."""
+    register(anonymous, "ops@example.com")
+    assert manage.main(["promote-admin", "OPS@example.com"], settings) == 0
+    headers = auth_headers(anonymous, "ops@example.com")
+    assert anonymous.get("/api/v1/admin/export", headers=headers).status_code == 200
+    assert manage.main(["demote-admin", "ops@example.com"], settings) == 0
+    assert anonymous.get("/api/v1/admin/export", headers=headers).status_code == 403
+    assert manage.main(["promote-admin", "nobody@example.com"], settings) == 1
+    assert "register it first" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

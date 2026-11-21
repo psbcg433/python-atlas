@@ -3,7 +3,8 @@
 # Use deploy/production/dc (the same command with the env files); CI runs rollout.sh.
 # ${...} values come from /srv/notes/.env (secrets; see deploy/production/env.example) and
 # state/release.env (NOTES_IMAGE and TAG, written by rollout.sh). A missing one stops Compose
-# with the message after ":?". The !reset / !override tags need Compose 2.24.4 or newer.
+# with the message after ":?". Two secrets are files in .secrets/ (notes_jwt_secret,
+# notes_redis_password). The !reset / !override tags need Compose 2.24.4 or newer.
 
 x-logging: &logging # every container: JSON lines on disk, rotated at 5 x 10 MB
   driver: json-file
@@ -13,7 +14,11 @@ x-app-environment: &app-environment # api, worker and migrate
   NOTES_DATABASE_URL: postgresql+asyncpg://notes:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/notes
   NOTES_DATABASE_POOL_SIZE: "5"
   NOTES_DATABASE_MAX_OVERFLOW: "5" # 10 per process: a rollout peaks at 4 x 2 x 10 = 80 < 150
-  NOTES_ADMIN_EMAILS: ${NOTES_ADMIN_EMAILS:-[]}
+  # Uvicorn trusts X-Forwarded-For only from Caddy's fixed address (below), so no other
+  # container can fake a client address to get around the per-IP login limit
+  FORWARDED_ALLOW_IPS: 172.30.240.10
+
+x-app-secrets: &app-secrets [notes_jwt_secret, notes_redis_password] # files in /run/secrets
 
 
 services:
@@ -25,16 +30,26 @@ services:
     shm_size: 256mb
     logging: *logging
 
-  redis:
-    command: ["redis-server", "--appendonly", "yes"] # queued jobs survive a restart
+  redis: # requirepass from a secret file: the password is never in a command line or env
+    command:
+      - sh
+      - -c
+      - >-
+        printf 'requirepass %s\n' "$$(cat /run/secrets/notes_redis_password)" > /tmp/redis.conf
+        && chown redis:redis /tmp/redis.conf
+        && exec docker-entrypoint.sh redis-server /tmp/redis.conf --appendonly yes
+    secrets: [notes_redis_password]
+    healthcheck: # redis-cli reads the password from REDISCLI_AUTH
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$(cat /run/secrets/notes_redis_password) redis-cli ping | grep -q PONG"]
     ports: !reset []
-    volumes: ["redis-data:/data"]
+    volumes: ["redis-data:/data"] # queued jobs survive a restart (append-only file)
     logging: *logging
 
   migrate:
     build: !reset null # production never builds: it runs the image CI pushed
     image: ${NOTES_IMAGE:?NOTES_IMAGE is set by rollout.sh}:${TAG:?TAG is set by rollout.sh}
     environment: *app-environment
+    secrets: *app-secrets
     logging: *logging
 
   api:
@@ -43,6 +58,7 @@ services:
     environment:
       <<: *app-environment
       WEB_CONCURRENCY: "2" # Uvicorn processes per container
+    secrets: *app-secrets
     deploy: { replicas: 2 } # rollout.sh adds 2 new replicas, then stops the 2 old ones
     stop_grace_period: 30s # SIGTERM, Uvicorn finishes requests for up to 20 s, SIGKILL at 30 s
     logging: *logging
@@ -51,6 +67,7 @@ services:
     build: !reset null
     image: ${NOTES_IMAGE:?NOTES_IMAGE is set by rollout.sh}:${TAG:?TAG is set by rollout.sh}
     environment: *app-environment
+    secrets: *app-secrets
     stop_grace_period: 30s
     logging: *logging
 
@@ -66,6 +83,8 @@ services:
     volumes: # same target as compose.yaml's Caddyfile mount, so this one replaces it
       - ./deploy/production/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-config:/config
+    networks:
+      default: { ipv4_address: 172.30.240.10 } # the one address FORWARDED_ALLOW_IPS trusts
     logging: *logging
 
   prometheus:
@@ -109,6 +128,15 @@ services:
     restart: unless-stopped
     logging: *logging
 
+
+networks:
+  default: # a fixed subnet, so that the proxy can have a fixed address
+    ipam:
+      config: [{ subnet: 172.30.240.0/24 }]
+
+secrets:
+  notes_redis_password: # openssl rand -hex 32; mode 444 inside the mode-700 .secrets folder
+    file: ./.secrets/notes_redis_password
 
 volumes:
   redis-data:

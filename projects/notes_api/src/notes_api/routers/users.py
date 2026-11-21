@@ -1,10 +1,15 @@
-"""/api/v1/users/me: the current user and their API keys."""
+"""/api/v1/users/me: the current user, their API keys and webhook; deleting the account."""
 
 from typing import Annotated
 
 from fastapi import APIRouter, Path, status
 
-from notes_api.dependencies import AuthServiceDep, CurrentPrincipal, LinkPreviewerDep
+from notes_api.dependencies import (
+    ACCOUNT_WRITE_LIMIT,
+    AuthServiceDep,
+    CurrentPrincipal,
+    LinkPreviewerDep,
+)
 from notes_api.exceptions import AuthenticationError, InvalidWebhookError, PermissionDeniedError
 from notes_api.models import ApiKey, User
 from notes_api.schemas import ApiKeyCreate, ApiKeyCreated, ApiKeyRead, UserRead, WebhookSettings
@@ -22,7 +27,21 @@ async def me(principal: CurrentPrincipal, auth: AuthServiceDep) -> User:
     return user
 
 
-@router.post("/me/api-keys", response_model=ApiKeyCreated, status_code=status.HTTP_201_CREATED)
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT, dependencies=[ACCOUNT_WRITE_LIMIT])
+async def delete_me(principal: CurrentPrincipal, auth: AuthServiceDep) -> None:
+    """Delete the caller's account; its notes, tokens, keys and events cascade with it.
+
+    The access token stops working at once: its user no longer exists.
+    """
+    await auth.users.delete_user(principal.user_id)
+
+
+@router.post(
+    "/me/api-keys",
+    response_model=ApiKeyCreated,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[ACCOUNT_WRITE_LIMIT],
+)
 async def create_api_key(
     data: ApiKeyCreate, principal: CurrentPrincipal, auth: AuthServiceDep
 ) -> dict[str, object]:
@@ -39,7 +58,11 @@ async def list_api_keys(principal: CurrentPrincipal, auth: AuthServiceDep) -> li
     return await auth.users.api_keys_of(principal.user_id)
 
 
-@router.delete("/me/api-keys/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/me/api-keys/{key_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[ACCOUNT_WRITE_LIMIT],
+)
 async def revoke_api_key(
     key_id: Annotated[int, Path(ge=1)], principal: CurrentPrincipal, auth: AuthServiceDep
 ) -> None:
@@ -54,7 +77,7 @@ async def get_webhook(principal: CurrentPrincipal, auth: AuthServiceDep) -> dict
     return {"url": user.webhook_url if user else None}
 
 
-@router.put("/me/webhook")
+@router.put("/me/webhook", dependencies=[ACCOUNT_WRITE_LIMIT])
 async def set_webhook(
     body: WebhookSettings,
     principal: CurrentPrincipal,
@@ -71,7 +94,9 @@ async def set_webhook(
     return {"url": user.webhook_url, "secret": user.webhook_secret}
 
 
-@router.delete("/me/webhook", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/me/webhook", status_code=status.HTTP_204_NO_CONTENT, dependencies=[ACCOUNT_WRITE_LIMIT]
+)
 async def delete_webhook(principal: CurrentPrincipal, auth: AuthServiceDep) -> None:
     """Stop sending webhooks."""
     user = await auth.users.user_by_id(principal.user_id)

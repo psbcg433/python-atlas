@@ -35,6 +35,10 @@
 	@internal path /metrics /metrics/*
 	respond @internal 404 # Prometheus scrapes the replicas directly, inside the network
 
+	request_body {
+		max_size 1MB # larger bodies get 413 here, before they reach (and occupy) a replica
+	}
+
 	reverse_proxy {
 		import upstreams-{$NOTES_UPSTREAM_MODE:dynamic}
 		lb_policy round_robin
