@@ -491,3 +491,18 @@ def test_runtime_image_gets_security_fixes_and_no_pip() -> None:
     runtime_stage = dockerfile.split(" AS runtime\n", 1)[1]
     assert "apt-get upgrade --yes" in runtime_stage
     assert "pip uninstall --yes" in runtime_stage
+
+
+@workflows_present
+def test_every_uv_step_pins_python_and_the_audit_installs_nothing() -> None:
+    """A runner's system Python (3.12) rejects `requires-python >=3.15`: every setup-uv step
+    pins 3.15, and pip-audit reads the exported third-party pins without installing them."""
+    jobs = load(WORKFLOWS_DIR / "notes-api.yml")["jobs"]
+    steps = [step for job in jobs.values() for step in job["steps"]]
+    setup_uv = [step for step in steps if "astral-sh/setup-uv" in step.get("uses", "")]
+    assert setup_uv and all(
+        step.get("with", {}).get("python-version") == "3.15" for step in setup_uv
+    )
+    audit = next(step["run"] for step in steps if "pip-audit" in step.get("run", ""))
+    assert "uv export" in audit and "--no-emit-project" in audit
+    assert "--disable-pip" in audit and "--no-deps" in audit

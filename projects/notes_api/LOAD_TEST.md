@@ -72,22 +72,22 @@ is left. Keep a run under 10 minutes after the setup: access tokens last 15 minu
 ## Results — local rehearsal
 
 <!-- results:local:start -->
-Run at 2026-11-22 14:46 UTC against `https://localhost:58443`: 50 users, spawn rate 10/s, 15s.
+Run at 2026-11-22 15:40 UTC against `https://localhost:58443`: 50 users, spawn rate 10/s, 15s.
 
 | Endpoint | Requests | Failures | req/s | p50 ms | p95 ms | p99 ms | max ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GET `/api/v1/notes` | 2491 | 0 | 165.9 | 8 | 15 | 24 | 36 |
-| POST `/api/v1/notes` | 500 | 0 | 33.3 | 10 | 28 | 37 | 148 |
-| GET `/api/v1/notes/feed` | 479 | 0 | 31.9 | 7 | 14 | 21 | 29 |
-| GET `/api/v1/notes/{id}` | 1291 | 0 | 86.0 | 6 | 13 | 19 | 31 |
-| **All requests** | 4761 | 0 | 317.1 | 8 | 16 | 28 | 148 |
+| GET `/api/v1/notes` | 2462 | 0 | 164.2 | 7 | 15 | 22 | 56 |
+| POST `/api/v1/notes` | 479 | 0 | 31.9 | 9 | 18 | 23 | 57 |
+| GET `/api/v1/notes/feed` | 514 | 0 | 34.3 | 6 | 14 | 22 | 38 |
+| GET `/api/v1/notes/{id}` | 1286 | 0 | 85.8 | 6 | 13 | 20 | 56 |
+| **All requests** | 4741 | 0 | 316.2 | 7 | 15 | 22 | 57 |
 
 | Target | Measured | Verdict |
 | --- | ---: | --- |
-| p95 latency (client side) < 200 ms | 16 ms | **PASS** |
+| p95 latency (client side) < 200 ms | 15 ms | **PASS** |
 | failed requests < 1% | 0.00% | **PASS** |
-| throughput >= 100 req/s | 317 req/s | **PASS** |
-| p95 latency (server side, Prometheus) < 200 ms | 19 ms | **PASS** |
+| throughput >= 100 req/s | 316 req/s | **PASS** |
+| p95 latency (server side, Prometheus) < 200 ms | 17 ms | **PASS** |
 <!-- results:local:end -->
 
 ## Results — live

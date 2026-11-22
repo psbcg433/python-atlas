@@ -2586,8 +2586,9 @@ def _injection_cells() -> list[NotebookNode]:
             )
             print(audit_version.stdout.strip() or audit_version.stderr.strip())
             print(
-                "SKIP the audit itself (needs the network)."
-                " Run: uv export --frozen --no-hashes > req.txt && uv run pip-audit -r req.txt"
+                "SKIP the audit itself (needs the network). Run in projects/notes_api:"
+                " uv export --frozen --no-dev --no-hashes --no-emit-project > req.txt"
+                " && uvx pip-audit --disable-pip --no-deps -r req.txt"
             )
             """
         ),

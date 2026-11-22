@@ -1218,8 +1218,10 @@ def _cicd_cells() -> list[NotebookNode]:
                     """
                     Part 5: scan the image (Trivy, pinned by version **and** digest: a moved
                     tag cannot change what runs) and the locked dependencies (`pip-audit`,
-                    pinned), then push the image with the commit SHA as its tag (on `main`, or
-                    a manual run on `main`):
+                    pinned, on the exported third-party pins with `--disable-pip --no-deps`:
+                    it installs nothing, so the runner's Python cannot reject `requires-python
+                    >=3.15`), then push the image with the commit SHA as its tag (on `main`,
+                    or a manual run on `main`):
                     """,
                 ),
                 (
@@ -1601,7 +1603,10 @@ def _tests_cells() -> list[NotebookNode]:
                     course's `.venv` is on `PATH`), and the image smoke test used
                     `sqlite+aiosqlite`, a dev-only driver the image does not contain. The scan
                     then found the base image's Debian packages behind their security fixes and
-                    the base image's pip carrying old vendored libraries:
+                    the base image's pip carrying old vendored libraries. On the next push the
+                    dependency audit failed: `uv export` listed the project itself, and pip-audit
+                    tried to install it with the runner's Python 3.12, which `requires-python
+                    >=3.15` rejects:
                     """,
                 ),
             ],

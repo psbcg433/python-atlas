@@ -4900,8 +4900,13 @@ jobs:
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.1 \
             image --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed "$IMAGE:$GITHUB_SHA"
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: { python-version: "3.15" } # never the runner's system Python
       - name: Known vulnerabilities in the locked dependencies
-        run: uv export --frozen --no-dev --no-hashes > requirements.txt && uvx pip-audit -r requirements.txt
+        # Only the third-party pins (no line for the project itself), audited as listed:
+        # pip-audit installs nothing, so no Python version can reject a package.
+        run: |
+          uv export --frozen --no-dev --no-hashes --no-emit-project > requirements.txt
+          uvx pip-audit --disable-pip --no-deps -r requirements.txt
 
   push:
     needs: scan
