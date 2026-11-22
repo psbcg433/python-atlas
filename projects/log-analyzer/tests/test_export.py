@@ -76,7 +76,9 @@ def test_write_json(tmp_path: Path) -> None:
     assert write_json([RECORD, RECORD], output) == 2
     loaded = json.loads(output.read_text(encoding="utf-8"))
     assert loaded == [dict(zip(RECORD_COLUMNS, record_row(RECORD), strict=True))] * 2
-    assert output.read_text(encoding="utf-8").count("\n") == 4  # "[", 2 records, "]"
+    raw = output.read_bytes()  # read_text() would turn a Windows "\r\n" back into "\n"
+    assert raw.count(b"\n") == 4  # "[", 2 records, "]"
+    assert b"\r" not in raw
 
 
 def test_write_json_empty(tmp_path: Path) -> None:

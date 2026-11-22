@@ -1484,7 +1484,8 @@ def _tests_cells() -> list[NotebookNode]:
             scripts are strict and executable, the rollout runs its steps in order, a rollback
             after a migration works (with a fake `docker`, so it runs everywhere), the CI key's
             wrapper refuses everything but the deploy commands, the deploy job waits for every
-            check and runs only on `main`. Part 1: imports
+            check and runs only on `main`, every tool CI runs is installed from `uv.lock`, and
+            the image takes Debian's security fixes and carries no pip. Part 1: imports
             and paths (the workflows live at the repository root, two levels up):
             """
         ),
@@ -1591,6 +1592,17 @@ def _tests_cells() -> list[NotebookNode]:
                 (
                     "@workflows_present\ndef test_workflows_use_only_the_documented_secrets",
                     "Part 21: the secrets and variables, and the uptime schedule:",
+                ),
+                (
+                    "def requirement_names(",
+                    """
+                    Part 22: two CI failures as tests. The first push ran `uv run ruff` on a
+                    runner where ruff was not a dependency (it had worked here only because the
+                    course's `.venv` is on `PATH`), and the image smoke test used
+                    `sqlite+aiosqlite`, a dev-only driver the image does not contain. The scan
+                    then found the base image's Debian packages behind their security fixes and
+                    the base image's pip carrying old vendored libraries:
+                    """,
                 ),
             ],
         )[1:],
@@ -1818,26 +1830,30 @@ def _rehearsal_cells() -> list[NotebookNode]:
             The redirect points at port 443 (the server's port), not 58443: the rehearsal's
             port mapping is invisible to Caddy. **Monitoring**: Prometheus finds both
             replicas (it scrapes every 15 s, so the cell waits for the first scrape), the three
-            alert rules are loaded and inactive, and Grafana has the provisioned dashboard:
+            alert rules are loaded and inactive, and Grafana has the provisioned dashboard.
+            Rules are evaluated on their own 15 s cycle: one evaluated before the first scrape
+            sees no `up` series, so `NotesApiDown` (`absent(up{job="notes-api"} == 1)`) is
+            briefly `pending` until the next evaluation; the cell waits for that as well:
             """
         ),
         code(
             r"""
             if HAS_DOCKER:
                 prometheus = "http://127.0.0.1:59090/api/v1"
-                for _ in range(40):
+                for _ in range(60):
                     targets = httpx.get(f"{prometheus}/targets", trust_env=False).json()
                     api_targets = [
                         target["health"]
                         for target in targets["data"]["activeTargets"]
                         if target["labels"]["job"] == "notes-api"
                     ]
-                    if api_targets.count("up") == 2:
+                    rules = httpx.get(f"{prometheus}/rules", trust_env=False).json()["data"]["groups"]
+                    rule_states = [(rule["name"], rule["state"]) for rule in rules[0]["rules"]]
+                    if api_targets.count("up") == 2 and all(state == "inactive" for _, state in rule_states):
                         break
                     time.sleep(1)
                 print("notes-api targets:", api_targets)
-                rules = httpx.get(f"{prometheus}/rules", trust_env=False).json()["data"]["groups"]
-                print("alert rules:", [(rule["name"], rule["state"]) for rule in rules[0]["rules"]])
+                print("alert rules:", rule_states)
                 found = httpx.get(
                     "http://127.0.0.1:53000/api/search",
                     params={"query": "Notes API", "type": "dash-db"},

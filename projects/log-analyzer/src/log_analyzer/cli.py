@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -143,6 +144,21 @@ def run_validate(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def file_error_message(error: OSError, args: argparse.Namespace) -> str:
+    """One line for a failed file operation: ``cannot read|write <path>: <reason>``.
+
+    Built from ``filename`` and ``strerror``, not ``str(error)``: that shows the path's
+    repr, which doubles every backslash of a Windows path and quotes the name. The input
+    log is the only file the commands read; any other path was being written.
+    """
+    if error.filename is None:
+        return str(error)
+    path = os.fsdecode(error.filename)
+    log = getattr(args, "log", None)
+    action = "read" if log is not None and path == str(log) else "write"
+    return f"cannot {action} {path}: {error.strerror or type(error).__name__}"
+
+
 def run_command(args: argparse.Namespace) -> int:
     """Dispatch to the handler of the chosen subcommand."""
     match args.command:
@@ -167,5 +183,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_command(args)
     except (LogAnalyzerError, OSError) as error:
         logger.debug("command failed", exc_info=True)
-        print(f"{PROG}: error: {error}", file=sys.stderr)
+        message = file_error_message(error, args) if isinstance(error, OSError) else str(error)
+        print(f"{PROG}: error: {message}", file=sys.stderr)
         return EXIT_ERROR

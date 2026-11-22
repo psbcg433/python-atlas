@@ -3446,6 +3446,7 @@ dev = [
     "locust>=2.47.0",
     "pytest>=9.2.0",
     "respx>=0.23.1",
+    "ruff>=0.17.3",
     "schemathesis>=4.33.4",
     "testcontainers>=4.15.0",
 ]

@@ -1004,6 +1004,7 @@ def _cli_cells() -> list[NotebookNode]:
             print(f"typer's bundled click: {importlib.util.find_spec('typer._click') is not None}")
             if installed("click", "click (not an Appendix A package; typer bundles its own copy)"):
                 import click
+                import click.testing  # a submodule: `import click` alone does not load it
 
                 @click.command()
                 @click.argument("sku")

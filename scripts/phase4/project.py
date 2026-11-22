@@ -464,12 +464,16 @@ def _code_tour_cells() -> list[NotebookNode]:
             inside an `except*` clause, so the handler records the exit code and returns after
             the `try`. `main` turns expected failures (`LogAnalyzerError`, `OSError`) into a
             one-line message on stderr and exit code 2; anything else is a bug and keeps its
-            traceback.
+            traceback. For an `OSError` the message is built from `error.filename` and
+            `error.strerror` (`cannot read access.log: No such file or directory`), not from
+            `str(error)`: that shows the path's `repr`, and on Windows a repr doubles every
+            backslash (`'C:\\\\logs\\\\access.log'`). The Windows CI job caught exactly that.
             """
         ),
         code(
             """
             print(inspect.getsource(cli.run_validate))
+            print(inspect.getsource(cli.file_error_message))
             print(inspect.getsource(cli.main))
             """
         ),

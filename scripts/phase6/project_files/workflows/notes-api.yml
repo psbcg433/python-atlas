@@ -96,10 +96,13 @@ jobs:
       - name: Report the image size
         run: docker image inspect "$IMAGE:$GITHUB_SHA" --format 'size={{.Size}}' >> "$GITHUB_STEP_SUMMARY"
       - name: Smoke test (the container starts and answers its liveness probe)
+        # The image has only the production driver (asyncpg; aiosqlite is a dev dependency).
+        # Nothing listens on port 9: the engine connects lazily and /health/live touches no
+        # dependency, so this checks that the app imports, configures and starts.
         run: |
           docker run --detach --name smoke --publish 8000:8000 \
             --env NOTES_ENVIRONMENT=test --env NOTES_CHECK_MIGRATIONS=false \
-            --env NOTES_DATABASE_URL=sqlite+aiosqlite:////tmp/smoke.db "$IMAGE:$GITHUB_SHA"
+            --env NOTES_DATABASE_URL=postgresql+asyncpg://smoke:smoke@127.0.0.1:9/smoke "$IMAGE:$GITHUB_SHA"
           for _ in $(seq 30); do curl --fail --silent localhost:8000/health/live && exit 0; sleep 1; done
           docker logs smoke; exit 1
       - run: docker save "$IMAGE:$GITHUB_SHA" | gzip > image.tar.gz

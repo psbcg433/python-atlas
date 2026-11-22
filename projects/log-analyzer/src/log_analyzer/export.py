@@ -86,9 +86,13 @@ def write_csv(records: Iterable[AccessRecord], output: Path) -> int:
 
 
 def write_json(records: Iterable[AccessRecord], output: Path) -> int:
-    """Write a JSON array of record objects, one per line; return the number written."""
+    """Write a JSON array of record objects, one per line; return the number written.
+
+    Lines end in ``\\n`` on every platform (no ``\\r\\n`` on Windows), so an export is
+    byte-for-byte the same wherever it was made.
+    """
     written = 0
-    with output.open("w", encoding="utf-8") as json_file:
+    with output.open("w", encoding="utf-8", newline="\n") as json_file:
         json_file.write("[")
         for record in records:
             json_file.write(",\n  " if written else "\n  ")

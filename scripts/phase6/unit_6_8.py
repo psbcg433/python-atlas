@@ -3458,6 +3458,7 @@ dev = [
     "mypy>=2.4.1",
     "pytest>=9.2.0",
     "respx>=0.23.1",
+    "ruff>=0.17.3",
     "schemathesis>=4.33.4",
     "testcontainers>=4.15.0",
 ]
@@ -3533,6 +3534,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 
 FROM python:${PYTHON_VERSION}-slim AS runtime
+# Debian security fixes published after the base image was built (CI fails on fixable
+# HIGH/CRITICAL findings), and no pip: the app runs from /app/.venv and installs nothing,
+# while the base image's pip vendors its own urllib3, msgpack and setuptools copies.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip uninstall --yes --root-user-action=ignore pip
 RUN groupadd --system --gid 10001 notes \
     && useradd --system --uid 10001 --gid notes --no-create-home --shell /usr/sbin/nologin notes \
     && install -d -o notes -g notes /tmp/prometheus
@@ -4866,10 +4874,13 @@ jobs:
       - name: Report the image size
         run: docker image inspect "$IMAGE:$GITHUB_SHA" --format 'size={{.Size}}' >> "$GITHUB_STEP_SUMMARY"
       - name: Smoke test (the container starts and answers its liveness probe)
+        # The image has only the production driver (asyncpg; aiosqlite is a dev dependency).
+        # Nothing listens on port 9: the engine connects lazily and /health/live touches no
+        # dependency, so this checks that the app imports, configures and starts.
         run: |
           docker run --detach --name smoke --publish 8000:8000 \
             --env NOTES_ENVIRONMENT=test --env NOTES_CHECK_MIGRATIONS=false \
-            --env NOTES_DATABASE_URL=sqlite+aiosqlite:////tmp/smoke.db "$IMAGE:$GITHUB_SHA"
+            --env NOTES_DATABASE_URL=postgresql+asyncpg://smoke:smoke@127.0.0.1:9/smoke "$IMAGE:$GITHUB_SHA"
           for attempt in $(seq 30); do curl --fail --silent localhost:8000/health/live && exit 0; sleep 1; done
           docker logs smoke; exit 1
       - run: docker save "$IMAGE:$GITHUB_SHA" | gzip > image.tar.gz

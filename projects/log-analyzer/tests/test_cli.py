@@ -1,6 +1,8 @@
 """The command-line interface, called in-process through ``main(argv)``."""
 
+import errno
 import json
+import os
 import runpy
 import sqlite3
 from contextlib import closing
@@ -124,13 +126,41 @@ def test_validate_lists_problems(sample_log: Path, capsys: Capture) -> None:
     ]
 
 
-def test_missing_file_is_a_clean_error(tmp_path: Path, capsys: Capture) -> None:
-    missing = tmp_path / "missing.log"
+NO_SUCH_FILE = os.strerror(errno.ENOENT)  # "No such file or directory", Windows included
+
+
+# A backslash and a quote are where str(OSError) goes wrong: its repr of the path doubles
+# the backslash (every separator on Windows) and switches quotes. On Windows the backslash
+# is a separator, so that case is a missing file in a missing folder: still ENOENT.
+@pytest.mark.parametrize("file_name", ["missing.log", "it's\\back.log"])
+def test_missing_file_is_a_clean_error(tmp_path: Path, capsys: Capture, file_name: str) -> None:
+    missing = tmp_path / file_name
     assert main(["report", str(missing)]) == EXIT_ERROR
     captured = capsys.readouterr()
     assert captured.out == ""
-    expected = f"log-analyzer: error: [Errno 2] No such file or directory: '{missing}'\n"
-    assert captured.err == expected
+    assert captured.err == f"log-analyzer: error: cannot read {missing}: {NO_SUCH_FILE}\n"
+
+
+def test_unwritable_output_is_a_clean_error(
+    sample_log: Path, tmp_path: Path, capsys: Capture
+) -> None:
+    output = tmp_path / "no-such-folder" / "out.csv"
+    assert main(["export", str(sample_log), str(output)]) == EXIT_ERROR
+    assert (
+        capsys.readouterr().err == f"log-analyzer: error: cannot write {output}: {NO_SUCH_FILE}\n"
+    )
+
+
+def test_os_error_without_a_file_name(monkeypatch: pytest.MonkeyPatch, capsys: Capture) -> None:
+    def disk_full(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr("log_analyzer.cli.write_synthetic_log", disk_full)
+    assert main(["generate", "x.log"]) == EXIT_ERROR
+    assert (
+        capsys.readouterr().err
+        == f"log-analyzer: error: {OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))}\n"
+    )
 
 
 def test_verbose_and_log_file(sample_log: Path, tmp_path: Path, capsys: Capture) -> None:

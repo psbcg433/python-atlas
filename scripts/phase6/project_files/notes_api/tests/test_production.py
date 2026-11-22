@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -455,3 +456,38 @@ def test_uptime_check_is_scheduled() -> None:
     triggers = workflow[True]  # YAML 1.1 reads the key "on" as True
     assert triggers["schedule"][0]["cron"].endswith("* * * *")
     assert workflow["permissions"] == {}
+
+
+def requirement_names(requirements: list[str]) -> set[str]:
+    """Distribution names of requirement strings: ``"pyjwt[crypto]>=2.15.1"`` -> ``"pyjwt"``."""
+    return {
+        re.split(r"[\s\[<>=!~;]", requirement, maxsplit=1)[0].lower()
+        for requirement in requirements
+    }
+
+
+@workflows_present
+def test_ci_tools_and_the_smoke_test_driver_are_installed() -> None:
+    """A runner has only what uv.lock installs: every `uv run <tool>` is a dependency, and the
+    image smoke test uses a database driver the image (built without the dev group) contains."""
+    project = tomllib.loads((PROJECT_DIR / "pyproject.toml").read_text())
+    runtime = requirement_names(project["project"]["dependencies"])
+    dev = requirement_names(project["dependency-groups"]["dev"])
+    jobs = load(WORKFLOWS_DIR / "notes-api.yml")["jobs"]
+    commands = "\n".join(step.get("run", "") for job in jobs.values() for step in job["steps"])
+    tools = set(re.findall(r"uv run (?:-\S+ )*([a-z][\w-]*)", commands))
+    assert {"ruff", "mypy", "pytest"} <= tools
+    assert tools <= runtime | dev, f"not installed on the runner: {tools - runtime - dev}"
+    smoke = "\n".join(step.get("run", "") for step in jobs["build"]["steps"])
+    drivers = set(re.findall(r"NOTES_DATABASE_URL=\w+\+(\w+)://", smoke))
+    assert drivers and drivers <= runtime, f"not in the image: {drivers - runtime}"
+
+
+def test_runtime_image_gets_security_fixes_and_no_pip() -> None:
+    """CI fails on fixable HIGH/CRITICAL findings: the runtime stage installs the Debian fixes
+    published after the base image, and drops the base image's pip, whose vendored urllib3,
+    msgpack and setuptools are findings of their own (the app never installs anything)."""
+    dockerfile = (PROJECT_DIR / "Dockerfile").read_text()
+    runtime_stage = dockerfile.split(" AS runtime\n", 1)[1]
+    assert "apt-get upgrade --yes" in runtime_stage
+    assert "pip uninstall --yes" in runtime_stage

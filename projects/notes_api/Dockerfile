@@ -27,6 +27,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 
 FROM python:${PYTHON_VERSION}-slim AS runtime
+# Debian security fixes published after the base image was built (CI fails on fixable
+# HIGH/CRITICAL findings), and no pip: the app runs from /app/.venv and installs nothing,
+# while the base image's pip vendors its own urllib3, msgpack and setuptools copies.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip uninstall --yes --root-user-action=ignore pip
 RUN groupadd --system --gid 10001 notes \
     && useradd --system --uid 10001 --gid notes --no-create-home --shell /usr/sbin/nologin notes \
     && install -d -o notes -g notes /tmp/prometheus
